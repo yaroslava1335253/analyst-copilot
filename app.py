@@ -2270,13 +2270,30 @@ if st.session_state.quarterly_analysis:
     _as_of = most_recent.get("label", "—")
     _price_str = f"${_price:,.2f}" if _price else "—"
     _mcap_str = f"${_mcap/1e9:.1f}B" if _mcap else "—"
-    _pe_str = f"{_pe:.1f}x" if _pe else "—"
+    _show_pe = _pe is not None and _pe > 0
+    _pe_str = f"{_pe:.1f}x" if _show_pe else None
+
+    _hero_tiles = [
+        ("Price", _price_str, None),
+        ("Market Cap", _mcap_str, None),
+    ]
+    if _show_pe:
+        _hero_tiles.append(("P/E Ratio", _pe_str, None))
+    _hero_tiles.append(("As Of", _as_of, "font-size:1rem"))
+
+    _hero_items_html = []
+    for idx, (label, value, value_style) in enumerate(_hero_tiles):
+        style = ' style="border-right:none"' if idx == len(_hero_tiles) - 1 else ""
+        value_style_html = f' style="{value_style}"' if value_style else ""
+        _hero_items_html.append(
+            f'<div class="hero-item"{style}><div class="hero-label">{label}</div>'
+            f'<div class="hero-value"{value_style_html}>{value}</div></div>'
+        )
+    _hero_items_html = "".join(_hero_items_html)
+
     st.markdown(f"""
 <div class="hero-strip">
-  <div class="hero-item"><div class="hero-label">Price</div><div class="hero-value">{_price_str}</div></div>
-  <div class="hero-item"><div class="hero-label">Market Cap</div><div class="hero-value">{_mcap_str}</div></div>
-  <div class="hero-item"><div class="hero-label">P/E Ratio</div><div class="hero-value">{_pe_str}</div></div>
-  <div class="hero-item" style="border-right:none"><div class="hero-label">As Of</div><div class="hero-value" style="font-size:1rem">{_as_of}</div></div>
+  {_hero_items_html}
   <div class="hero-divider"></div>
   <div class="hero-ticker">
     <span class="hero-ticker-symbol">{ticker}</span>

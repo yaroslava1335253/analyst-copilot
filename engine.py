@@ -849,11 +849,17 @@ def analyze_quarterly_trends(ticker_symbol: str, num_quarters: int = 8, end_date
         current_price = None
         shares_outstanding = None
         current_market_cap = None
+        pe_ratio = None
         try:
             stock_info = yf.Ticker(ticker_symbol).info
             current_price = stock_info.get('currentPrice') or stock_info.get('regularMarketPrice')
             shares_outstanding = stock_info.get('sharesOutstanding')
             current_market_cap = stock_info.get('marketCap')
+            pe_ratio = (
+                stock_info.get('trailingPE')
+                or stock_info.get('forwardPE')
+                or stock_info.get('priceToEarnings')
+            )
         except Exception:
             pass
         
@@ -866,7 +872,8 @@ def analyze_quarterly_trends(ticker_symbol: str, num_quarters: int = 8, end_date
         result["market_data"] = {
             "current_price": current_price,
             "shares_outstanding": shares_outstanding,
-            "market_cap": current_market_cap
+            "market_cap": current_market_cap,
+            "pe_ratio": pe_ratio
         }
         
         # --- PART 1: Historical Quarterly Data ---
