@@ -122,7 +122,7 @@ def _show_dcf_details_page():
     df_inputs = pd.DataFrame(inputs_table)
     st.dataframe(df_inputs, use_container_width=True, hide_index=True)
     
-    with st.expander("ℹ️ Input Data Legend"):
+    with st.expander("Input Data Legend", icon="ℹ️"):
         st.markdown("""
         - **Value**: Actual number or "—" if missing/zero
         - **Units**: USD (currency), shares (count), % (percentage), x (multiple)
@@ -201,7 +201,7 @@ def _show_dcf_details_page():
                 st.success(f"**Used WACC: {used_wacc*100:.1f}%** — Matches CAPM cost of equity")
         
         # Sources and methodology
-        with st.expander("📚 CAPM Sources & Methodology (Sources [9–12])"):
+        with st.expander("CAPM Sources & Methodology (Sources [9–12])", icon="📚"):
             st.markdown(f"""
             **Data Sources (all traceable):**
             - **Beta ({beta:.2f})**: Yahoo Finance — 5-year monthly returns vs S&P 500
@@ -482,7 +482,7 @@ def _show_dcf_details_page():
         # Industry classification
         match_badge = "✅ Exact Match" if is_exact_match else "⚡ Approximate Match"
         
-        with st.expander("📚 Industry Classification & Methodology"):
+        with st.expander("Industry Classification & Methodology", icon="📚"):
             st.markdown(f"""
             **Industry Mapping:**
             - Yahoo Finance Industry: `{yf_industry}`
@@ -2097,7 +2097,7 @@ if st.session_state.quarterly_analysis:
     # ───────────────────────────────────────────────────────────────
     # DCF DATA SOURCES EXPANDER
     # ───────────────────────────────────────────────────────────────
-    with st.expander("📚 Data Sources & Methodology", expanded=False):
+    with st.expander("Data Sources & Methodology", expanded=False, icon="📚"):
         st.markdown("All data sources used in the DCF analysis above:")
         ticker_for_url = st.session_state.get('ticker', '{ticker}')
         for key, src in SOURCE_CATALOG.items():
