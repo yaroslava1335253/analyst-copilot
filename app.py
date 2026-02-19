@@ -319,7 +319,7 @@ def _show_dcf_details_page():
             
             # Show years 6-10 in expander if 10-year horizon
             if forecast_years == 10 and len(yearly_projections) > 5:
-                with st.expander(f"📈 Years 6-10 (Fade to Terminal)"):
+                with st.expander(f"Years 6–10 (Fade to Terminal)", icon="📈"):
                     fade_table = []
                     for proj in yearly_projections[5:]:
                         fcf_src = proj.get('fcf_source', 'driver_model')
@@ -336,7 +336,7 @@ def _show_dcf_details_page():
                     st.dataframe(pd.DataFrame(fade_table), use_container_width=True, hide_index=True)
             
             # Show formulas below
-            with st.expander("📐 Driver Formulas"):
+            with st.expander("Driver Formulas", icon="📐"):
                 st.markdown("""
                 | Driver | Formula |
                 |--------|---------|
@@ -643,10 +643,10 @@ def _show_dcf_details_page():
             if year_n_fcf_actual:
                 st.markdown(f"""
 <div style="display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px;">
-    <span style="background: #e8f4f8; padding: 4px 10px; border-radius: 12px; font-size: 13px;">{fcff_label}₁₀ = <b>${year_n_fcf_actual/1e9:.2f}B</b></span>
-    <span style="background: #e8f4f8; padding: 4px 10px; border-radius: 12px; font-size: 13px;">g = <b>{terminal_growth*100:.1f}%</b></span>
-    <span style="background: #e8f4f8; padding: 4px 10px; border-radius: 12px; font-size: 13px;">WACC = <b>{wacc_used*100:.1f}%</b></span>
-    <span style="background: #e8f4f8; padding: 4px 10px; border-radius: 12px; font-size: 13px;">n = <b>{forecast_years} years</b></span>
+    <span class="input-chip">{fcff_label}₁₀ = <b>${year_n_fcf_actual/1e9:.2f}B</b></span>
+    <span class="input-chip">g = <b>{terminal_growth*100:.1f}%</b></span>
+    <span class="input-chip">WACC = <b>{wacc_used*100:.1f}%</b></span>
+    <span class="input-chip">n = <b>{forecast_years} years</b></span>
 </div>
                 """, unsafe_allow_html=True)
         
@@ -717,9 +717,9 @@ def _show_dcf_details_page():
         forecasted_str = f"{terminal_fcff_ebitda:.0%}" if terminal_fcff_ebitda else "N/A"
         st.markdown(f"""
 <div style="display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px;">
-    <span style="background: #f0f2f6; padding: 4px 10px; border-radius: 12px; font-size: 13px;">Spread (WACC − g) = <b>{wacc_minus_g*100:.1f}%</b></span>
-    <span style="background: #f0f2f6; padding: 4px 10px; border-radius: 12px; font-size: 13px;">Terminal Cash Conversion = <b>{forecasted_str}</b> <span style="font-size:11px; color:#666;">(Year {forecast_years} forecast)</span></span>
-    <span style="background: #f0f2f6; padding: 4px 10px; border-radius: 12px; font-size: 13px;">Terminal Year = <b>{forecast_years}</b></span>
+    <span class="param-chip">Spread (WACC − g) = <b>{wacc_minus_g*100:.1f}%</b></span>
+    <span class="param-chip">Terminal Cash Conversion = <b>{forecasted_str}</b> <span style="font-size:11px; color:var(--clr-text-muted);">(Year {forecast_years} forecast)</span></span>
+    <span class="param-chip">Terminal Year = <b>{forecast_years}</b></span>
 </div>
         """, unsafe_allow_html=True)
         
@@ -748,11 +748,11 @@ def _show_dcf_details_page():
             
             # Status pill styling
             status_styles = {
-                'PASS': ('✅', '#d4edda', '#155724'),
-                'WARN': ('⚠️', '#fff3cd', '#856404'),
-                'FAIL': ('🔴', '#f8d7da', '#721c24')
+                'PASS': ('✅', 'var(--clr-success-bg)', 'var(--clr-success-text)'),
+                'WARN': ('⚠️', 'var(--clr-warn-bg)', 'var(--clr-warn-text)'),
+                'FAIL': ('🔴', 'var(--clr-danger-bg)', 'var(--clr-danger-text)')
             }
-            icon, bg_color, text_color = status_styles.get(status, ('❓', '#e2e3e5', '#383d41'))
+            icon, bg_color, text_color = status_styles.get(status, ('❓', 'var(--clr-bg)', 'var(--clr-text-secondary)'))
             
             # One-line explanation based on status
             if status == 'PASS':
@@ -784,7 +784,7 @@ def _show_dcf_details_page():
             # Row card
             price_str = f"${price:.0f}" if price else "N/A"
             st.markdown(f"""
-<div style="display: grid; grid-template-columns: 2fr 1fr 1fr 1.5fr 1fr; gap: 8px; align-items: center; padding: 10px 8px; margin: 4px 0; background: #fafafa; border-radius: 6px; border-left: 3px solid {bg_color};">
+<div style="display: grid; grid-template-columns: 2fr 1fr 1fr 1.5fr 1fr; gap: 8px; align-items: center; padding: 10px 8px; margin: 4px 0; background: var(--clr-surface); border-radius: 6px; border-left: 3px solid {bg_color}; box-shadow: var(--shadow-sm);">
     <div>
         <span style="font-weight: 600;">{name}</span><br/>
         <span style="font-size: 11px; color: #666;">{source_cite}</span>
@@ -792,9 +792,9 @@ def _show_dcf_details_page():
     <span style="text-align: right; font-weight: 600;">{multiple:.1f}x</span>
     <span style="text-align: right; font-weight: 600;">{price_str}</span>
     <span style="text-align: right; font-weight: 600;">{required_conv*100:.0f}%</span>
-    <span style="text-align: right; color: {'#dc3545' if gap_display.startswith('+') and float(gap_display[:-1]) > 50 else '#666'};">{gap_display}</span>
+    <span style="text-align: right; color: {'var(--clr-danger)' if gap_display.startswith('+') and float(gap_display[:-1]) > 50 else 'var(--clr-text-muted)'};">{gap_display}</span>
 </div>
-<div style="font-size: 13px; color: #555; margin-left: 12px; margin-bottom: 8px;">{icon} {explanation}</div>
+<div style="font-size: 13px; color: var(--clr-text-secondary); margin-left: 12px; margin-bottom: 8px;">{icon} {explanation}</div>
             """, unsafe_allow_html=True)
         
         # Model-implied multiple callout
@@ -943,12 +943,465 @@ st.set_page_config(
     initial_sidebar_state="collapsed"  # Start collapsed for expanded view
 )
 
-# --- Clean Professional CSS ---
+# --- Design System CSS ---
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
-    
-    /* Hide the default sidebar collapse control completely */
+
+    /* ═══════════════════════════════════════════
+       DESIGN TOKENS
+    ═══════════════════════════════════════════ */
+    :root {
+      --clr-bg:             #f8fafc;
+      --clr-surface:        #ffffff;
+      --clr-sidebar-bg:     #0d1630;
+      --clr-sidebar-text:   #e2e8f0;
+      --clr-sidebar-muted:  #94a3b8;
+      --clr-accent:         #2563eb;
+      --clr-accent-hover:   #1d4ed8;
+      --clr-success:        #10b981;
+      --clr-success-bg:     #ecfdf5;
+      --clr-success-text:   #065f46;
+      --clr-danger:         #f43f5e;
+      --clr-danger-bg:      #fff1f2;
+      --clr-danger-text:    #9f1239;
+      --clr-warn:           #f59e0b;
+      --clr-warn-bg:        #fffbeb;
+      --clr-warn-text:      #92400e;
+      --clr-text-primary:   #0f172a;
+      --clr-text-secondary: #475569;
+      --clr-text-muted:     #94a3b8;
+      --clr-border:         #e2e8f0;
+      --clr-border-strong:  #cbd5e1;
+      --shadow-sm:  0 1px 3px rgba(0,0,0,0.08);
+      --shadow-md:  0 4px 12px rgba(0,0,0,0.10);
+      --radius-sm: 4px;
+      --radius-md: 8px;
+      --radius-lg: 12px;
+    }
+
+    /* QW-1: Global background */
+    .stApp {
+        background: var(--clr-bg) !important;
+    }
+
+    /* QW-2: Dark navy sidebar */
+    [data-testid="stSidebar"] {
+        background: var(--clr-sidebar-bg) !important;
+    }
+    [data-testid="stSidebar"] label,
+    [data-testid="stSidebar"] p,
+    [data-testid="stSidebar"] span,
+    [data-testid="stSidebar"] .stMarkdown,
+    [data-testid="stSidebar"] .stCaption,
+    [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p {
+        color: var(--clr-sidebar-text) !important;
+    }
+    /* Input container wrapper (this is what shows the white bg) */
+    [data-testid="stSidebar"] [data-baseweb="input"],
+    [data-testid="stSidebar"] [data-baseweb="base-input"],
+    [data-testid="stSidebar"] .stTextInput > div > div {
+        background: rgba(255,255,255,0.10) !important;
+        border: 1px solid rgba(255,255,255,0.20) !important;
+        border-radius: var(--radius-sm) !important;
+    }
+    /* Remove BaseWeb's red/blue focus outline; replace with accent glow */
+    [data-testid="stSidebar"] [data-baseweb="input"]:focus-within,
+    [data-testid="stSidebar"] .stTextInput > div > div:focus-within {
+        border-color: var(--clr-accent) !important;
+        box-shadow: 0 0 0 2px rgba(37,99,235,0.35) !important;
+        outline: none !important;
+    }
+    /* Inner input element — transparent bg so container colour shows */
+    [data-testid="stSidebar"] [data-baseweb="input"] input,
+    [data-testid="stSidebar"] input {
+        background: transparent !important;
+        color: var(--clr-sidebar-text) !important;
+        caret-color: var(--clr-sidebar-text) !important;
+        border: none !important;
+        box-shadow: none !important;
+    }
+    [data-testid="stSidebar"] [data-baseweb="input"] input::placeholder,
+    [data-testid="stSidebar"] input::placeholder {
+        color: var(--clr-sidebar-muted) !important;
+        opacity: 1 !important;
+    }
+    /* "Press Enter to apply" helper text */
+    [data-testid="stSidebar"] [data-testid="InputInstructions"],
+    [data-testid="stSidebar"] .stTextInput small,
+    [data-testid="stSidebar"] .stTextInput [class*="instructions"] {
+        color: var(--clr-sidebar-muted) !important;
+    }
+    /* Selectbox */
+    [data-testid="stSidebar"] [data-baseweb="select"],
+    [data-testid="stSidebar"] [data-baseweb="select"] > div {
+        background: rgba(255,255,255,0.10) !important;
+        border: 1px solid rgba(255,255,255,0.20) !important;
+        border-radius: var(--radius-sm) !important;
+    }
+    [data-testid="stSidebar"] [data-baseweb="select"] [data-baseweb="selected-option"],
+    [data-testid="stSidebar"] [data-baseweb="select"] [data-baseweb="placeholder"],
+    [data-testid="stSidebar"] [data-baseweb="select"] svg {
+        color: var(--clr-sidebar-text) !important;
+        fill: var(--clr-sidebar-text) !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stSliderThumb"],
+    [data-testid="stSidebar"] [data-testid="stSlider"] [role="slider"] {
+        background: var(--clr-accent) !important;
+    }
+    [data-testid="stSidebar"] hr {
+        border-color: rgba(255,255,255,0.1) !important;
+    }
+    [data-testid="stSidebar"] .stCaption,
+    [data-testid="stSidebar"] small {
+        color: var(--clr-sidebar-muted) !important;
+    }
+    [data-testid="stSidebar"] .stButton > button[kind="primary"],
+    [data-testid="stSidebar"] .stButton > button[data-testid="baseButton-primary"] {
+        background: var(--clr-accent) !important;
+        border: none !important;
+        color: #fff !important;
+    }
+    [data-testid="stSidebar"] .stButton > button[kind="primary"]:hover {
+        background: var(--clr-accent-hover) !important;
+    }
+    [data-testid="stSidebar"] .stButton > button[kind="secondary"],
+    [data-testid="stSidebar"] .stButton > button[data-testid="baseButton-secondary"] {
+        background: rgba(255,255,255,0.06) !important;
+        border: 1px solid rgba(255,255,255,0.15) !important;
+        color: var(--clr-sidebar-text) !important;
+    }
+    [data-testid="stSidebar"] .stButton > button {
+        color: var(--clr-sidebar-text) !important;
+    }
+
+    /* QW-3: Metric tile cards */
+    [data-testid="metric-container"] {
+        background: var(--clr-surface) !important;
+        border: 1px solid var(--clr-border) !important;
+        border-radius: var(--radius-md) !important;
+        padding: 14px 16px !important;
+        box-shadow: var(--shadow-sm) !important;
+    }
+    [data-testid="stMetricLabel"] {
+        font-size: 0.68rem !important;
+        font-weight: 600 !important;
+        text-transform: uppercase !important;
+        letter-spacing: 0.06em !important;
+        color: var(--clr-text-muted) !important;
+    }
+    [data-testid="stMetricValue"] {
+        font-family: 'JetBrains Mono', monospace !important;
+        font-size: 1.35rem !important;
+        font-weight: 600 !important;
+        color: var(--clr-text-primary) !important;
+    }
+    [data-testid="stMetricDelta"] {
+        font-family: 'JetBrains Mono', monospace !important;
+        font-size: 0.78rem !important;
+    }
+
+    /* QW-4: Section divider upgrade */
+    hr {
+        border: none !important;
+        border-top: 2px solid var(--clr-border) !important;
+        margin: 2rem 0 !important;
+    }
+
+    /* QW-5: Typography hierarchy */
+    h1, h2, h3, h4, h5, h6 {
+        font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif !important;
+        color: var(--clr-text-primary) !important;
+    }
+    h1 { font-size: 1.5rem !important; font-weight: 700 !important; }
+    h2 { font-size: 1.15rem !important; font-weight: 700 !important; text-transform: uppercase; letter-spacing: 0.04em; }
+    h3 { font-size: 0.95rem !important; font-weight: 700 !important; }
+    .stApp, .stApp p, .stApp div, .stApp label {
+        font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif !important;
+    }
+    .stApp [class*="material-symbols"],
+    .stApp .material-symbols-outlined,
+    .stApp .material-symbols-rounded {
+        font-family: "Material Symbols Rounded", "Material Symbols Outlined", "Material Icons" !important;
+        font-style: normal;
+        line-height: 1;
+    }
+    .stApp [data-testid="stExpanderToggleIcon"],
+    .stApp [data-testid="stExpanderToggleIcon"] * {
+        font-family: "Material Symbols Rounded", "Material Symbols Outlined", "Material Icons" !important;
+        font-style: normal !important;
+        font-weight: 400 !important;
+        line-height: 1 !important;
+    }
+    .stCaption { color: var(--clr-text-muted) !important; font-size: 0.78rem !important; }
+
+    /* QW-6: Call-box token migration */
+    .call-outperform {
+        background: var(--clr-success-bg) !important;
+        border: 1px solid var(--clr-success) !important;
+        color: var(--clr-success-text) !important;
+        padding: 1rem;
+        border-radius: var(--radius-md);
+        text-align: center;
+    }
+    .call-underperform {
+        background: var(--clr-danger-bg) !important;
+        border: 1px solid var(--clr-danger) !important;
+        color: var(--clr-danger-text) !important;
+        padding: 1rem;
+        border-radius: var(--radius-md);
+        text-align: center;
+    }
+    .call-inline {
+        background: var(--clr-bg) !important;
+        border: 1px solid var(--clr-border-strong) !important;
+        color: var(--clr-text-secondary) !important;
+        padding: 1rem;
+        border-radius: var(--radius-md);
+        text-align: center;
+    }
+    .call-label {
+        font-size: 0.875rem;
+        font-weight: 700;
+        letter-spacing: 0.05em;
+    }
+
+    /* QW-7: Expander modernization */
+    [data-testid="stExpander"] {
+        background: var(--clr-surface) !important;
+        border: 1px solid var(--clr-border) !important;
+        border-radius: var(--radius-md) !important;
+        margin-top: 1rem !important;
+        box-shadow: var(--shadow-sm) !important;
+    }
+    [data-testid="stExpander"] summary {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        list-style: none;
+        padding: 0.75rem 1rem !important;
+        font-weight: 600;
+        color: var(--clr-text-primary) !important;
+        cursor: pointer;
+        transition: background 0.15s ease;
+    }
+    [data-testid="stExpander"] summary:hover {
+        background: #f8fafc !important;
+    }
+    [data-testid="stExpander"] summary:focus-visible {
+        outline: 2px solid var(--clr-accent) !important;
+        outline-offset: 2px;
+    }
+    [data-testid="stExpander"] [data-testid="stExpanderToggleIcon"] {
+        color: var(--clr-accent) !important;
+    }
+
+    /* QW-8: DataFrame finance density */
+    [data-testid="stDataFrame"] th {
+        font-size: 0.68rem !important;
+        font-weight: 700 !important;
+        text-transform: uppercase !important;
+        letter-spacing: 0.05em !important;
+        color: var(--clr-text-muted) !important;
+        background: var(--clr-bg) !important;
+        padding: 6px 10px !important;
+    }
+    [data-testid="stDataFrame"] td {
+        font-family: 'JetBrains Mono', monospace !important;
+        font-size: 0.8rem !important;
+        padding: 5px 10px !important;
+        color: var(--clr-text-primary) !important;
+    }
+    [data-testid="stDataFrame"] tr:hover td {
+        background: #eff6ff !important;
+    }
+
+    /* QW-9: Buttons + alert boxes */
+    .stButton > button {
+        font-family: 'Inter', sans-serif !important;
+        font-weight: 600 !important;
+        border-radius: var(--radius-sm) !important;
+        transition: background 0.15s ease !important;
+    }
+    .stButton > button[kind="primary"],
+    .stButton > button[data-testid="baseButton-primary"] {
+        background: var(--clr-accent) !important;
+        border: none !important;
+        color: #fff !important;
+    }
+    .stButton > button[kind="primary"]:hover {
+        background: var(--clr-accent-hover) !important;
+    }
+    [data-testid="stAlert"] {
+        border-radius: var(--radius-md) !important;
+    }
+
+    /* QW-10: Column gap */
+    [data-testid="column"] { padding: 0 8px !important; }
+    .stMarkdown br { display: block; margin: 0.25rem 0; }
+
+    /* ═══════════════════════════════════════════
+       PHASE 2 UTILITY CLASSES
+    ═══════════════════════════════════════════ */
+
+    /* Section header with step badge */
+    .section-header {
+        display: flex; align-items: center; gap: 12px;
+        margin-bottom: 1.25rem; padding: 0.5rem 0;
+    }
+    .step-badge {
+        font-size: .65rem; font-weight: 700; text-transform: uppercase;
+        letter-spacing: .1em; color: var(--clr-accent); background: #eff6ff;
+        border: 1px solid #bfdbfe; padding: 3px 8px; border-radius: 4px;
+    }
+    .section-title { font-size: 1.05rem; font-weight: 700; color: var(--clr-text-primary); }
+
+    /* Unified badge system */
+    .badge {
+        display: inline-block; padding: 3px 10px; border-radius: var(--radius-sm);
+        font-size: .7rem; font-weight: 700; letter-spacing: .06em; text-transform: uppercase;
+    }
+    .badge-pass  { background: var(--clr-success-bg); color: var(--clr-success-text); border: 1px solid var(--clr-success); }
+    .badge-warn  { background: var(--clr-warn-bg);    color: var(--clr-warn-text);    border: 1px solid var(--clr-warn); }
+    .badge-fail  { background: var(--clr-danger-bg);  color: var(--clr-danger-text);  border: 1px solid var(--clr-danger); }
+    .badge-neutral-plain { background: var(--clr-bg); color: var(--clr-text-secondary); border: 1px solid var(--clr-border-strong); }
+
+    /* Stance cards */
+    .stance-card {
+        background: var(--clr-surface); border: 1px solid var(--clr-border);
+        border-radius: var(--radius-md); padding: 14px 16px; border-left-width: 3px;
+        border-left-style: solid;
+    }
+    .stance-card-bull { border-left-color: var(--clr-success) !important; }
+    .stance-card-bear { border-left-color: var(--clr-danger) !important; }
+    .stance-card-neut { border-left-color: var(--clr-text-muted) !important; }
+
+    /* Chips */
+    .input-chip {
+        background: #eff6ff; border: 1px solid #bfdbfe; color: var(--clr-text-secondary);
+        padding: 3px 10px; border-radius: 12px; font-size: .78rem;
+        font-family: 'JetBrains Mono', monospace; display: inline-block;
+    }
+    .param-chip {
+        background: var(--clr-bg); border: 1px solid var(--clr-border);
+        color: var(--clr-text-secondary); padding: 3px 10px; border-radius: 12px;
+        font-size: .78rem; display: inline-block;
+    }
+
+    /* Subsection header */
+    .subsection-header {
+        font-size: .85rem; font-weight: 700; color: var(--clr-text-primary);
+        text-transform: uppercase; letter-spacing: .06em;
+        padding-bottom: .5rem; border-bottom: 1px solid var(--clr-border);
+        margin: 1.5rem 0 .75rem 0;
+    }
+
+    /* Sidebar data badge */
+    .sidebar-data-badge {
+        background: rgba(16,185,129,.12); border: 1px solid rgba(16,185,129,.3);
+        border-radius: var(--radius-sm); padding: 6px 12px; text-align: center;
+        font-size: .78rem; font-weight: 600; color: #6ee7b7; letter-spacing: .02em;
+        margin: 8px 0;
+    }
+
+    /* Spacers */
+    .spacer-sm { height: 1rem; }
+    .spacer-md { height: 1.75rem; }
+
+    /* App top bar */
+    .app-topbar {
+        display: flex; align-items: center; justify-content: space-between;
+        padding: 12px 0; border-bottom: 2px solid var(--clr-border); margin-bottom: 1.5rem;
+    }
+    .app-wordmark {
+        font-size: 1.1rem; font-weight: 700; color: var(--clr-text-primary); letter-spacing: -.01em;
+    }
+    .app-version {
+        font-size: .6rem; font-weight: 700; text-transform: uppercase; letter-spacing: .08em;
+        color: var(--clr-accent); background: #eff6ff; border: 1px solid #bfdbfe;
+        padding: 2px 6px; border-radius: 3px; margin-left: 8px; vertical-align: middle;
+    }
+    .app-tagline { font-size: .78rem; color: var(--clr-text-muted); }
+
+    /* Hero KPI strip */
+    .hero-strip {
+        background: var(--clr-surface); border: 1px solid var(--clr-border);
+        border-radius: var(--radius-lg); padding: 16px 24px;
+        display: flex; align-items: center; margin-bottom: 1.25rem;
+        box-shadow: var(--shadow-sm);
+    }
+    .hero-item { flex: 1; padding: 0 20px; border-right: 1px solid var(--clr-border); }
+    .hero-item:first-child { padding-left: 0; }
+    .hero-label {
+        font-size: .65rem; font-weight: 600; text-transform: uppercase;
+        letter-spacing: .07em; color: var(--clr-text-muted); margin-bottom: 4px;
+    }
+    .hero-value {
+        font-size: 1.3rem; font-weight: 700; font-family: 'JetBrains Mono', monospace;
+        color: var(--clr-text-primary);
+    }
+    .hero-divider { width: 1px; background: var(--clr-border); height: 48px; margin: 0 24px; flex-shrink: 0; }
+    .hero-ticker { text-align: right; flex-shrink: 0; }
+    .hero-ticker-symbol {
+        display: block; font-size: 1.8rem; font-weight: 800; color: var(--clr-accent);
+        font-family: 'JetBrains Mono', monospace; letter-spacing: -.02em;
+    }
+    .hero-ticker-source {
+        font-size: .65rem; color: var(--clr-text-muted); text-transform: uppercase; letter-spacing: .06em;
+    }
+
+    /* Step progress indicator */
+    .step-progress {
+        display: flex; align-items: center; justify-content: center;
+        gap: 0; margin-bottom: 1.5rem; padding: 12px 0;
+    }
+    .step-pill {
+        display: flex; align-items: center; gap: 8px; padding: 6px 16px; border-radius: 20px;
+        font-size: .72rem; font-weight: 700; letter-spacing: .05em; text-transform: uppercase;
+    }
+    .step-pill-active  { background: #eff6ff; border: 1.5px solid var(--clr-accent); color: var(--clr-accent); }
+    .step-pill-inactive { background: var(--clr-bg); border: 1.5px solid var(--clr-border); color: var(--clr-text-muted); }
+    .step-num {
+        width: 20px; height: 20px; border-radius: 50%;
+        display: flex; align-items: center; justify-content: center; font-size: .65rem; font-weight: 800;
+    }
+    .step-num-active   { background: var(--clr-accent); color: #fff; }
+    .step-num-inactive { background: var(--clr-border); color: var(--clr-text-muted); }
+    .step-connector         { flex: 1; height: 2px; background: var(--clr-border); max-width: 40px; }
+    .step-connector-active  { background: var(--clr-accent); }
+
+    /* Sidebar brand */
+    .sidebar-brand {
+        padding: 16px 0 20px 0;
+        border-bottom: 1px solid rgba(255,255,255,0.08);
+        margin-bottom: 16px;
+    }
+    .sidebar-brand-logo {
+        width: 32px; height: 32px; background: var(--clr-accent); border-radius: 6px;
+        display: inline-flex; align-items: center; justify-content: center;
+        font-size: .85rem; font-weight: 800; color: #fff;
+    }
+    .sidebar-brand-name {
+        font-size: .95rem; font-weight: 700; color: var(--clr-sidebar-text);
+        margin-left: 10px; vertical-align: middle;
+    }
+    .sidebar-brand-sub {
+        font-size: .65rem; color: var(--clr-sidebar-muted); text-transform: uppercase;
+        letter-spacing: .08em; margin-top: 6px;
+    }
+    .sidebar-section-label {
+        font-size: .6rem; font-weight: 700; text-transform: uppercase; letter-spacing: .1em;
+        color: var(--clr-sidebar-muted); margin-bottom: 8px;
+    }
+
+    /* Fix chart legend overlap */
+    [data-testid="stVegaLiteChart"] { margin-bottom: 2rem; }
+
+    /* Hide streamlit branding */
+    #MainMenu { visibility: hidden; }
+    footer { visibility: hidden; }
+
+    /* Hide the default sidebar collapse control */
     [data-testid="collapsedControl"],
     [data-testid="stSidebarCollapseButton"],
     button[kind="header"],
@@ -960,156 +1413,11 @@ st.markdown("""
         opacity: 0 !important;
         pointer-events: none !important;
     }
-    
+
     /* Fixed sidebar width */
     [data-testid="stSidebar"] > div:first-child {
         width: 300px !important;
     }
-    
-    /* Clean typography */
-    h1, h2, h3, h4, h5, h6 {
-        font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif !important;
-        font-weight: 600;
-    }
-    
-    .stApp, .stApp p, .stApp div, .stApp span, .stApp label {
-        font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif !important;
-    }
-    /* Do not override icon font glyphs (prevents expander icon token text) */
-    .stApp [data-testid="stExpanderToggleIcon"],
-    .stApp [data-testid="stExpanderToggleIcon"] * {
-        font-family: inherit !important;
-    }
-    
-    /* Metric styling */
-    [data-testid="stMetricValue"] {
-        font-family: 'JetBrains Mono', monospace !important;
-    }
-    
-    /* Fix chart legend overlap */
-    [data-testid="stVegaLiteChart"] {
-        margin-bottom: 2rem;
-    }
-    
-    /* Fix expander header overlap */
-    [data-testid="stExpander"] {
-        margin-top: 1.5rem;
-    }
-    
-    /* Expander header layout + hide default markers/icons */
-    [data-testid="stExpander"] summary {
-        display: flex;
-        align-items: center;
-        gap: 0.5rem;
-        list-style: none;
-    }
-    [data-testid="stExpander"] summary::-webkit-details-marker {
-        display: none !important;
-    }
-    [data-testid="stExpander"] summary svg,
-    [data-testid="stExpander"] summary [data-baseweb="icon"],
-    [data-testid="stExpanderToggleIcon"] {
-        display: none !important;
-    }
-    /* Hide any stray arrow text tokens rendered as elements */
-    [data-testid="stExpander"] summary [class*="arrow"],
-    [data-testid="stExpander"] summary [class*="Arrow"],
-    [data-testid="stExpander"] summary [class*="chevron"],
-    [data-testid="stExpander"] summary [class*="caret"] {
-        display: none !important;
-    }
-
-    /* Replace broken arrow text with a clean caret (works across DOM variants) */
-    [data-testid="stExpander"] summary::before {
-        content: "▸";
-        font-size: 14px;
-        color: #6b7280;
-        display: inline-block;
-        line-height: 1;
-    }
-    details[open][data-testid="stExpander"] summary::before {
-        content: "▾";
-    }
-    
-    /* Hide tooltips and hover text on expanders */
-    [data-testid="stExpander"] summary::after,
-    [data-testid="stExpander"] summary::before,
-    [data-testid="stExpander"] summary:hover::after,
-    [data-testid="stExpander"] summary:hover::before,
-    [data-testid="stExpander"] summary:focus::after,
-    [data-testid="stExpander"] summary:focus::before,
-    [data-testid="stExpander"] [title],
-    [data-testid="stExpander"] [aria-label] {
-        content: none !important;
-    }
-    
-    [data-testid="stExpander"] summary [title] {
-        title: none;
-    }
-    
-    /* Remove title attribute tooltip */
-    [data-testid="stExpander"] summary * {
-        pointer-events: auto;
-    }
-    
-    [data-testid="stExpander"] summary svg {
-        title: unset !important;
-    }
-    
-    /* Clean step cards */
-    .step-header {
-        font-size: 0.75rem;
-        font-weight: 600;
-        text-transform: uppercase;
-        letter-spacing: 0.1em;
-        color: #6b7280;
-        margin-bottom: 0.25rem;
-    }
-    
-    .step-title {
-        font-size: 1.25rem;
-        font-weight: 600;
-        color: #111827;
-        margin-bottom: 1rem;
-    }
-    
-    /* Stock call styling */
-    .call-outperform {
-        background: #ecfdf5;
-        border: 1px solid #10b981;
-        color: #065f46;
-        padding: 1rem;
-        border-radius: 8px;
-        text-align: center;
-    }
-    
-    .call-underperform {
-        background: #fef2f2;
-        border: 1px solid #ef4444;
-        color: #991b1b;
-        padding: 1rem;
-        border-radius: 8px;
-        text-align: center;
-    }
-    
-    .call-inline {
-        background: #f9fafb;
-        border: 1px solid #9ca3af;
-        color: #374151;
-        padding: 1rem;
-        border-radius: 8px;
-        text-align: center;
-    }
-    
-    .call-label {
-        font-size: 0.875rem;
-        font-weight: 700;
-        letter-spacing: 0.05em;
-    }
-    
-    /* Hide streamlit branding */
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -1205,11 +1513,23 @@ with st.sidebar:
             st.session_state.sidebar_visible = False
             st.rerun()
     
+    # Sidebar brand header
+    st.markdown("""
+        <div class="sidebar-brand">
+            <div>
+                <span class="sidebar-brand-logo">AC</span>
+                <span class="sidebar-brand-name">Analyst Co-Pilot</span>
+            </div>
+            <div class="sidebar-brand-sub">Equity Research</div>
+        </div>
+        <div class="sidebar-section-label">Configuration</div>
+    """, unsafe_allow_html=True)
+
     # Auto-load API key from .env (no UI shown)
     env_api_key = os.environ.get("GEMINI_API_KEY", "")
     if env_api_key:
         st.session_state.api_key_set = True
-    
+
     ticker = st.text_input("Stock Ticker", value="MSFT").upper()
 
     # Date-fetch state
@@ -1246,12 +1566,7 @@ with st.sidebar:
     if available_dates:
         latest_date = available_dates[0]["display"]
         st.markdown(f"""
-            <div style="background: #dcfce7; border: 1px solid #22c55e; border-radius: 6px; 
-                        padding: 8px 12px; margin: 8px 0; text-align: center;">
-                <span style="color: #15803d; font-weight: 600; font-size: 0.85rem;">
-                    📅 Latest Data: {latest_date}
-                </span>
-            </div>
+            <div class="sidebar-data-badge">Latest Data: {latest_date}</div>
         """, unsafe_allow_html=True)
     
     # Analysis Period selection
@@ -1333,10 +1648,15 @@ with st.sidebar:
 
 
 # --- Main Interface ---
-st.title("📊 Analyst Co-Pilot")
-
-# Header row with ticker
-st.caption(f"Equity research assistant for {st.session_state.get('ticker', 'your stocks')}")
+st.markdown("""
+<div class="app-topbar">
+    <div>
+        <span class="app-wordmark">Analyst Co-Pilot</span>
+        <span class="app-version">Beta</span>
+    </div>
+    <div class="app-tagline">AI-powered equity research assistant</div>
+</div>
+""", unsafe_allow_html=True)
 
 if st.session_state.quarterly_analysis:
     analysis = st.session_state.quarterly_analysis
@@ -1351,12 +1671,50 @@ if st.session_state.quarterly_analysis:
     # Show warning if using limited data
     if warning:
         st.warning(warning)
-    
+
+    # LC-3: Hero KPI strip
+    _market_data = analysis.get("market_data", {})
+    _price = _market_data.get("current_price")
+    _mcap = _market_data.get("market_cap")
+    _pe = _market_data.get("pe_ratio")
+    _as_of = most_recent.get("label", "—")
+    _price_str = f"${_price:,.2f}" if _price else "—"
+    _mcap_str = f"${_mcap/1e9:.1f}B" if _mcap else "—"
+    _pe_str = f"{_pe:.1f}x" if _pe else "—"
+    st.markdown(f"""
+<div class="hero-strip">
+  <div class="hero-item"><div class="hero-label">Price</div><div class="hero-value">{_price_str}</div></div>
+  <div class="hero-item"><div class="hero-label">Market Cap</div><div class="hero-value">{_mcap_str}</div></div>
+  <div class="hero-item"><div class="hero-label">P/E Ratio</div><div class="hero-value">{_pe_str}</div></div>
+  <div class="hero-item" style="border-right:none"><div class="hero-label">As Of</div><div class="hero-value" style="font-size:1rem">{_as_of}</div></div>
+  <div class="hero-divider"></div>
+  <div class="hero-ticker">
+    <span class="hero-ticker-symbol">{ticker}</span>
+    <span class="hero-ticker-source">via yFinance</span>
+  </div>
+</div>
+    """, unsafe_allow_html=True)
+
+    # LC-4: Step progress indicator
+    _has_forecast = bool(st.session_state.get("independent_forecast"))
+    _c2 = "step-connector-active" if _has_forecast else ""
+    _p3 = "step-pill-active" if _has_forecast else "step-pill-inactive"
+    _n3 = "step-num-active" if _has_forecast else "step-num-inactive"
+    st.markdown(f"""
+<div class="step-progress">
+  <div class="step-pill step-pill-active"><span class="step-num step-num-active">01</span>Historical</div>
+  <div class="step-connector step-connector-active"></div>
+  <div class="step-pill step-pill-active"><span class="step-num step-num-active">02</span>Consensus</div>
+  <div class="step-connector {_c2}"></div>
+  <div class="step-pill {_p3}"><span class="step-num {_n3}">03</span>AI Outlook</div>
+</div>
+    """, unsafe_allow_html=True)
+
     # ═══════════════════════════════════════════════════════════════
     # STEP 1: Historical Analysis
     # ═══════════════════════════════════════════════════════════════
     st.markdown("---")
-    st.subheader("📈 Step 1: Historical Analysis")
+    st.markdown('<div class="section-header"><span class="step-badge">Step 01</span><span class="section-title">Historical Analysis</span></div>', unsafe_allow_html=True)
     st.caption(f"Source: {data_source}")
     
     
@@ -1413,13 +1771,13 @@ if st.session_state.quarterly_analysis:
             if not eps_df.empty:
                 st.line_chart(eps_df, height=200, use_container_width=True)
     
-    st.markdown("<br><br>", unsafe_allow_html=True)  # Add spacing to prevent overlap
+    st.markdown('<div class="spacer-md"></div>', unsafe_allow_html=True)
     
     # ========== DUPONT & DCF ANALYSIS ==========
     comp_analysis = st.session_state.get('comprehensive_analysis', {})
     
     if comp_analysis:
-        st.markdown("### 🔍 Fundamental Analysis")
+        st.markdown('<h3 class="subsection-header">Fundamental Analysis</h3>', unsafe_allow_html=True)
         
         # DuPont Analysis section
         st.markdown("**DuPont Analysis**")
@@ -1712,8 +2070,8 @@ if st.session_state.quarterly_analysis:
                 else:
                     st.warning("Missing price data for comparison.")
     
-    st.markdown("<br>", unsafe_allow_html=True)
-    
+    st.markdown('<div class="spacer-sm"></div>', unsafe_allow_html=True)
+
     # Detailed data in expander
     with st.expander("View detailed quarterly data", icon="📋"):
         if hist_data:
@@ -1754,7 +2112,7 @@ if st.session_state.quarterly_analysis:
     # STEP 2: Wall Street Consensus
     # ═══════════════════════════════════════════════════════════════
     st.markdown("---")
-    st.subheader("🎯 Step 2: Wall Street Consensus")
+    st.markdown('<div class="section-header"><span class="step-badge">Step 02</span><span class="section-title">Wall Street Consensus</span></div>', unsafe_allow_html=True)
     
     consensus = analysis.get("consensus_estimates", {})
     next_forecast_label = next_forecast.get("label", "Next Quarter")
@@ -1862,7 +2220,7 @@ if st.session_state.quarterly_analysis:
                     direction = "bullish" if upside > 5 else ("neutral" if upside > -5 else "cautious")
                     st.markdown(f"**Analyst View:** Consensus is {direction} with {buy} buy ratings vs {sell} sell, targeting {upside:+.0f}% from current levels.")
         
-        st.markdown("<br>", unsafe_allow_html=True)  # Add spacing
+        st.markdown('<div class="spacer-sm"></div>', unsafe_allow_html=True)
         
         # Sources
         with st.expander("Sources & Citations", icon="🔗"):
@@ -1891,7 +2249,7 @@ if st.session_state.quarterly_analysis:
     # STEP 3: AI Outlook
     # ═══════════════════════════════════════════════════════════════
     st.markdown("---")
-    st.subheader("🤖 Step 3: AI Outlook — Multi-Horizon Analysis")
+    st.markdown('<div class="section-header"><span class="step-badge">Step 03</span><span class="section-title">AI Outlook — Multi-Horizon Analysis</span></div>', unsafe_allow_html=True)
     
     # Check if DCF analysis has been run
     dcf_ui = st.session_state.get('dcf_ui_adapter')
@@ -1941,9 +2299,10 @@ if st.session_state.quarterly_analysis:
                 with col1:
                     short_stance = extracted.get("short_term_stance", "Neutral")
                     short_emoji = {"Bullish": "📈", "Neutral": "➡️", "Bearish": "📉"}.get(short_stance, "➡️")
+                    _sc1 = "stance-card-bull" if short_stance == "Bullish" else "stance-card-bear" if short_stance == "Bearish" else "stance-card-neut"
                     st.markdown(f"""
-<div style="background: #f8f9fa; padding: 12px; border-radius: 8px; border-left: 3px solid {'#28a745' if short_stance == 'Bullish' else '#dc3545' if short_stance == 'Bearish' else '#6c757d'};">
-    <div style="font-size: 11px; color: #666;">SHORT-TERM (0-12m)</div>
+<div class="stance-card {_sc1}">
+    <div style="font-size: 11px; color: var(--clr-text-muted);">SHORT-TERM (0-12m)</div>
     <div style="font-size: 18px; font-weight: 600;">{short_emoji} {short_stance}</div>
 </div>
                     """, unsafe_allow_html=True)
@@ -1951,9 +2310,10 @@ if st.session_state.quarterly_analysis:
                 with col2:
                     fund_outlook = extracted.get("fundamental_outlook", "Stable")
                     fund_emoji = {"Strong": "💪", "Stable": "➡️", "Weakening": "⚠️"}.get(fund_outlook, "➡️")
+                    _sc2 = "stance-card-bull" if fund_outlook == "Strong" else "stance-card-neut" if fund_outlook == "Stable" else "stance-card-bear"
                     st.markdown(f"""
-<div style="background: #f8f9fa; padding: 12px; border-radius: 8px; border-left: 3px solid {'#28a745' if fund_outlook == 'Strong' else '#ffc107' if fund_outlook == 'Stable' else '#dc3545'};">
-    <div style="font-size: 11px; color: #666;">FUNDAMENTALS</div>
+<div class="stance-card {_sc2}">
+    <div style="font-size: 11px; color: var(--clr-text-muted);">FUNDAMENTALS</div>
     <div style="font-size: 18px; font-weight: 600;">{fund_emoji} {fund_outlook}</div>
 </div>
                     """, unsafe_allow_html=True)
@@ -1964,9 +2324,10 @@ if st.session_state.quarterly_analysis:
                     stock_emoji = {"Bullish": "📈", "Neutral": "➡️", "Bearish": "📉"}.get(stock_outlook, "➡️")
                     conv_level = extracted.get("fundamental_conviction", "Medium")
                     conv_badge = {"High": "🟢", "Medium": "🟡", "Low": "🔴"}.get(conv_level, "🟡")
+                    _sc3 = "stance-card-bull" if stock_outlook == "Bullish" else "stance-card-bear" if stock_outlook == "Bearish" else "stance-card-neut"
                     st.markdown(f"""
-<div style="background: #f8f9fa; padding: 12px; border-radius: 8px; border-left: 3px solid {'#28a745' if stock_outlook == 'Bullish' else '#dc3545' if stock_outlook == 'Bearish' else '#6c757d'};">
-    <div style="font-size: 11px; color: #666;">STOCK OUTLOOK {conv_badge}</div>
+<div class="stance-card {_sc3}">
+    <div style="font-size: 11px; color: var(--clr-text-muted);">STOCK OUTLOOK {conv_badge}</div>
     <div style="font-size: 18px; font-weight: 600;">{stock_emoji} {stock_outlook}</div>
 </div>
                     """, unsafe_allow_html=True)
@@ -1988,16 +2349,16 @@ if st.session_state.quarterly_analysis:
                     cols = st.columns(3)
                     with cols[0]:
                         if wacc_assess:
-                            color = "#28a745" if wacc_assess == "reasonable" else "#ffc107" if wacc_assess == "conservative" else "#dc3545"
-                            st.markdown(f'<span style="background: {color}20; color: {color}; padding: 4px 8px; border-radius: 4px; font-size: 12px;">WACC: {wacc_assess}</span>', unsafe_allow_html=True)
+                            _bcls = "badge-pass" if wacc_assess == "reasonable" else "badge-warn" if wacc_assess == "conservative" else "badge-fail"
+                            st.markdown(f'<span class="badge {_bcls}">WACC: {wacc_assess}</span>', unsafe_allow_html=True)
                     with cols[1]:
                         if growth_assess:
-                            color = "#28a745" if growth_assess == "reasonable" else "#ffc107" if growth_assess == "conservative" else "#dc3545"
-                            st.markdown(f'<span style="background: {color}20; color: {color}; padding: 4px 8px; border-radius: 4px; font-size: 12px;">Growth: {growth_assess}</span>', unsafe_allow_html=True)
+                            _bcls = "badge-pass" if growth_assess == "reasonable" else "badge-warn" if growth_assess == "conservative" else "badge-fail"
+                            st.markdown(f'<span class="badge {_bcls}">Growth: {growth_assess}</span>', unsafe_allow_html=True)
                     with cols[2]:
                         if conv_assess:
-                            color = "#28a745" if conv_assess == "achievable" else "#dc3545"
-                            st.markdown(f'<span style="background: {color}20; color: {color}; padding: 4px 8px; border-radius: 4px; font-size: 12px;">Terminal Conv: {conv_assess}</span>', unsafe_allow_html=True)
+                            _bcls = "badge-pass" if conv_assess == "achievable" else "badge-fail"
+                            st.markdown(f'<span class="badge {_bcls}">Terminal Conv: {conv_assess}</span>', unsafe_allow_html=True)
                 
                 # Evidence Gaps
                 evidence_gaps = extracted.get("evidence_gaps", [])

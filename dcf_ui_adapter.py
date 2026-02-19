@@ -314,6 +314,22 @@ class DCFUIAdapter:
             "growth_proxy_warning": assumptions.get("growth_proxy_warning", False),
             "data_quality_score": assumptions.get("data_quality_score"),
             "wacc_is_estimated": assumptions.get("wacc_is_estimated", True),
+            # ── Textbook driver model fields ──
+            "use_driver_model": assumptions.get("use_driver_model", True),
+            "yearly_projections": assumptions.get("yearly_projections", []),
+            "display_years": assumptions.get("display_years", 5),
+            "is_large_cap": assumptions.get("is_large_cap", False),
+            "horizon_reason": assumptions.get("horizon_reason"),
+            "near_term_growth_rate": assumptions.get("near_term_growth_rate"),
+            "stable_growth_rate": assumptions.get("stable_growth_rate"),
+            "base_roic": assumptions.get("base_roic"),
+            "terminal_roic": assumptions.get("terminal_roic"),
+            "industry_roic": assumptions.get("industry_roic"),
+            "terminal_reinvestment_rate": assumptions.get("terminal_reinvestment_rate"),
+            "base_revenue": assumptions.get("base_revenue"),
+            # Analyst FCF anchor metadata
+            "analyst_fcf_anchors_used": assumptions.get("analyst_fcf_anchors_used", False),
+            "fcf_sources": assumptions.get("fcf_sources", []),
         }
         
         # Extract outputs with validation

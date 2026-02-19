@@ -127,7 +127,11 @@ class DCFAssumptions:
     
     # Derived per-year projections (populated during calculation)
     yearly_projections: List[Dict] = field(default_factory=list)  # Full driver table
-    
+
+    # Analyst FCF anchor metadata
+    analyst_fcf_anchors_used: bool = False  # True if analyst revenue estimates anchored Years 1-3
+    fcf_sources: List[str] = field(default_factory=list)  # Per-year source: "analyst_revenue_estimate" or "driver_model"
+
     # Driver-based mode flag
     use_driver_model: bool = True  # True = textbook, False = legacy simple growth
     
