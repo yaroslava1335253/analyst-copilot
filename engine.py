@@ -468,14 +468,10 @@ def calculate_comprehensive_analysis(
 def get_gemini_model():
     """Returns a configured Gemini GenerativeModel."""
     try:
-        available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        # Prefer flash for speed/cost
-        flash_models = [m for m in available_models if 'flash' in m]
-        model_name = flash_models[0] if flash_models else 'gemini-1.5-flash'
-        return genai.GenerativeModel(model_name)
-    except Exception as e:
-        # Fallback if list_models fails or token issues
-        return genai.GenerativeModel('gemini-1.5-flash')
+        return genai.GenerativeModel("gemini-3-flash-preview")
+    except Exception:
+        # Fallback keeps a fixed model name (no dynamic model lookup).
+        return genai.GenerativeModel("gemini-2.5-flash")
 
 def run_structured_prompt(system_role: str, user_prompt: str, context_data: str) -> str:
     """
