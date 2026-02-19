@@ -21,6 +21,7 @@ from engine import get_financials, run_structured_prompt, calculate_metrics, run
 from data_adapter import DataAdapter
 from dcf_engine import DCFEngine, DCFAssumptions
 from dcf_ui_adapter import DCFUIAdapter
+from sources import SOURCE_CATALOG
 
 # --- Cached API Functions ---
 # These decorators cache results so API calls only happen once per input
@@ -155,19 +156,19 @@ def _show_dcf_details_page():
         col_capm1, col_capm2, col_capm3 = st.columns(3)
         
         with col_capm1:
-            st.metric("Risk-Free Rate (Rf)", f"{RISK_FREE_RATE*100:.1f}%")
+            st.metric("Risk-Free Rate (Rf)¹¹", f"{RISK_FREE_RATE*100:.1f}%")
             st.caption(RF_SOURCE)
-        
+
         with col_capm2:
-            st.metric("Market Risk Premium", f"{MARKET_RISK_PREMIUM*100:.1f}%")
+            st.metric("Market Risk Premium (ERP)¹²", f"{MARKET_RISK_PREMIUM*100:.1f}%")
             st.caption(f"Damodaran Implied ERP ({DAMODARAN_DATE})")
-        
+
         with col_capm3:
             if beta:
-                st.metric("Beta (β)", f"{beta:.2f}")
+                st.metric("Beta (β)¹⁰", f"{beta:.2f}")
                 st.caption("Yahoo Finance (5Y monthly)")
             else:
-                st.metric("Beta (β)", "N/A")
+                st.metric("Beta (β)¹⁰", "N/A")
                 st.caption("Not available")
         
         # Show CAPM calculation
@@ -200,7 +201,7 @@ def _show_dcf_details_page():
                 st.success(f"**Used WACC: {used_wacc*100:.1f}%** — Matches CAPM cost of equity")
         
         # Sources and methodology
-        with st.expander("📚 CAPM Sources & Methodology"):
+        with st.expander("📚 CAPM Sources & Methodology (Sources [9–12])"):
             st.markdown(f"""
             **Data Sources (all traceable):**
             - **Beta ({beta:.2f})**: Yahoo Finance — 5-year monthly returns vs S&P 500
@@ -266,7 +267,19 @@ def _show_dcf_details_page():
         # Check if we have driver-based projections (textbook DCF)
         if use_driver_model and yearly_projections:
             # ===== DRIVER-BASED PROJECTION TABLE (TEXTBOOK DCF) =====
-            st.caption("📚 **Textbook DCF**: Revenue → EBIT → NOPAT → Reinvestment → FCFF")
+            analyst_anchors_used = assumptions.get('analyst_fcf_anchors_used', False)
+            if analyst_anchors_used:
+                st.caption(
+                    "📚 **Textbook DCF**: Revenue → EBIT → NOPAT → Reinvestment → FCFF  \n"
+                    "FCF Years 1–3: analyst revenue consensus¹ × TTM FCF margin⁴  |  "
+                    "FCF Years 4–10: FCFF driver model²  |  Growth rates: Damodaran fade⁶"
+                )
+            else:
+                st.caption(
+                    "📚 **Textbook DCF**: Revenue → EBIT → NOPAT → Reinvestment → FCFF  \n"
+                    "FCF: FCFF driver model² (no analyst estimates available)  |  "
+                    "Growth rates: Damodaran smooth fade⁶"
+                )
             
             # Show growth fade and ROIC info
             near_term_g = assumptions.get('near_term_growth_rate', 0)
@@ -277,25 +290,27 @@ def _show_dcf_details_page():
             terminal_reinv_rate = assumptions.get('terminal_reinvestment_rate', 0)
             
             st.info(
-                f"**Growth Fade**: Years 1-3: {near_term_g:.1%} → Year {forecast_years}: {stable_g:.1%} (g_perp)  \n"
-                f"**ROIC Fade**: Current {current_roic:.1%} → Terminal {terminal_roic:.1%} (industry: {industry_roic:.1%})  \n"
-                f"**Terminal Reinvestment**: {terminal_reinv_rate:.1%} = g_perp / ROIC_terminal"
+                f"**Growth Fade**⁶: {near_term_g:.1%} → Year {forecast_years}: {stable_g:.1%} (g_perp)⁸  \n"
+                f"**ROIC Fade**⁷: Current {current_roic:.1%} → Terminal {terminal_roic:.1%} (industry: {industry_roic:.1%})  \n"
+                f"**Terminal Reinvestment**⁶: {terminal_reinv_rate:.1%} = g_perp / ROIC_terminal"
             )
             
             # Full driver table (show display_years, but compute all)
             proj_table = []
             display_projs = yearly_projections[:display_years] if len(yearly_projections) > display_years else yearly_projections
             for proj in display_projs:
+                fcf_src = proj.get('fcf_source', 'driver_model')
+                src_badge = "[¹]" if fcf_src == "analyst_revenue_estimate" else "[²]"
                 proj_table.append({
                     "Year": f"Y{proj.get('year', 0)}",
-                    "Revenue": f"${proj.get('revenue', 0)/1e9:.1f}B",
-                    "Growth": f"{proj.get('revenue_growth', 0):.1%}",
-                    "EBIT Margin": f"{proj.get('ebit_margin', 0):.1%}",
+                    "Revenue³": f"${proj.get('revenue', 0)/1e9:.1f}B",
+                    "Growth⁶": f"{proj.get('revenue_growth', 0):.1%}",
+                    "EBIT Margin⁵": f"{proj.get('ebit_margin', 0):.1%}",
                     "EBIT": f"${proj.get('ebit', 0)/1e9:.1f}B",
                     "NOPAT": f"${proj.get('nopat', 0)/1e9:.1f}B",
-                    "Reinvest": f"${proj.get('reinvestment', 0)/1e9:.1f}B",
-                    "Reinv Rate": f"{proj.get('reinvestment_rate', 0):.0%}",
-                    "FCFF": f"${proj.get('fcff', 0)/1e9:.1f}B",
+                    "Reinvest⁶": f"${proj.get('reinvestment', 0)/1e9:.1f}B",
+                    "Reinv Rate⁶": f"{proj.get('reinvestment_rate', 0):.0%}",
+                    "FCFF⁴": f"${proj.get('fcff', 0)/1e9:.1f}B {src_badge}",
                     "PV(FCFF)": f"${proj.get('pv_fcff', 0)/1e9:.1f}B"
                 })
             
@@ -307,13 +322,15 @@ def _show_dcf_details_page():
                 with st.expander(f"📈 Years 6-10 (Fade to Terminal)"):
                     fade_table = []
                     for proj in yearly_projections[5:]:
+                        fcf_src = proj.get('fcf_source', 'driver_model')
+                        src_badge = "[¹]" if fcf_src == "analyst_revenue_estimate" else "[²]"
                         fade_table.append({
                             "Year": f"Y{proj.get('year', 0)}",
-                            "Revenue": f"${proj.get('revenue', 0)/1e9:.1f}B",
-                            "Growth": f"{proj.get('revenue_growth', 0):.1%}",
+                            "Revenue³": f"${proj.get('revenue', 0)/1e9:.1f}B",
+                            "Growth⁶": f"{proj.get('revenue_growth', 0):.1%}",
                             "NOPAT": f"${proj.get('nopat', 0)/1e9:.1f}B",
-                            "Reinv Rate": f"{proj.get('reinvestment_rate', 0):.0%}",
-                            "FCFF": f"${proj.get('fcff', 0)/1e9:.1f}B",
+                            "Reinv Rate⁶": f"{proj.get('reinvestment_rate', 0):.0%}",
+                            "FCFF⁴": f"${proj.get('fcff', 0)/1e9:.1f}B {src_badge}",
                             "PV(FCFF)": f"${proj.get('pv_fcff', 0)/1e9:.1f}B"
                         })
                     st.dataframe(pd.DataFrame(fade_table), use_container_width=True, hide_index=True)
@@ -353,7 +370,7 @@ def _show_dcf_details_page():
         pv_sum = sum([p.get('pv', 0) for p in projections])
     
     # TERMINAL VALUE CALCULATION
-    st.markdown("### Terminal Value Calculation")
+    st.markdown("### Terminal Value Calculation⁸ ¹³")
     tv_yearN = ui_data.get('terminal_value_yearN', 0)
     pv_tv = ui_data.get('pv_terminal_value', 0)
     assumptions = ui_data.get('assumptions', {})
@@ -1719,6 +1736,20 @@ if st.session_state.quarterly_analysis:
                 df_growth[col] = df_growth[col].apply(lambda x: f"{x:.1f}%" if x is not None else "—")
             st.dataframe(df_growth, use_container_width=True)
     
+    # ───────────────────────────────────────────────────────────────
+    # DCF DATA SOURCES EXPANDER
+    # ───────────────────────────────────────────────────────────────
+    with st.expander("📚 Data Sources & Methodology", expanded=False):
+        st.markdown("All data sources used in the DCF analysis above:")
+        ticker_for_url = st.session_state.get('ticker', '{ticker}')
+        for key, src in SOURCE_CATALOG.items():
+            url = src['url'].replace('{ticker}', ticker_for_url)
+            st.markdown(
+                f"**[{src['id']}]** **{src['label']}** — {src['description']}  \n"
+                f"*Method: {src['method']}*  \n"
+                f"[{url}]({url})"
+            )
+
     # ═══════════════════════════════════════════════════════════════
     # STEP 2: Wall Street Consensus
     # ═══════════════════════════════════════════════════════════════
@@ -1846,6 +1877,7 @@ if st.session_state.quarterly_analysis:
 **Data Sources:**
 - [Yahoo Finance](https://finance.yahoo.com/quote/{ticker}/analysis) — EPS & Revenue Estimates, Analyst Ratings
                 """)
+            st.markdown("*See **📚 Data Sources & Methodology** in the DCF section above for full methodology citations.*")
             
             # AI-sourced analyst commentary
             if qual_sources:

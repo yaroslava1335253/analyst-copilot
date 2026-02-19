@@ -1256,22 +1256,12 @@ class DCFEngine:
         self.assumptions.stable_growth_rate = stable_g
         self.assumptions.near_term_growth_source = "analyst_cagr" if hasattr(self.snapshot, 'analyst_growth') else "yahoo_trailing"
         
-        # Growth fade: Years 1-3 near-term, Years 4-N linear fade to g_perp
+        # Growth fade: smooth linear fade from near-term to g_perp across all years
+        # (Avoids cliff at Year 4 when analyst anchors are unavailable)
         growth_rates = []
         for year in range(1, n_years + 1):
-            if year <= 3:
-                # Years 1-3: Near-term growth (analyst CAGR or historical)
-                g = near_term_g
-            else:
-                # Years 4-N: Linear fade from near-term to stable
-                # At year 4, start fading; at year N, reach g_perp
-                fade_start = 3
-                fade_end = n_years
-                if fade_end > fade_start:
-                    fade_progress = (year - fade_start) / (fade_end - fade_start)
-                    g = near_term_g + fade_progress * (stable_g - near_term_g)
-                else:
-                    g = stable_g
+            fade_progress = (year - 1) / max(n_years - 1, 1)
+            g = near_term_g + fade_progress * (stable_g - near_term_g)
             growth_rates.append(round(g, 4))
         
         self.assumptions.revenue_growth_rates = growth_rates
@@ -1289,17 +1279,8 @@ class DCFEngine:
         
         reinv_rates = []
         for year in range(1, n_years + 1):
-            if year <= 3:
-                rr = current_reinv_rate
-            else:
-                # Fade from current to terminal
-                fade_start = 3
-                fade_end = n_years
-                if fade_end > fade_start:
-                    fade_progress = (year - fade_start) / (fade_end - fade_start)
-                    rr = current_reinv_rate + fade_progress * (terminal_reinv_rate - current_reinv_rate)
-                else:
-                    rr = terminal_reinv_rate
+            fade_progress = (year - 1) / max(n_years - 1, 1)
+            rr = current_reinv_rate + fade_progress * (terminal_reinv_rate - current_reinv_rate)
             reinv_rates.append(round(rr, 4))
         
         self.assumptions.reinvestment_rates = reinv_rates
@@ -1349,43 +1330,70 @@ class DCFEngine:
             notes=f"Textbook DCF: {horizon_note}, growth fades Y4-{n_years}, ROIC-based terminal reinvestment"
         ))
         
+        # --- Build analyst FCF anchors (Years 1-3) ---
+        # Anchor near-term FCF to analyst revenue consensus × TTM FCF margin to avoid
+        # the reinvestment-rate cliff that occurs when the driver model holds reinv_rate
+        # constant for Years 1-3 then abruptly fades it from Year 4 onward.
+        analyst_fcf_anchors = {}   # {year_index (1-based): fcf_value}
+        analyst_estimates = getattr(self.snapshot, 'analyst_revenue_estimates', [])
+        ttm_fcff_margin = ttm_fcff / ttm_revenue if ttm_revenue > 0 else None
+
+        if analyst_estimates and ttm_fcff_margin is not None and ttm_fcff_margin > 0:
+            raw_revs = [e['revenue'] for e in analyst_estimates if e.get('revenue')]
+            for i, rev in enumerate(raw_revs[:2]):   # Year 1, Year 2
+                analyst_fcf_anchors[i + 1] = rev * ttm_fcff_margin
+            # Year 3: extrapolate from Year 1→2 trend (or compound Year 2 at near-term g)
+            if len(raw_revs) >= 2 and raw_revs[0] > 0:
+                yr2_growth = raw_revs[1] / raw_revs[0] - 1
+                analyst_fcf_anchors[3] = raw_revs[1] * (1 + yr2_growth) * ttm_fcff_margin
+            elif len(raw_revs) == 1:
+                analyst_fcf_anchors[2] = raw_revs[0] * (1 + near_term_g) * ttm_fcff_margin
+                analyst_fcf_anchors[3] = analyst_fcf_anchors[2] * (1 + near_term_g)
+
+        self.assumptions.analyst_fcf_anchors_used = bool(analyst_fcf_anchors)
+        self.assumptions.fcf_sources = []  # Populated per-year below
+
         for year in range(1, n_years + 1):
             g = growth_rates[year - 1]
             margin = ebit_margins[year - 1]
             reinv_rate = reinv_rates[year - 1]
-            
-            # Revenue projection
-            revenue = prev_revenue * (1 + g)
-            delta_revenue = revenue - prev_revenue
-            
-            # EBIT from margin
-            ebit = revenue * margin
-            
-            # D&A projection (constant % of revenue)
-            da = revenue * da_to_revenue_ratio
-            
-            # EBITDA = EBIT + D&A (critical for exit multiple consistency)
-            ebitda = ebit + da
-            
-            # NOPAT
-            nopat = ebit * (1 - tax_rate)
-            
-            # Reinvestment using rate (textbook method)
-            reinvestment = nopat * reinv_rate
-            
-            # FCFF = NOPAT - Reinvestment = NOPAT × (1 - reinv_rate)
-            fcff = nopat - reinvestment
-            
-            # Implied ROIC = g / reinvestment_rate (for display)
-            implied_roic = g / reinv_rate if reinv_rate > 0 else None
-            
+
+            if year in analyst_fcf_anchors:
+                # ── Analyst anchor path: FCF = analyst_revenue × TTM FCF margin ──
+                fcff = analyst_fcf_anchors[year]
+                fcf_source = "analyst_revenue_estimate"
+                # Back-derive implied revenue for downstream fields (EBITDA, etc.)
+                revenue = fcff / ttm_fcff_margin if ttm_fcff_margin else prev_revenue * (1 + g)
+                delta_revenue = revenue - prev_revenue
+                ebit = revenue * margin
+                da = revenue * da_to_revenue_ratio
+                ebitda = ebit + da
+                nopat = ebit * (1 - tax_rate)
+                # Implied reinvestment = NOPAT - FCFF (may differ from reinv_rate formula)
+                reinvestment = max(0, nopat - fcff)
+                implied_roic = g / reinv_rate if reinv_rate > 0 else None
+            else:
+                # ── Driver model path: FCFF = NOPAT × (1 - reinv_rate) ──
+                fcf_source = "driver_model"
+                revenue = prev_revenue * (1 + g)
+                delta_revenue = revenue - prev_revenue
+                ebit = revenue * margin
+                da = revenue * da_to_revenue_ratio
+                ebitda = ebit + da
+                nopat = ebit * (1 - tax_rate)
+                reinvestment = nopat * reinv_rate
+                fcff = nopat - reinvestment
+                implied_roic = g / reinv_rate if reinv_rate > 0 else None
+
+            self.assumptions.fcf_sources.append(fcf_source)
+
             # FCFF/EBITDA ratio for this year (cash conversion)
             fcff_ebitda_year = fcff / ebitda if ebitda > 0 else None
-            
+
             # Present value
             discount_factor = (1 + wacc) ** year
             pv = fcff / discount_factor
-            
+
             # Store detailed projection
             year_detail = {
                 "year": year,
@@ -1403,10 +1411,11 @@ class DCFEngine:
                 "fcff_ebitda": fcff_ebitda_year,
                 "discount_factor": discount_factor,
                 "pv_fcff": pv,
-                "implied_roic": implied_roic
+                "implied_roic": implied_roic,
+                "fcf_source": fcf_source,
             }
             yearly_details.append(year_detail)
-            
+
             # Standard projection format for compatibility
             projections.append({
                 "year": year,
@@ -1424,9 +1433,10 @@ class DCFEngine:
                 "nopat": nopat,
                 "reinvestment": reinvestment,
                 "reinvestment_rate": reinv_rate,
-                "fcff_ebitda": fcff_ebitda_year
+                "fcff_ebitda": fcff_ebitda_year,
+                "fcf_source": fcf_source,
             })
-            
+
             prev_revenue = revenue
         
         # Store detailed yearly projections in assumptions for UI

@@ -105,7 +105,8 @@ class NormalizedFinancialSnapshot:
         self.beta = DataQualityMetadata()
         self.suggested_wacc = DataQualityMetadata()
         self.suggested_fcf_growth = DataQualityMetadata()
-        
+        self.analyst_revenue_estimates = []  # List of {year_label, revenue, source, reliability_score}
+
         # Latest annual
         self.latest_annual_date = None
         self.latest_annual_diluted_shares = DataQualityMetadata()
@@ -205,6 +206,9 @@ class DataAdapter:
             
             # Step 6: Calculate suggested WACC and FCF growth
             self._calculate_suggested_assumptions()
+
+            # Step 7: Fetch analyst revenue consensus estimates (for DCF anchor)
+            self._fetch_analyst_revenue_estimates(stock)
             
         except Exception as e:
             self.snapshot.add_warning(
@@ -1001,3 +1005,31 @@ class DataAdapter:
             is_estimated=True,
             notes="Fallback: No analyst estimates or historical data, using 8% default"
         )
+
+    def _fetch_analyst_revenue_estimates(self, stock):
+        """Fetch analyst consensus revenue estimates for DCF Year 1-2 anchoring."""
+        try:
+            rev_est = stock.revenue_estimate
+            if rev_est is None or rev_est.empty:
+                return
+
+            estimates = []
+            reliability_map = {"0y": 85, "+1y": 80}
+            for label in ["0y", "+1y"]:
+                if label in rev_est.index:
+                    row = rev_est.loc[label]
+                    avg_rev = row.get("avg") if hasattr(row, "get") else row["avg"] if "avg" in row else None
+                    if avg_rev is not None and not (isinstance(avg_rev, float) and avg_rev != avg_rev):
+                        estimates.append({
+                            "year_label": label,
+                            "revenue": float(avg_rev),
+                            "source": "Yahoo Finance consensus",
+                            "reliability_score": reliability_map.get(label, 75),
+                        })
+
+            self.snapshot.analyst_revenue_estimates = estimates
+        except Exception as e:
+            self.snapshot.add_warning(
+                "ANALYST_REVENUE_ESTIMATES_ERROR",
+                f"Could not fetch analyst revenue estimates: {str(e)[:80]}"
+            )
