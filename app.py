@@ -12,6 +12,8 @@ import os
 import re
 import streamlit as st
 import streamlit.components.v1 as components
+from pathlib import Path
+from datetime import datetime
 from dotenv import load_dotenv
 
 # Load API keys from .env file (if exists)
@@ -19,10 +21,299 @@ load_dotenv()
 import pandas as pd
 import json
 from engine import get_financials, run_structured_prompt, calculate_metrics, run_chat, analyze_quarterly_trends, generate_independent_forecast, get_latest_date_info, get_available_report_dates, calculate_comprehensive_analysis
-from data_adapter import DataAdapter
+from data_adapter import DataAdapter, DataQualityMetadata, NormalizedFinancialSnapshot
 from dcf_engine import DCFEngine, DCFAssumptions
 from dcf_ui_adapter import DCFUIAdapter
 from sources import SOURCE_CATALOG
+
+UI_CACHE_VERSION = 1
+UI_CACHE_PATH = Path(__file__).resolve().parent / "data" / "user_ui_cache.json"
+MAX_TICKER_LIBRARY_SIZE = 100
+TICKER_PATTERN = re.compile(r"^[A-Z0-9.\-]{1,10}$")
+MAG7_TICKERS = ["AAPL", "AMZN", "GOOGL", "META", "MSFT", "NVDA", "TSLA"]
+SNAPSHOT_METADATA_FIELDS = [
+    "price",
+    "shares_outstanding",
+    "market_cap",
+    "total_debt",
+    "cash_and_equivalents",
+    "ttm_revenue",
+    "ttm_operating_cash_flow",
+    "ttm_capex",
+    "ttm_fcf",
+    "ttm_ebitda",
+    "ttm_operating_income",
+    "ttm_net_income",
+    "effective_tax_rate",
+    "beta",
+    "suggested_wacc",
+    "suggested_fcf_growth",
+]
+
+
+def _default_ui_cache() -> dict:
+    return {
+        "version": UI_CACHE_VERSION,
+        "ticker_library": MAG7_TICKERS.copy(),
+        "last_selected_ticker": "MSFT",
+        "results": {},
+    }
+
+
+def _normalize_ticker(ticker: str) -> str:
+    if ticker is None:
+        return ""
+    return str(ticker).strip().upper()
+
+
+def _is_valid_ticker_format(ticker: str) -> bool:
+    return bool(TICKER_PATTERN.match(_normalize_ticker(ticker)))
+
+
+def _normalize_ticker_library(raw_tickers) -> list:
+    ordered = []
+    for ticker in MAG7_TICKERS + (raw_tickers or []):
+        t = _normalize_ticker(ticker)
+        if not t or not _is_valid_ticker_format(t):
+            continue
+        if t not in ordered:
+            ordered.append(t)
+        if len(ordered) >= MAX_TICKER_LIBRARY_SIZE:
+            break
+    return ordered if ordered else MAG7_TICKERS.copy()
+
+
+def _json_safe(value):
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:
+            pass
+    return str(value)
+
+
+def load_ui_cache() -> dict:
+    default = _default_ui_cache()
+    if not UI_CACHE_PATH.exists():
+        return default
+    try:
+        with UI_CACHE_PATH.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return default
+        cache = {
+            "version": data.get("version", UI_CACHE_VERSION),
+            "ticker_library": _normalize_ticker_library(data.get("ticker_library", [])),
+            "last_selected_ticker": _normalize_ticker(data.get("last_selected_ticker", "MSFT")) or "MSFT",
+            "results": data.get("results", {}) if isinstance(data.get("results", {}), dict) else {},
+        }
+        return cache
+    except Exception:
+        return default
+
+
+def save_ui_cache(cache_obj: dict) -> None:
+    try:
+        UI_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": UI_CACHE_VERSION,
+            "ticker_library": _normalize_ticker_library(cache_obj.get("ticker_library", [])),
+            "last_selected_ticker": _normalize_ticker(cache_obj.get("last_selected_ticker", "MSFT")) or "MSFT",
+            "results": _json_safe(cache_obj.get("results", {})),
+        }
+        tmp_path = UI_CACHE_PATH.with_suffix(".tmp")
+        with tmp_path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        tmp_path.replace(UI_CACHE_PATH)
+    except Exception:
+        # Persistence failure should never break the UI flow.
+        pass
+
+
+def build_context_key(ticker: str, end_date: str, num_quarters: int) -> str:
+    return f"{_normalize_ticker(ticker)}|{end_date}|{int(num_quarters)}"
+
+
+def _metadata_from_dict(raw: dict) -> DataQualityMetadata:
+    if not isinstance(raw, dict):
+        return DataQualityMetadata()
+    return DataQualityMetadata(
+        value=raw.get("value"),
+        units=raw.get("units", "USD"),
+        period_end=raw.get("period_end"),
+        period_type=raw.get("period_type"),
+        source_path=raw.get("source_path"),
+        retrieved_at=raw.get("retrieved_at"),
+        reliability_score=raw.get("reliability_score", 0),
+        notes=raw.get("notes"),
+        is_estimated=raw.get("is_estimated", False),
+        fallback_reason=raw.get("fallback_reason"),
+    )
+
+
+def snapshot_from_dict(raw: dict) -> NormalizedFinancialSnapshot:
+    base = raw if isinstance(raw, dict) else {}
+    ticker = _normalize_ticker(base.get("ticker")) or "UNKNOWN"
+    snapshot = NormalizedFinancialSnapshot(ticker)
+
+    snapshot.retrieved_at = base.get("retrieved_at", snapshot.retrieved_at)
+    snapshot.currency = base.get("currency", snapshot.currency)
+    snapshot.company_name = base.get("company_name")
+    snapshot.sector = base.get("sector")
+    snapshot.industry = base.get("industry")
+    snapshot.num_quarters_available = base.get("num_quarters_available", 0)
+    snapshot.overall_quality_score = base.get("overall_quality_score", snapshot.overall_quality_score)
+    snapshot.warnings = base.get("warnings", []) if isinstance(base.get("warnings", []), list) else []
+    snapshot.errors = base.get("errors", []) if isinstance(base.get("errors", []), list) else []
+
+    for field in SNAPSHOT_METADATA_FIELDS:
+        setattr(snapshot, field, _metadata_from_dict(base.get(field, {})))
+
+    return snapshot
+
+
+def _upsert_ticker_in_library(ticker: str) -> None:
+    t = _normalize_ticker(ticker)
+    if not _is_valid_ticker_format(t):
+        return
+
+    cache = st.session_state.get("ui_cache", _default_ui_cache())
+    library = _normalize_ticker_library(cache.get("ticker_library", []))
+    if t not in library:
+        library.append(t)
+        library = _normalize_ticker_library(library)
+        cache["ticker_library"] = library
+        st.session_state.ui_cache = cache
+        st.session_state.ticker_library = library
+        save_ui_cache(cache)
+
+
+def _restore_cached_results_for_context(ticker: str, end_date: str, num_quarters: int) -> dict:
+    restored = {"dcf": False, "ai": False}
+    if not ticker or not end_date or num_quarters is None:
+        return restored
+
+    cache = st.session_state.get("ui_cache", _default_ui_cache())
+    context_key = build_context_key(ticker, end_date, num_quarters)
+    entry = cache.get("results", {}).get(context_key, {})
+    if not isinstance(entry, dict):
+        return restored
+
+    dcf_entry = entry.get("dcf")
+    if isinstance(dcf_entry, dict):
+        engine_result = dcf_entry.get("engine_result")
+        snapshot_dict = dcf_entry.get("snapshot")
+        if isinstance(engine_result, dict) and isinstance(snapshot_dict, dict):
+            try:
+                snapshot = snapshot_from_dict(snapshot_dict)
+                ui_adapter = DCFUIAdapter(engine_result, snapshot)
+                st.session_state.dcf_ui_adapter = ui_adapter
+                st.session_state.dcf_engine_result = engine_result
+                st.session_state.dcf_snapshot = snapshot
+                st.session_state.dcf_wacc = dcf_entry.get("dcf_wacc")
+                st.session_state.dcf_fcf_growth = dcf_entry.get("dcf_fcf_growth")
+                st.session_state.dcf_terminal_scenario = dcf_entry.get("dcf_terminal_scenario")
+                st.session_state.dcf_custom_multiple = dcf_entry.get("dcf_custom_multiple")
+                restored["dcf"] = True
+            except Exception:
+                pass
+
+    ai_entry = entry.get("ai_outlook")
+    if isinstance(ai_entry, dict) and isinstance(ai_entry.get("independent_forecast"), dict):
+        st.session_state.independent_forecast = ai_entry.get("independent_forecast")
+        st.session_state.forecast_just_generated = False
+        restored["ai"] = True
+
+    if restored["dcf"] or restored["ai"]:
+        st.session_state.last_restore_key = context_key
+
+    return restored
+
+
+def _persist_dcf_result_for_context(ticker: str, end_date: str, num_quarters: int) -> None:
+    if not ticker or not end_date or num_quarters is None:
+        return
+
+    engine_result = st.session_state.get("dcf_engine_result")
+    snapshot = st.session_state.get("dcf_snapshot")
+    if not isinstance(engine_result, dict) or snapshot is None:
+        return
+
+    snapshot_dict = snapshot.to_dict() if hasattr(snapshot, "to_dict") else None
+    if not isinstance(snapshot_dict, dict):
+        return
+
+    cache = st.session_state.get("ui_cache", _default_ui_cache())
+    results = cache.setdefault("results", {})
+    context_key = build_context_key(ticker, end_date, num_quarters)
+    entry = results.get(context_key, {})
+    if not isinstance(entry, dict):
+        entry = {}
+
+    entry.update({
+        "ticker": _normalize_ticker(ticker),
+        "end_date": end_date,
+        "num_quarters": int(num_quarters),
+        "updated_at": datetime.utcnow().isoformat(),
+    })
+    entry["dcf"] = {
+        "dcf_wacc": st.session_state.get("dcf_wacc"),
+        "dcf_fcf_growth": st.session_state.get("dcf_fcf_growth"),
+        "dcf_terminal_scenario": st.session_state.get("dcf_terminal_scenario"),
+        "dcf_custom_multiple": st.session_state.get("dcf_custom_multiple"),
+        "engine_result": _json_safe(engine_result),
+        "snapshot": _json_safe(snapshot_dict),
+    }
+    results[context_key] = entry
+    cache["results"] = results
+    cache["last_selected_ticker"] = _normalize_ticker(ticker)
+    st.session_state.ui_cache = cache
+    save_ui_cache(cache)
+
+
+def _persist_ai_result_for_context(ticker: str, end_date: str, num_quarters: int) -> None:
+    if not ticker or not end_date or num_quarters is None:
+        return
+
+    forecast = st.session_state.get("independent_forecast")
+    if not isinstance(forecast, dict):
+        return
+
+    cache = st.session_state.get("ui_cache", _default_ui_cache())
+    results = cache.setdefault("results", {})
+    context_key = build_context_key(ticker, end_date, num_quarters)
+    entry = results.get(context_key, {})
+    if not isinstance(entry, dict):
+        entry = {}
+
+    entry.update({
+        "ticker": _normalize_ticker(ticker),
+        "end_date": end_date,
+        "num_quarters": int(num_quarters),
+        "updated_at": datetime.utcnow().isoformat(),
+    })
+    entry["ai_outlook"] = {
+        "independent_forecast": _json_safe(forecast),
+        "forecast_date": forecast.get("forecast_date"),
+    }
+    results[context_key] = entry
+    cache["results"] = results
+    cache["last_selected_ticker"] = _normalize_ticker(ticker)
+    st.session_state.ui_cache = cache
+    save_ui_cache(cache)
 
 # --- Cached API Functions ---
 # These decorators cache results so API calls only happen once per input
@@ -1373,29 +1664,61 @@ st.markdown("""
         background: #dbeafe;
         box-shadow: inset 0 0 0 1px #bfdbfe;
     }
-    .floating-toc {
+    .floating-toc-wrap {
         position: fixed;
         right: 18px;
         top: 86px;
+        z-index: 999;
+        display: flex;
+        flex-direction: row-reverse;
+        align-items: flex-start;
+        gap: 8px;
+        opacity: 0;
+        transform: translateX(12px);
+        pointer-events: none;
+        transition: opacity 0.18s ease, transform 0.18s ease;
+    }
+    .floating-toc-wrap.is-visible {
+        opacity: 1;
+        transform: translateX(0);
+        pointer-events: auto;
+    }
+    .floating-toc-toggle {
+        width: 36px;
+        height: 36px;
+        border: 1px solid var(--clr-border);
+        border-radius: 999px;
+        background: var(--clr-surface);
+        color: var(--clr-text-secondary);
+        font-size: 1rem;
+        font-weight: 700;
+        line-height: 1;
+        cursor: pointer;
+        box-shadow: var(--shadow-sm);
+    }
+    .floating-toc-toggle:hover {
+        color: var(--clr-accent);
+        border-color: #bfdbfe;
+        background: #eff6ff;
+    }
+    .floating-toc-wrap.is-expanded .floating-toc-toggle {
+        color: var(--clr-accent);
+        border-color: #93c5fd;
+        background: #dbeafe;
+    }
+    .floating-toc {
         width: 196px;
         background: var(--clr-surface);
         border: 1px solid var(--clr-border);
         border-radius: var(--radius-md);
         box-shadow: var(--shadow-md);
         padding: 10px;
-        display: flex;
+        display: none;
         flex-direction: column;
         gap: 6px;
-        z-index: 999;
-        opacity: 0;
-        transform: translateX(12px);
-        pointer-events: none;
-        transition: opacity 0.18s ease, transform 0.18s ease;
     }
-    .floating-toc.is-visible {
-        opacity: 1;
-        transform: translateX(0);
-        pointer-events: auto;
+    .floating-toc-wrap.is-expanded .floating-toc {
+        display: flex;
     }
     .floating-toc-title {
         font-size: .62rem;
@@ -1455,7 +1778,8 @@ st.markdown("""
 
     @media (max-width: 1024px) {
         .decision-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-        .floating-toc { width: 176px; right: 10px; }
+        .floating-toc-wrap { right: 10px; }
+        .floating-toc { width: 176px; }
     }
     @media (max-width: 640px) {
         .decision-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -1469,7 +1793,7 @@ st.markdown("""
         }
         .hero-divider { display: none; }
         .hero-ticker { width: 100%; text-align: left; }
-        .floating-toc { display: none; }
+        .floating-toc-wrap { display: none; }
     }
 
     /* Step progress indicator */
@@ -1564,12 +1888,32 @@ if 'show_dcf_details' not in st.session_state:
     st.session_state.show_dcf_details = False
 if 'forecast_just_generated' not in st.session_state:
     st.session_state.forecast_just_generated = False
+if 'ui_cache' not in st.session_state:
+    st.session_state.ui_cache = load_ui_cache()
+if 'ticker_library' not in st.session_state:
+    st.session_state.ticker_library = _normalize_ticker_library(st.session_state.ui_cache.get("ticker_library", []))
+if 'last_restore_key' not in st.session_state:
+    st.session_state.last_restore_key = None
+if 'cache_restore_notice' not in st.session_state:
+    st.session_state.cache_restore_notice = ""
+if 'custom_ticker_input' not in st.session_state:
+    st.session_state.custom_ticker_input = ""
+if 'ticker_dropdown' not in st.session_state:
+    last_selected = _normalize_ticker(st.session_state.ui_cache.get("last_selected_ticker", "MSFT"))
+    library = st.session_state.ticker_library
+    st.session_state.ticker_dropdown = last_selected if last_selected in library else library[0]
+if 'pending_ticker_dropdown' not in st.session_state:
+    st.session_state.pending_ticker_dropdown = None
+if 'clear_custom_ticker_input' not in st.session_state:
+    st.session_state.clear_custom_ticker_input = False
 
 # --- Helper Functions ---
 def reset_analysis():
     st.session_state.quarterly_analysis = None
     st.session_state.independent_forecast = None
     st.session_state.forecast_just_generated = False
+    st.session_state.cache_restore_notice = ""
+    st.session_state.last_restore_key = None
     # Reset DCF assumptions so they get re-calculated for new ticker
     st.session_state.dcf_wacc = None
     st.session_state.dcf_fcf_growth = None
@@ -1667,7 +2011,31 @@ with st.sidebar:
     if env_api_key:
         st.session_state.api_key_set = True
 
-    ticker = st.text_input("Stock Ticker", value="MSFT").upper()
+    # Persistent ticker picker: MAG7 defaults + learned custom tickers
+    st.session_state.ticker_library = _normalize_ticker_library(
+        st.session_state.ui_cache.get("ticker_library", st.session_state.ticker_library)
+    )
+    ticker_options = st.session_state.ticker_library
+
+    # Apply deferred widget updates before widget instantiation (Streamlit-safe).
+    pending_dropdown = _normalize_ticker(st.session_state.get("pending_ticker_dropdown"))
+    if pending_dropdown and pending_dropdown in ticker_options:
+        st.session_state.ticker_dropdown = pending_dropdown
+    st.session_state.pending_ticker_dropdown = None
+    if st.session_state.get("clear_custom_ticker_input"):
+        st.session_state.custom_ticker_input = ""
+        st.session_state.clear_custom_ticker_input = False
+
+    if st.session_state.ticker_dropdown not in ticker_options:
+        st.session_state.ticker_dropdown = ticker_options[0]
+
+    selected_ticker = st.selectbox("Stock Ticker", options=ticker_options, key="ticker_dropdown")
+    st.text_input("Custom Ticker (optional)", key="custom_ticker_input", placeholder="e.g. NFLX")
+    custom_ticker = _normalize_ticker(st.session_state.custom_ticker_input)
+    ticker = custom_ticker if custom_ticker else _normalize_ticker(selected_ticker)
+    ticker_valid = _is_valid_ticker_format(ticker)
+    if custom_ticker and not ticker_valid:
+        st.warning("Custom ticker format invalid. Use letters/numbers, up to 10 chars.")
 
     # Date-fetch state
     if "available_dates" not in st.session_state:
@@ -1678,7 +2046,7 @@ with st.sidebar:
         st.session_state.selected_end_date = None
 
     # Refresh cached dates when ticker changes
-    if ticker != st.session_state.available_dates_ticker:
+    if ticker_valid and ticker != st.session_state.available_dates_ticker:
         st.session_state.available_dates_ticker = ticker
         st.session_state.selected_end_date = None
         with st.spinner(f"Fetching available reports for {ticker}..."):
@@ -1687,9 +2055,13 @@ with st.sidebar:
                 st.session_state.selected_end_date = st.session_state.available_dates[0]["value"]
             else:
                 st.session_state.selected_end_date = None
+    elif not ticker_valid:
+        st.session_state.available_dates_ticker = None
+        st.session_state.available_dates = []
+        st.session_state.selected_end_date = None
 
     # Initial fetch for first load
-    if ticker and not st.session_state.available_dates:
+    if ticker_valid and ticker and not st.session_state.available_dates:
         with st.spinner(f"Fetching available reports for {ticker}..."):
             st.session_state.available_dates = cached_available_dates(ticker)
             if st.session_state.available_dates:
@@ -1733,10 +2105,43 @@ with st.sidebar:
             disabled=True
         )
         selected_end_date = None
+
+    # Best-effort immediate restore for same active ticker/context
+    active_ticker = _normalize_ticker(st.session_state.get("ticker", ""))
+    if ticker_valid and selected_end_date:
+        context_key = build_context_key(ticker, selected_end_date, num_quarters)
+        loaded_end_date = st.session_state.get("end_date")
+        loaded_num_quarters = st.session_state.get("num_quarters")
+        same_loaded_context = (
+            active_ticker == ticker
+            and loaded_end_date == selected_end_date
+            and loaded_num_quarters == num_quarters
+        )
+        can_restore_now = st.session_state.quarterly_analysis is None or same_loaded_context
+        if can_restore_now and st.session_state.get("last_restore_key") != context_key:
+            restored = _restore_cached_results_for_context(ticker, selected_end_date, num_quarters)
+            if restored["dcf"] or restored["ai"]:
+                restored_parts = []
+                if restored["dcf"]:
+                    restored_parts.append("DCF")
+                if restored["ai"]:
+                    restored_parts.append("AI outlook")
+                st.session_state.cache_restore_notice = f"Restored cached {' + '.join(restored_parts)} for {ticker} ({selected_end_date}, {num_quarters}Q)."
+            else:
+                st.session_state.cache_restore_notice = ""
+                st.session_state.last_restore_key = None
+        elif st.session_state.get("last_restore_key") == context_key:
+            # no-op; already restored for this exact context in current session
+            pass
+    else:
+        st.session_state.cache_restore_notice = ""
+        st.session_state.last_restore_key = None
     
     if st.button("Load Data", type="primary", use_container_width=True):
         if not st.session_state.api_key_set:
             st.error("API key not found. Add `GEMINI_API_KEY=your_key` to `.env` file and restart.")
+        elif not ticker_valid:
+            st.warning("Please enter/select a valid ticker symbol.")
         elif not selected_end_date:
             st.warning("Please select a valid ticker and ending report.")
         else:
@@ -1749,6 +2154,17 @@ with st.sidebar:
                     st.session_state.num_quarters = num_quarters
                     st.session_state.end_date = selected_end_date
                     reset_analysis()
+
+                    # Persist last selected ticker and add successful custom ticker to library
+                    cache = st.session_state.get("ui_cache", _default_ui_cache())
+                    cache["last_selected_ticker"] = ticker
+                    st.session_state.ui_cache = cache
+                    save_ui_cache(cache)
+                    if custom_ticker and ticker == custom_ticker:
+                        _upsert_ticker_in_library(ticker)
+                        st.session_state.pending_ticker_dropdown = ticker
+                        st.session_state.clear_custom_ticker_input = True
+
                     # Auto-run quarterly analysis (cached) with user-selected end date
                     analysis = cached_quarterly_analysis(ticker, num_quarters, selected_end_date)
                     st.session_state.quarterly_analysis = analysis
@@ -1762,6 +2178,20 @@ with st.sidebar:
                         cf,
                         qcf
                     )
+
+                    # Restore cached per-context DCF / AI outputs (if available)
+                    restored = _restore_cached_results_for_context(ticker, selected_end_date, num_quarters)
+                    if restored["dcf"] or restored["ai"]:
+                        restored_parts = []
+                        if restored["dcf"]:
+                            restored_parts.append("DCF")
+                        if restored["ai"]:
+                            restored_parts.append("AI outlook")
+                        restore_message = f"Restored cached {' + '.join(restored_parts)} for {ticker} ({selected_end_date}, {num_quarters}Q)."
+                        st.session_state.cache_restore_notice = restore_message
+                    else:
+                        st.session_state.cache_restore_notice = ""
+                        st.session_state.last_restore_key = None
                     
                     # Show what was loaded
                     most_recent = analysis.get("historical_trends", {}).get("most_recent_quarter", {})
@@ -1812,6 +2242,8 @@ if st.session_state.quarterly_analysis:
 
     if warning:
         st.warning(warning)
+    if st.session_state.get("cache_restore_notice"):
+        st.info(st.session_state.cache_restore_notice)
 
     # Top context strip
     _market_data = analysis.get("market_data", {})
@@ -1848,14 +2280,17 @@ if st.session_state.quarterly_analysis:
     """, unsafe_allow_html=True)
 
     st.markdown("""
-<div id="floating-toc" class="floating-toc" aria-label="Report table of contents">
-  <div class="floating-toc-title">Quick Nav</div>
-  <a href="#verdict">Verdict</a>
-  <a href="#valuation">Valuation</a>
-  <a href="#momentum">Momentum</a>
-  <a href="#consensus">Street</a>
-  <a href="#outlook">AI View</a>
-  <a href="#sources">Sources</a>
+<div id="floating-toc-wrap" class="floating-toc-wrap" aria-label="Quick navigation">
+  <button id="floating-toc-toggle" class="floating-toc-toggle" type="button" aria-label="Toggle quick nav" aria-expanded="false" aria-controls="floating-toc">☰</button>
+  <div id="floating-toc" class="floating-toc" aria-label="Report table of contents">
+    <div class="floating-toc-title">Quick Nav</div>
+    <a href="#verdict">Verdict</a>
+    <a href="#valuation">Valuation</a>
+    <a href="#momentum">Momentum</a>
+    <a href="#consensus">Street</a>
+    <a href="#outlook">AI View</a>
+    <a href="#sources">Sources</a>
+  </div>
 </div>
     """, unsafe_allow_html=True)
 
@@ -1883,6 +2318,14 @@ if st.session_state.quarterly_analysis:
 
     if (prev.onResize) {
       try { p.removeEventListener("resize", prev.onResize); } catch (_) {}
+    }
+    if (prev.toggleButton && prev.onToggle) {
+      try { prev.toggleButton.removeEventListener("click", prev.onToggle); } catch (_) {}
+    }
+    if (prev.navLinks && prev.onLinkClick) {
+      prev.navLinks.forEach((link) => {
+        try { link.removeEventListener("click", prev.onLinkClick); } catch (_) {}
+      });
     }
     if (prev.observer) {
       try { prev.observer.disconnect(); } catch (_) {}
@@ -1940,8 +2383,10 @@ if st.session_state.quarterly_analysis:
 
   const init = (attempt) => {
     const primary = d.getElementById("report-nav-primary");
+    const floatingWrap = d.getElementById("floating-toc-wrap");
     const floating = d.getElementById("floating-toc");
-    if (!primary || !floating) {
+    const floatingToggle = d.getElementById("floating-toc-toggle");
+    if (!primary || !floatingWrap || !floating || !floatingToggle) {
       if (attempt < 40) {
         const timer = p.setTimeout(() => init(attempt + 1), 80);
         p[bindingKey] = { ...(p[bindingKey] || {}), timer };
@@ -1952,10 +2397,18 @@ if st.session_state.quarterly_analysis:
     const scroller = getScroller();
     let rafId = null;
 
+    const setExpanded = (expanded) => {
+      floatingWrap.classList.toggle("is-expanded", expanded);
+      floatingToggle.setAttribute("aria-expanded", expanded ? "true" : "false");
+    };
+
     const update = () => {
       const rect = primary.getBoundingClientRect();
       const shouldShow = rect.bottom <= 0;
-      floating.classList.toggle("is-visible", shouldShow);
+      floatingWrap.classList.toggle("is-visible", shouldShow);
+      if (!shouldShow) {
+        setExpanded(false);
+      }
       setActive(getActiveSection());
     };
 
@@ -1972,12 +2425,22 @@ if st.session_state.quarterly_analysis:
 
     const onScroll = () => scheduleUpdate();
     const onResize = () => scheduleUpdate();
+    const onToggle = () => {
+      const isExpanded = floatingWrap.classList.contains("is-expanded");
+      setExpanded(!isExpanded);
+    };
+    const onLinkClick = () => setExpanded(false);
+    const navLinks = Array.from(floating.querySelectorAll('a[href^="#"]'));
 
     const scrollTargets = Array.from(new Set([scroller, p]));
     scrollTargets.forEach((target) => {
       target.addEventListener("scroll", onScroll, { passive: true });
     });
     p.addEventListener("resize", onResize);
+    floatingToggle.addEventListener("click", onToggle);
+    navLinks.forEach((link) => {
+      link.addEventListener("click", onLinkClick);
+    });
 
     let observer = null;
     if ("IntersectionObserver" in p) {
@@ -1996,6 +2459,10 @@ if st.session_state.quarterly_analysis:
       scrollTargets,
       onScroll,
       onResize,
+      toggleButton: floatingToggle,
+      onToggle,
+      navLinks,
+      onLinkClick,
       observer,
       rafId: null,
       timer: null,
@@ -2144,6 +2611,11 @@ if st.session_state.quarterly_analysis:
                 st.session_state.dcf_ui_adapter = ui_adapter_result
                 st.session_state.dcf_engine_result = engine_result
                 st.session_state.dcf_snapshot = snapshot
+                _persist_dcf_result_for_context(
+                    ticker=ticker,
+                    end_date=st.session_state.get("end_date") or st.session_state.get("selected_end_date"),
+                    num_quarters=st.session_state.get("num_quarters"),
+                )
                 st.rerun()
 
     with col_details:
@@ -2438,6 +2910,11 @@ if st.session_state.quarterly_analysis:
                 )
                 st.session_state.independent_forecast = forecast
                 st.session_state.forecast_just_generated = True
+                _persist_ai_result_for_context(
+                    ticker=ticker,
+                    end_date=st.session_state.get("end_date") or st.session_state.get("selected_end_date"),
+                    num_quarters=st.session_state.get("num_quarters"),
+                )
                 st.rerun()
 
     if st.session_state.independent_forecast:
