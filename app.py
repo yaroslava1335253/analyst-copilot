@@ -563,8 +563,8 @@ def _show_dcf_details_page():
             if analyst_anchors_used:
                 st.caption(
                     "📚 **Textbook DCF**: Revenue → EBIT → NOPAT → Reinvestment → FCFF  \n"
-                    "FCF Years 1–3: analyst revenue consensus¹ × TTM FCF margin⁴  |  "
-                    "FCF Years 4–10: FCFF driver model²  |  Growth rates: Damodaran fade⁶"
+                    "Revenue Years 1–3: analyst consensus anchor¹  |  "
+                    "FCFF Years 1–10: driver model²  |  Growth rates: Damodaran fade⁶"
                 )
             else:
                 st.caption(
@@ -575,14 +575,21 @@ def _show_dcf_details_page():
             
             # Show growth fade and ROIC info
             near_term_g = assumptions.get('near_term_growth_rate', 0)
+            effective_near_term_g = assumptions.get('effective_near_term_growth_rate')
+            consensus_years = assumptions.get('consensus_revenue_used_years', [])
             stable_g = assumptions.get('stable_growth_rate', 0)
             current_roic = assumptions.get('base_roic', 0)
             terminal_roic = assumptions.get('terminal_roic', 0)
             industry_roic = assumptions.get('industry_roic', 0)
             terminal_reinv_rate = assumptions.get('terminal_reinvestment_rate', 0)
+
+            growth_start = effective_near_term_g if effective_near_term_g is not None else near_term_g
+            growth_note = ""
+            if consensus_years:
+                growth_note = f" (effective from consensus Y{consensus_years[0]}-Y{consensus_years[-1]})"
             
             st.info(
-                f"**Growth Fade**⁶: {near_term_g:.1%} → Year {forecast_years}: {stable_g:.1%} (g_perp)⁸  \n"
+                f"**Growth Fade**⁶: {growth_start:.1%}{growth_note} → Year {forecast_years}: {stable_g:.1%} (g_perp)⁸  \n"
                 f"**ROIC Fade**⁷: Current {current_roic:.1%} → Terminal {terminal_roic:.1%} (industry: {industry_roic:.1%})  \n"
                 f"**Terminal Reinvestment**⁶: {terminal_reinv_rate:.1%} = g_perp / ROIC_terminal"
             )
@@ -591,8 +598,12 @@ def _show_dcf_details_page():
             proj_table = []
             display_projs = yearly_projections[:display_years] if len(yearly_projections) > display_years else yearly_projections
             for proj in display_projs:
-                fcf_src = proj.get('fcf_source', 'driver_model')
-                src_badge = "[¹]" if fcf_src == "analyst_revenue_estimate" else "[²]"
+                revenue_src = proj.get('revenue_source')
+                if revenue_src is None:
+                    fcf_src = proj.get('fcf_source', 'driver_model')
+                    src_badge = "[¹]" if fcf_src == "analyst_revenue_estimate" else "[²]"
+                else:
+                    src_badge = "[¹]" if revenue_src == "analyst_consensus" else "[²]"
                 proj_table.append({
                     "Year": f"Y{proj.get('year', 0)}",
                     "Revenue³": f"${proj.get('revenue', 0)/1e9:.1f}B",
@@ -614,8 +625,12 @@ def _show_dcf_details_page():
                 with st.expander(f"Years 6–10 (Fade to Terminal)", icon="📈"):
                     fade_table = []
                     for proj in yearly_projections[5:]:
-                        fcf_src = proj.get('fcf_source', 'driver_model')
-                        src_badge = "[¹]" if fcf_src == "analyst_revenue_estimate" else "[²]"
+                        revenue_src = proj.get('revenue_source')
+                        if revenue_src is None:
+                            fcf_src = proj.get('fcf_source', 'driver_model')
+                            src_badge = "[¹]" if fcf_src == "analyst_revenue_estimate" else "[²]"
+                        else:
+                            src_badge = "[¹]" if revenue_src == "analyst_consensus" else "[²]"
                         fade_table.append({
                             "Year": f"Y{proj.get('year', 0)}",
                             "Revenue³": f"${proj.get('revenue', 0)/1e9:.1f}B",
@@ -921,7 +936,9 @@ def _show_dcf_details_page():
         
         # Calculate TV share of EV
         pv_fcf_sum = assumptions.get('pv_fcf_sum', 0)
-        ev_gordon = assumptions.get('ev_gordon_growth', 0)
+        ev_gordon = ui_data.get('enterprise_value') or assumptions.get('ev_gordon_growth') or 0
+        if not ev_gordon and pv_fcf_sum:
+            ev_gordon = pv_fcf_sum + pv_tv_gordon
         tv_share_pct = (pv_tv_gordon / ev_gordon * 100) if ev_gordon and ev_gordon > 0 else 0
         
         # Calculate discount factor

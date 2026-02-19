@@ -321,6 +321,7 @@ class DCFUIAdapter:
             "is_large_cap": assumptions.get("is_large_cap", False),
             "horizon_reason": assumptions.get("horizon_reason"),
             "near_term_growth_rate": assumptions.get("near_term_growth_rate"),
+            "effective_near_term_growth_rate": assumptions.get("effective_near_term_growth_rate"),
             "stable_growth_rate": assumptions.get("stable_growth_rate"),
             "base_roic": assumptions.get("base_roic"),
             "terminal_roic": assumptions.get("terminal_roic"),
@@ -329,7 +330,9 @@ class DCFUIAdapter:
             "base_revenue": assumptions.get("base_revenue"),
             # Analyst FCF anchor metadata
             "analyst_fcf_anchors_used": assumptions.get("analyst_fcf_anchors_used", False),
+            "consensus_revenue_used_years": assumptions.get("consensus_revenue_used_years", []),
             "fcf_sources": assumptions.get("fcf_sources", []),
+            "revenue_sources": assumptions.get("revenue_sources", []),
         }
         
         # Extract outputs with validation
