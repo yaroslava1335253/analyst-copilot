@@ -225,6 +225,10 @@ def _restore_cached_results_for_context(ticker: str, end_date: str, num_quarters
                 st.session_state.dcf_snapshot = snapshot
                 st.session_state.dcf_wacc = dcf_entry.get("dcf_wacc")
                 st.session_state.dcf_fcf_growth = dcf_entry.get("dcf_fcf_growth")
+                terminal_growth_from_cache = dcf_entry.get("dcf_terminal_growth")
+                if terminal_growth_from_cache is None:
+                    terminal_growth_from_cache = (engine_result.get("assumptions", {}).get("terminal_growth_rate") or 0.03) * 100
+                st.session_state.dcf_terminal_growth = terminal_growth_from_cache
                 st.session_state.dcf_terminal_scenario = dcf_entry.get("dcf_terminal_scenario")
                 st.session_state.dcf_custom_multiple = dcf_entry.get("dcf_custom_multiple")
                 restored["dcf"] = True
@@ -272,6 +276,7 @@ def _persist_dcf_result_for_context(ticker: str, end_date: str, num_quarters: in
     entry["dcf"] = {
         "dcf_wacc": st.session_state.get("dcf_wacc"),
         "dcf_fcf_growth": st.session_state.get("dcf_fcf_growth"),
+        "dcf_terminal_growth": st.session_state.get("dcf_terminal_growth"),
         "dcf_terminal_scenario": st.session_state.get("dcf_terminal_scenario"),
         "dcf_custom_multiple": st.session_state.get("dcf_custom_multiple"),
         "engine_result": _json_safe(engine_result),
@@ -359,8 +364,9 @@ def cached_financial_snapshot(ticker: str):
     except Exception:
         return None
 
-def run_dcf_analysis(ticker: str, wacc: float = None, fcf_growth: float = None, 
-                     terminal_scenario: str = "current", custom_multiple: float = None) -> tuple:
+def run_dcf_analysis(ticker: str, wacc: float = None, fcf_growth: float = None,
+                     terminal_growth: float = None, terminal_scenario: str = "current",
+                     custom_multiple: float = None) -> tuple:
     """Run DCF analysis with user-adjustable assumptions. Returns (ui_adapter, engine_result, snapshot)."""
     try:
         adapter = DataAdapter(ticker)
@@ -372,7 +378,9 @@ def run_dcf_analysis(ticker: str, wacc: float = None, fcf_growth: float = None,
             assumptions.wacc = wacc / 100.0  # Convert from percentage
         if fcf_growth is not None:
             assumptions.fcf_growth_rate = fcf_growth / 100.0  # Convert from percentage
-        
+        if terminal_growth is not None:
+            assumptions.terminal_growth_rate = terminal_growth / 100.0  # Convert from percentage
+
         # Set terminal multiple scenario
         assumptions.terminal_multiple_scenario = terminal_scenario
         if terminal_scenario == "custom" and custom_multiple is not None:
@@ -1934,6 +1942,7 @@ def reset_analysis():
     # Reset DCF assumptions so they get re-calculated for new ticker
     st.session_state.dcf_wacc = None
     st.session_state.dcf_fcf_growth = None
+    st.session_state.dcf_terminal_growth = None
     st.session_state.dcf_ui_adapter = None
     st.session_state.dcf_engine_result = None
     st.session_state.dcf_snapshot = None
@@ -2599,10 +2608,12 @@ if st.session_state.quarterly_analysis:
 
     stored_wacc = st.session_state.get("dcf_wacc")
     stored_fcf_growth = st.session_state.get("dcf_fcf_growth")
+    stored_terminal_growth = st.session_state.get("dcf_terminal_growth")
     default_wacc = stored_wacc if stored_wacc is not None else suggested_wacc
     default_fcf_growth = stored_fcf_growth if stored_fcf_growth is not None else suggested_fcf_growth
+    default_terminal_growth = stored_terminal_growth if stored_terminal_growth is not None else 3.0
 
-    col_wacc, col_growth = st.columns(2)
+    col_wacc, col_growth, col_terminal = st.columns(3)
     with col_wacc:
         user_wacc = st.slider(
             "WACC (%)",
@@ -2631,16 +2642,43 @@ if st.session_state.quarterly_analysis:
         if snapshot_for_suggestions and snapshot_for_suggestions.suggested_fcf_growth.value:
             st.caption(f"Suggested: {suggested_fcf_growth:.1f}%")
 
+    with col_terminal:
+        terminal_growth_min = 0.0
+        terminal_growth_max = max(0.5, min(6.0, round(user_wacc - 0.5, 1)))
+        terminal_growth_key = f"terminal_growth_slider_{ticker}"
+        if terminal_growth_key in st.session_state:
+            st.session_state[terminal_growth_key] = min(
+                max(st.session_state[terminal_growth_key], terminal_growth_min),
+                terminal_growth_max
+            )
+        terminal_growth_default = min(max(default_terminal_growth, terminal_growth_min), terminal_growth_max)
+        user_terminal_growth = st.slider(
+            "Terminal Growth g (%)",
+            min_value=terminal_growth_min,
+            max_value=terminal_growth_max,
+            value=terminal_growth_default,
+            step=0.1,
+            key=terminal_growth_key,
+            help="Perpetual growth rate used in Gordon Growth terminal value."
+        )
+        st.caption("Fallback/default: 3.0% (if not set)")
+
     col_run, col_details = st.columns([1, 1])
     with col_run:
         if st.button("Run DCF Analysis", type="primary", key="run_dcf"):
             with st.spinner("Running DCF analysis with full verification..."):
                 st.session_state.dcf_wacc = user_wacc
                 st.session_state.dcf_fcf_growth = user_fcf_growth
+                st.session_state.dcf_terminal_growth = user_terminal_growth
                 st.session_state.dcf_terminal_scenario = "current"
                 st.session_state.dcf_custom_multiple = None
                 ui_adapter_result, engine_result, snapshot = run_dcf_analysis(
-                    ticker, user_wacc, user_fcf_growth, terminal_scenario="current", custom_multiple=None
+                    ticker,
+                    user_wacc,
+                    user_fcf_growth,
+                    terminal_growth=user_terminal_growth,
+                    terminal_scenario="current",
+                    custom_multiple=None
                 )
                 st.session_state.dcf_ui_adapter = ui_adapter_result
                 st.session_state.dcf_engine_result = engine_result
@@ -2928,28 +2966,32 @@ if st.session_state.quarterly_analysis:
     dcf_ui = st.session_state.get("dcf_ui_adapter")
     dcf_data_for_forecast = dcf_ui.get_ui_data() if dcf_ui else None
 
-    if not st.session_state.independent_forecast:
-        if not dcf_ui:
-            st.warning("Run DCF Analysis first for a more complete synthesis.")
-        st.caption("Combines valuation, consensus, and historical momentum into a multi-horizon view.")
-        if st.button("Generate Multi-Horizon Outlook", type="primary"):
-            with st.spinner("Analyzing data and generating multi-horizon outlook..."):
-                dcf_hash = str(hash(str(dcf_data_for_forecast.get("price_per_share", 0)))) if dcf_data_for_forecast else ""
-                data_hash = str(hash(str(st.session_state.quarterly_analysis.get("analysis_date", "")) + dcf_hash))
-                forecast = cached_independent_forecast(
-                    ticker,
-                    data_hash,
-                    company_name=ticker,
-                    dcf_data=dcf_data_for_forecast
-                )
-                st.session_state.independent_forecast = forecast
-                st.session_state.forecast_just_generated = True
-                _persist_ai_result_for_context(
-                    ticker=ticker,
-                    end_date=st.session_state.get("end_date") or st.session_state.get("selected_end_date"),
-                    num_quarters=st.session_state.get("num_quarters"),
-                )
-                st.rerun()
+    if not dcf_ui:
+        st.warning("Run DCF Analysis first for a more complete synthesis.")
+    st.caption("Combines valuation, consensus, and historical momentum into a multi-horizon view.")
+
+    has_existing_forecast = bool(st.session_state.get("independent_forecast"))
+    outlook_button_label = "Regenerate Multi-Horizon Outlook" if has_existing_forecast else "Generate Multi-Horizon Outlook"
+    if st.button(outlook_button_label, type="primary", key="generate_outlook"):
+        with st.spinner("Analyzing data and generating multi-horizon outlook..."):
+            dcf_hash = str(hash(str(dcf_data_for_forecast.get("price_per_share", 0)))) if dcf_data_for_forecast else ""
+            # If a forecast already exists, include a nonce so rerun doesn't get stuck on a cached response.
+            rerun_nonce = str(datetime.utcnow().timestamp()) if has_existing_forecast else ""
+            data_hash = str(hash(str(st.session_state.quarterly_analysis.get("analysis_date", "")) + dcf_hash + rerun_nonce))
+            forecast = cached_independent_forecast(
+                ticker,
+                data_hash,
+                company_name=ticker,
+                dcf_data=dcf_data_for_forecast
+            )
+            st.session_state.independent_forecast = forecast
+            st.session_state.forecast_just_generated = True
+            _persist_ai_result_for_context(
+                ticker=ticker,
+                end_date=st.session_state.get("end_date") or st.session_state.get("selected_end_date"),
+                num_quarters=st.session_state.get("num_quarters"),
+            )
+            st.rerun()
 
     if st.session_state.independent_forecast:
         forecast = st.session_state.independent_forecast
