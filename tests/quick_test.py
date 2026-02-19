@@ -2,6 +2,10 @@
 Quick test: Validate new DCF engine with real yfinance data
 """
 
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from data_adapter import DataAdapter
 from dcf_engine import DCFEngine, DCFAssumptions
 from dcf_integration import calculate_dcf_with_traceability, format_dcf_for_ui
