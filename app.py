@@ -48,6 +48,7 @@ SNAPSHOT_METADATA_FIELDS = [
     "beta",
     "suggested_wacc",
     "suggested_fcf_growth",
+    "analyst_long_term_growth",
 ]
 
 
@@ -103,6 +104,25 @@ def _json_safe(value):
         except Exception:
             pass
     return str(value)
+
+
+def _sanitize_ai_valuation_language(text: str) -> str:
+    """
+    Keep valuation wording assumption-aware in rendered AI text.
+    Also normalizes older cached outputs produced before prompt updates.
+    """
+    if not isinstance(text, str):
+        return text
+    sanitized = text
+    replacements = [
+        (r"(?i)\bfundamental floor\b", "model-implied value under current assumptions"),
+        (r"(?i)\bvaluation floor\b", "model-implied value under current assumptions"),
+        (r"(?i)\bintrinsic floor\b", "model-implied value under current assumptions"),
+        (r"(?i)\bhard floor\b", "assumption-sensitive downside case"),
+    ]
+    for pattern, replacement in replacements:
+        sanitized = re.sub(pattern, replacement, sanitized)
+    return sanitized
 
 
 def load_ui_cache() -> dict:
@@ -178,6 +198,11 @@ def snapshot_from_dict(raw: dict) -> NormalizedFinancialSnapshot:
     snapshot.overall_quality_score = base.get("overall_quality_score", snapshot.overall_quality_score)
     snapshot.warnings = base.get("warnings", []) if isinstance(base.get("warnings", []), list) else []
     snapshot.errors = base.get("errors", []) if isinstance(base.get("errors", []), list) else []
+    snapshot.analyst_revenue_estimates = (
+        base.get("analyst_revenue_estimates", [])
+        if isinstance(base.get("analyst_revenue_estimates", []), list)
+        else []
+    )
 
     for field in SNAPSHOT_METADATA_FIELDS:
         setattr(snapshot, field, _metadata_from_dict(base.get(field, {})))
@@ -355,8 +380,9 @@ def cached_latest_date_info(ticker: str) -> dict:
     return get_latest_date_info(ticker)
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def cached_financial_snapshot(ticker: str):
+def cached_financial_snapshot(ticker: str, suggestion_algo_version: str = "v2"):
     """Cached wrapper to get financial snapshot for suggested assumptions."""
+    _ = suggestion_algo_version  # cache-key salt for suggestion logic revisions
     try:
         adapter = DataAdapter(ticker)
         snapshot = adapter.fetch()
@@ -395,863 +421,560 @@ def run_dcf_analysis(ticker: str, wacc: float = None, fcf_growth: float = None,
 
 
 def _show_dcf_details_page():
-    """Render the full DCF Details page with spreadsheet-like layout.
-    
-    This page shows complete calculation breakdown with all inputs, assumptions,
-    and intermediate steps for full audit traceability.
-    """
+    """Render DCF details in a clear sequential flow."""
     st.markdown("---")
-    st.subheader("DCF Valuation Details")
-    
-    # Back button
-    if st.button("← Back to Summary", key="back_from_details_top"):
+    st.subheader("DCF Calculation Details")
+
+    if st.button("<- Back to Summary", key="back_from_details_top"):
         st.session_state.show_dcf_details = False
         st.rerun()
-    
+
     ui_adapter = st.session_state.dcf_ui_adapter
     ui_data = ui_adapter.get_ui_data()
-    engine_result = st.session_state.dcf_engine_result
-    
-    st.caption("Complete calculation breakdown with all inputs, assumptions, and intermediate steps")
-    
-    # INPUTS TABLE
-    st.markdown("### Input Data")
-    st.caption("All financial data fetched from yfinance with quality assessment")
-    
-    inputs_table = ui_adapter.format_input_table()
-    df_inputs = pd.DataFrame(inputs_table)
-    st.dataframe(df_inputs, use_container_width=True, hide_index=True)
-    
-    with st.expander("Input Data Legend", icon="ℹ️"):
-        st.markdown("""
-        - **Value**: Actual number or "—" if missing/zero
-        - **Units**: USD (currency), shares (count), % (percentage), x (multiple)
-        - **Period**: TTM (trailing 12 months), annual, quarterly
-        - **Source**: yfinance field path for reproducibility
-        - **Reliability**: Score out of 100 (higher = more confidence)
-        - **Notes**: Fallback reasons (e.g., "quarterly unavailable, used annual")
-        """)
-    
-    # ASSUMPTIONS TABLE
-    st.markdown("### Valuation Assumptions")
-    assumptions_table = ui_adapter.format_assumptions_table()
-    df_assumptions = pd.DataFrame(assumptions_table)
-    st.dataframe(df_assumptions, use_container_width=True, hide_index=True)
-    
-    # CAPM / WACC CALCULATION DETAILS
-    st.markdown("### CAPM & WACC Calculation")
-    st.caption("Cost of equity estimation using Capital Asset Pricing Model")
-    
-    snapshot = st.session_state.get('dcf_snapshot')
-    if snapshot:
-        # CAPM inputs
-        beta = snapshot.beta.value
-        
-        # Get dynamic risk-free rate from snapshot (fetched from ^TNX)
-        RISK_FREE_RATE = getattr(snapshot, 'risk_free_rate', 0.045)
-        RF_SOURCE = getattr(snapshot, 'rf_source', '10-Year Treasury (^TNX)')
-        MARKET_RISK_PREMIUM = 0.05  # Damodaran implied ERP (5.0%)
-        DAMODARAN_DATE = "January 2026"
-        
-        col_capm1, col_capm2, col_capm3 = st.columns(3)
-        
-        with col_capm1:
-            st.metric("Risk-Free Rate (Rf)¹¹", f"{RISK_FREE_RATE*100:.1f}%")
-            st.caption(RF_SOURCE)
+    engine_result = st.session_state.get("dcf_engine_result") or {}
+    snapshot = st.session_state.get("dcf_snapshot")
 
-        with col_capm2:
-            st.metric("Market Risk Premium (ERP)¹²", f"{MARKET_RISK_PREMIUM*100:.1f}%")
-            st.caption(f"Damodaran Implied ERP ({DAMODARAN_DATE})")
+    assumptions = ui_data.get("assumptions", {}) or {}
+    yearly_projections = assumptions.get("yearly_projections", []) or []
+    fcf_projections = ui_data.get("fcf_projections", []) or []
+    trace_steps = engine_result.get("trace", []) if isinstance(engine_result, dict) else []
 
-        with col_capm3:
-            if beta:
-                st.metric("Beta (β)¹⁰", f"{beta:.2f}")
-                st.caption("Yahoo Finance (5Y monthly)")
-            else:
-                st.metric("Beta (β)¹⁰", "N/A")
-                st.caption("Not available")
-        
-        # Show CAPM calculation
-        if beta:
-            cost_of_equity = RISK_FREE_RATE + beta * MARKET_RISK_PREMIUM
-            st.markdown("---")
-            
-            col_formula, col_result = st.columns([2, 1])
-            with col_formula:
-                st.markdown(f"""
-                **CAPM Formula:**
-                ```
-                Cost of Equity = Rf + β × (Rm - Rf)
-                              = {RISK_FREE_RATE*100:.1f}% + {beta:.2f} × {MARKET_RISK_PREMIUM*100:.1f}%
-                              = {cost_of_equity*100:.1f}%
-                ```
-                """)
-            
-            with col_result:
-                st.metric("Cost of Equity", f"{cost_of_equity*100:.1f}%")
-                st.caption("CAPM result")
-            
-            # Compare to used WACC
-            used_wacc = ui_data.get('assumptions', {}).get('wacc', 0.09)
-            
-            if abs(cost_of_equity - used_wacc) > 0.005:
-                delta_wacc = (used_wacc - cost_of_equity) * 100
-                st.info(f"**Used WACC: {used_wacc*100:.1f}%** — User adjusted by {delta_wacc:+.1f}% from CAPM suggestion")
-            else:
-                st.success(f"**Used WACC: {used_wacc*100:.1f}%** — Matches CAPM cost of equity")
-        
-        # Sources and methodology
-        with st.expander("CAPM Sources & Methodology (Sources [9–12])", icon="📚"):
-            st.markdown(f"""
-            **Data Sources (all traceable):**
-            - **Beta ({beta:.2f})**: Yahoo Finance — 5-year monthly returns vs S&P 500
-            - **Risk-Free Rate ({RISK_FREE_RATE*100:.1f}%)**: 10-year U.S. Treasury yield
-              - Source: [FRED DGS10](https://fred.stlouisfed.org/series/DGS10) (Feb 2026 ~4.5%)
-            - **Implied Equity Risk Premium ({MARKET_RISK_PREMIUM*100:.1f}%)**: Damodaran, NYU Stern ({DAMODARAN_DATE})
-              - Source: [pages.stern.nyu.edu/~adamodar/](https://pages.stern.nyu.edu/~adamodar/)
-              - Using *implied* ERP (forward-looking), not historical average
-            
-            **CAPM Calculation:**
-            ```
-            Cost of Equity = Rf + β × ERP
-                           = {RISK_FREE_RATE*100:.1f}% + {beta:.2f} × {MARKET_RISK_PREMIUM*100:.1f}%
-                           = {cost_of_equity*100:.1f}%
-            ```
-            
-            **Simplifications:**
-            - This model uses Cost of Equity as a proxy for WACC
-            - For companies with significant debt, a full WACC calculation would include:
-              - Cost of Debt × (1 - Tax Rate) × Debt Weight
-              - Cost of Equity × Equity Weight
-            - Large-cap tech companies typically have minimal debt, so Cost of Equity ≈ WACC
-            
-            **Beta Interpretation:**
-            - β = 1.0: Moves with the market
-            - β > 1.0: More volatile than market (higher risk, higher expected return)
-            - β < 1.0: Less volatile than market (lower risk, lower expected return)
-            """)
-    else:
-        st.warning("Snapshot data not available for CAPM details.")
-    
-    # 5-YEAR FCF PROJECTION
-    # Get FCFF method for the header badge
-    fcff_method_for_header = ui_data.get('assumptions', {}).get('fcff_method', 'unknown')
-    fcff_reliability_for_header = ui_data.get('assumptions', {}).get('fcff_reliability', 0)
-    
-    fcff_header_badges = {
-        'proper_fcff': ('✅ Proper FCFF', '95%' if fcff_reliability_for_header >= 90 else f'{fcff_reliability_for_header}%'),
-        'approx_unlevered': ('📊 Approx Unlevered', f'{fcff_reliability_for_header}%' if fcff_reliability_for_header else '70%'),
-        'unlevered_proxy': ('📊 Approx Unlevered', f'{fcff_reliability_for_header}%' if fcff_reliability_for_header else '70%'),
-        'levered_proxy': ('⚠️ Levered Proxy', f'{fcff_reliability_for_header}%' if fcff_reliability_for_header else '50%')
+    forecast_years = int(assumptions.get("forecast_years") or 5)
+    wacc_used = assumptions.get("wacc")
+    terminal_growth = assumptions.get("terminal_growth_rate")
+    tv_method = assumptions.get("terminal_value_method", "gordon_growth")
+
+    ev = ui_data.get("enterprise_value")
+    equity = ui_data.get("equity_value")
+    price_per_share = ui_data.get("price_per_share")
+    pv_fcf_sum = ui_data.get("pv_fcf_sum")
+    pv_tv = ui_data.get("pv_terminal_value")
+    terminal_value_yearN = ui_data.get("terminal_value_yearN")
+    net_debt = ui_data.get("net_debt")
+    shares_outstanding = ui_data.get("shares_outstanding")
+
+    def _to_float(value):
+        try:
+            if value is None:
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _fmt_money(value, decimals=2):
+        num = _to_float(value)
+        if num is None:
+            return "N/A"
+        abs_num = abs(num)
+        if abs_num >= 1e12:
+            return f"${num / 1e12:.{decimals}f}T"
+        if abs_num >= 1e9:
+            return f"${num / 1e9:.{decimals}f}B"
+        if abs_num >= 1e6:
+            return f"${num / 1e6:.{decimals}f}M"
+        return f"${num:,.{decimals}f}"
+
+    def _fmt_rate(value, decimals=1):
+        num = _to_float(value)
+        if num is None:
+            return "N/A"
+        return f"{num * 100:.{decimals}f}%"
+
+    def _fmt_multiple(value, decimals=1):
+        num = _to_float(value)
+        if num is None:
+            return "N/A"
+        return f"{num:.{decimals}f}x"
+
+    def _fmt_number(value, decimals=2):
+        num = _to_float(value)
+        if num is None:
+            return "N/A"
+        return f"{num:,.{decimals}f}"
+
+    def _parse_reliability(value):
+        if isinstance(value, str) and value.endswith("/100"):
+            try:
+                return int(value.split("/")[0])
+            except ValueError:
+                return None
+        return None
+
+    st.caption("Sequential view of inputs, assumptions, calculations, and outputs.")
+
+    col_h1, col_h2, col_h3, col_h4 = st.columns(4)
+    with col_h1:
+        st.metric(
+            "Intrinsic Value / Share",
+            f"${_to_float(price_per_share):.2f}" if _to_float(price_per_share) is not None else "N/A",
+        )
+    with col_h2:
+        st.metric("Enterprise Value", _fmt_money(ev))
+    with col_h3:
+        st.metric("Equity Value", _fmt_money(equity))
+    with col_h4:
+        tv_ratio = ((_to_float(pv_tv) or 0.0) / (_to_float(ev) or 1.0) * 100.0) if _to_float(ev) else 0.0
+        st.metric("PV(Terminal) as % EV", f"{tv_ratio:.1f}%")
+
+    st.markdown("### 1. Input Data")
+    input_order = {
+        "Current Price": 1,
+        "Market Cap": 2,
+        "Shares Outstanding": 3,
+        "TTM Revenue": 4,
+        "TTM Operating Income": 5,
+        "TTM EBITDA": 6,
+        "TTM Operating Cash Flow": 7,
+        "TTM CapEx": 8,
+        "TTM Free Cash Flow": 9,
+        "Total Debt": 10,
+        "Cash & Equivalents": 11,
     }
-    badge_label, badge_reliability = fcff_header_badges.get(fcff_method_for_header, ('Unknown', ''))
-    
-    assumptions = ui_data.get('assumptions', {})
-    
-    # Get horizon info
-    forecast_years = assumptions.get('forecast_years', 5)
-    display_years = assumptions.get('display_years', 5)
-    is_large_cap = assumptions.get('is_large_cap', False)
-    horizon_reason = assumptions.get('horizon_reason', 'standard')
-    
-    # Dynamic header based on horizon
-    horizon_label = f"{forecast_years}-Year Projection"
-    
-    st.markdown(f"### {horizon_label} & Present Value")
-    
-    projections = ui_data.get("fcf_projections", [])
-    use_driver_model = assumptions.get('use_driver_model', False)
-    yearly_projections = assumptions.get('yearly_projections', [])
-    
-    if projections:
-        # Check if we have driver-based projections (textbook DCF)
-        if use_driver_model and yearly_projections:
-            # ===== DRIVER-BASED PROJECTION TABLE (TEXTBOOK DCF) =====
-            analyst_anchors_used = assumptions.get('analyst_fcf_anchors_used', False)
-            if analyst_anchors_used:
-                st.caption(
-                    "📚 **Textbook DCF**: Revenue → EBIT → NOPAT → Reinvestment → FCFF  \n"
-                    "Revenue Years 1–3: analyst consensus anchor¹  |  "
-                    "FCFF Years 1–10: driver model²  |  Growth rates: Damodaran fade⁶"
-                )
-            else:
-                st.caption(
-                    "📚 **Textbook DCF**: Revenue → EBIT → NOPAT → Reinvestment → FCFF  \n"
-                    "FCF: FCFF driver model² (no analyst estimates available)  |  "
-                    "Growth rates: Damodaran smooth fade⁶"
-                )
-            
-            # Show growth fade and ROIC info
-            near_term_g = assumptions.get('near_term_growth_rate', 0)
-            effective_near_term_g = assumptions.get('effective_near_term_growth_rate')
-            consensus_years = assumptions.get('consensus_revenue_used_years', [])
-            stable_g = assumptions.get('stable_growth_rate', 0)
-            current_roic = assumptions.get('base_roic', 0)
-            terminal_roic = assumptions.get('terminal_roic', 0)
-            industry_roic = assumptions.get('industry_roic', 0)
-            terminal_reinv_rate = assumptions.get('terminal_reinvestment_rate', 0)
 
-            growth_start = effective_near_term_g if effective_near_term_g is not None else near_term_g
-            growth_note = ""
-            if consensus_years:
-                growth_note = f" (effective from consensus Y{consensus_years[0]}-Y{consensus_years[-1]})"
-            
-            st.info(
-                f"**Growth Fade**⁶: {growth_start:.1%}{growth_note} → Year {forecast_years}: {stable_g:.1%} (g_perp)⁸  \n"
-                f"**ROIC Fade**⁷: Current {current_roic:.1%} → Terminal {terminal_roic:.1%} (industry: {industry_roic:.1%})  \n"
-                f"**Terminal Reinvestment**⁶: {terminal_reinv_rate:.1%} = g_perp / ROIC_terminal"
-            )
-            
-            # Full driver table (show display_years, but compute all)
-            proj_table = []
-            display_projs = yearly_projections[:display_years] if len(yearly_projections) > display_years else yearly_projections
-            for proj in display_projs:
-                revenue_src = proj.get('revenue_source')
-                if revenue_src is None:
-                    fcf_src = proj.get('fcf_source', 'driver_model')
-                    src_badge = "[¹]" if fcf_src == "analyst_revenue_estimate" else "[²]"
-                else:
-                    src_badge = "[¹]" if revenue_src == "analyst_consensus" else "[²]"
-                proj_table.append({
-                    "Year": f"Y{proj.get('year', 0)}",
-                    "Revenue³": f"${proj.get('revenue', 0)/1e9:.1f}B",
-                    "Growth⁶": f"{proj.get('revenue_growth', 0):.1%}",
-                    "EBIT Margin⁵": f"{proj.get('ebit_margin', 0):.1%}",
-                    "EBIT": f"${proj.get('ebit', 0)/1e9:.1f}B",
-                    "NOPAT": f"${proj.get('nopat', 0)/1e9:.1f}B",
-                    "Reinvest⁶": f"${proj.get('reinvestment', 0)/1e9:.1f}B",
-                    "Reinv Rate⁶": f"{proj.get('reinvestment_rate', 0):.0%}",
-                    "FCFF⁴": f"${proj.get('fcff', 0)/1e9:.1f}B {src_badge}",
-                    "PV(FCFF)": f"${proj.get('pv_fcff', 0)/1e9:.1f}B"
-                })
-            
-            df_proj = pd.DataFrame(proj_table)
-            st.dataframe(df_proj, use_container_width=True, hide_index=True)
-            
-            # Show years 6-10 in expander if 10-year horizon
-            if forecast_years == 10 and len(yearly_projections) > 5:
-                with st.expander(f"Years 6–10 (Fade to Terminal)", icon="📈"):
-                    fade_table = []
-                    for proj in yearly_projections[5:]:
-                        revenue_src = proj.get('revenue_source')
-                        if revenue_src is None:
-                            fcf_src = proj.get('fcf_source', 'driver_model')
-                            src_badge = "[¹]" if fcf_src == "analyst_revenue_estimate" else "[²]"
-                        else:
-                            src_badge = "[¹]" if revenue_src == "analyst_consensus" else "[²]"
-                        fade_table.append({
-                            "Year": f"Y{proj.get('year', 0)}",
-                            "Revenue³": f"${proj.get('revenue', 0)/1e9:.1f}B",
-                            "Growth⁶": f"{proj.get('revenue_growth', 0):.1%}",
-                            "NOPAT": f"${proj.get('nopat', 0)/1e9:.1f}B",
-                            "Reinv Rate⁶": f"{proj.get('reinvestment_rate', 0):.0%}",
-                            "FCFF⁴": f"${proj.get('fcff', 0)/1e9:.1f}B {src_badge}",
-                            "PV(FCFF)": f"${proj.get('pv_fcff', 0)/1e9:.1f}B"
-                        })
-                    st.dataframe(pd.DataFrame(fade_table), use_container_width=True, hide_index=True)
-            
-            # Show formulas below
-            with st.expander("Driver Formulas", icon="📐"):
-                st.markdown("""
-                | Driver | Formula |
-                |--------|---------|
-                | Revenue | `Revenue_t = Revenue_{t-1} × (1 + g_t)` |
-                | EBIT | `EBIT_t = Revenue_t × EBIT_margin` |
-                | NOPAT | `NOPAT_t = EBIT_t × (1 - tax_rate)` |
-                | Reinvestment | `Reinvestment_t = ΔRevenue_t / Sales_to_Capital` |
-                | FCFF | `FCFF_t = NOPAT_t - Reinvestment_t` |
-                | PV(FCFF) | `PV_t = FCFF_t / (1 + WACC)^t` |
-                """)
-                
-        else:
-            # ===== LEGACY SIMPLE GROWTH TABLE =====
-            proj_table = []
-            for i, proj in enumerate(projections):
-                growth_str = "—"
-                if i > 0 and projections[i-1].get('fcf', 0) > 0:
-                    growth = ((proj.get('fcf', 0) / projections[i-1].get('fcf', 1)) - 1) * 100
-                    growth_str = f"{growth:.1f}%"
-                proj_table.append({
-                    "Year": f"Year {proj.get('year', 0)}",
-                    "FCF ($B)": f"${proj.get('fcf', 0)/1e9:.1f}",
-                    "Growth": growth_str,
-                    "Discount Factor": f"{proj.get('discount_factor', 0):.4f}",
-                    "PV(FCF) ($B)": f"${proj.get('pv', 0)/1e9:.1f}",
-                    "Formula": "FCF_t / (1+WACC)^t"
-                })
-            df_proj = pd.DataFrame(proj_table)
-            st.dataframe(df_proj, use_container_width=True, hide_index=True)
-        
-        pv_sum = sum([p.get('pv', 0) for p in projections])
-    
-    # TERMINAL VALUE CALCULATION
-    st.markdown("### Terminal Value Calculation⁸ ¹³")
-    tv_yearN = ui_data.get('terminal_value_yearN', 0)
-    pv_tv = ui_data.get('pv_terminal_value', 0)
-    assumptions = ui_data.get('assumptions', {})
-    ev = ui_data.get('enterprise_value', 1)
-    
-    tv_method = assumptions.get('terminal_value_method', 'exit_multiple')
-    
-    # Show method-specific calculation details
-    if tv_method == "exit_multiple":
-        # Exit Multiple Method with current-anchored default
-        exit_multiple = assumptions.get('exit_multiple', 15)
-        current_ev_ebitda = assumptions.get('current_ev_ebitda')
-        industry_ev_ebitda = assumptions.get('industry_ev_ebitda')
-        damodaran_industry = assumptions.get('damodaran_industry', 'N/A')
-        yf_industry = assumptions.get('yf_industry', 'N/A')
-        is_exact_match = assumptions.get('is_exact_industry_match', False)
-        multiple_source = assumptions.get('terminal_multiple_source', 'unknown')
-        
-        st.markdown("#### Exit Multiple Method (EV/EBITDA)")
-        
-        # Terminal Multiple Transparency Section
-        st.markdown("##### Terminal Multiple Analysis")
-        
-        # Key metrics in columns
-        col_m1, col_m2, col_m3 = st.columns(3)
-        with col_m1:
-            if current_ev_ebitda is not None:
-                st.metric("Current EV/EBITDA", f"{current_ev_ebitda:.1f}x")
-                st.caption("Company trading multiple")
-            else:
-                st.metric("Current EV/EBITDA", "N/A")
-                st.caption("Cannot compute")
-        with col_m2:
-            if industry_ev_ebitda is not None:
-                st.metric("Industry EV/EBITDA", f"{industry_ev_ebitda:.1f}x")
-                st.caption(f"Damodaran: {damodaran_industry[:25]}...")
-            else:
-                st.metric("Industry EV/EBITDA", "N/A")
-                st.caption("Not applicable")
-        with col_m3:
-            # Show terminal multiple with scenario info
-            terminal_scenario = assumptions.get('terminal_multiple_scenario', 'current')
-            rerating_pct = assumptions.get('terminal_multiple_rerating_pct')
-            
-            scenario_labels = {
-                'current': 'Current',
-                'industry': 'Industry', 
-                'blended': 'Blended',
-                'custom': 'Custom'
+    input_rows_raw = ui_adapter.format_input_table()
+    input_rows = sorted(input_rows_raw, key=lambda row: input_order.get(row.get("Item", ""), 999))
+
+    input_table = []
+    low_reliability_inputs = []
+    for row in input_rows:
+        score = _parse_reliability(row.get("Reliability", ""))
+        if score is not None and score < 60:
+            low_reliability_inputs.append(f"{row.get('Item', 'Unknown')} ({score}/100)")
+
+        input_table.append(
+            {
+                "Item": row.get("Item", "N/A"),
+                "Value": row.get("Value", "N/A"),
+                "Period": row.get("Period", "N/A"),
+                "Source": row.get("Source", "N/A"),
+                "Reliability": row.get("Reliability", "N/A"),
+                "Notes": row.get("Notes", "N/A"),
             }
-            scenario_label = scenario_labels.get(terminal_scenario, terminal_scenario)
-            
-            if rerating_pct is not None and abs(rerating_pct) > 0.5:
-                st.metric("Terminal EV/EBITDA (Used)", f"{exit_multiple:.1f}x", 
-                         delta=f"{rerating_pct:+.1f}% rerating")
-                st.caption(f"Scenario: {scenario_label}")
-            else:
-                st.metric("Terminal EV/EBITDA (Used)", f"{exit_multiple:.1f}x")
-                st.caption(f"Scenario: {scenario_label} (no rerating)")
-        
-        # Show cash conversion analysis - BOTH TTM and Terminal
-        observed_fcff_ebitda_ttm = assumptions.get('observed_fcff_ebitda_ttm')
-        terminal_fcff_ebitda = assumptions.get('terminal_year_fcff_ebitda')  # From Year N projection
-        required_fcff_ebitda = assumptions.get('required_fcff_ebitda_for_exit')
-        consistent_multiple = assumptions.get('consistent_exit_multiple')
-        
-        if observed_fcff_ebitda_ttm or terminal_fcff_ebitda:
-            st.markdown("##### Cash Conversion Analysis")
-            col_cc1, col_cc2, col_cc3, col_cc4 = st.columns(4)
-            
-            with col_cc1:
-                if observed_fcff_ebitda_ttm:
-                    st.metric("TTM FCFF/EBITDA", f"{observed_fcff_ebitda_ttm*100:.0f}%")
-                    st.caption("Current (today)")
-                else:
-                    st.metric("TTM FCFF/EBITDA", "N/A")
-            
-            with col_cc2:
-                if terminal_fcff_ebitda:
-                    st.metric("Terminal FCFF/EBITDA", f"{terminal_fcff_ebitda*100:.0f}%")
-                    st.caption(f"Year {assumptions.get('forecast_years', 10)} forecast")
-                else:
-                    st.metric("Terminal FCFF/EBITDA", "N/A")
-                    st.caption("Not projected")
-            
-            with col_cc3:
-                if consistent_multiple:
-                    st.metric("Consistent Multiple", f"{consistent_multiple:.1f}x")
-                    st.caption("From economics")
-                else:
-                    st.metric("Consistent Multiple", "N/A")
-            
-            with col_cc4:
-                if required_fcff_ebitda:
-                    # Color-code based on plausibility
-                    comparison_conversion = terminal_fcff_ebitda if terminal_fcff_ebitda else observed_fcff_ebitda_ttm
-                    if required_fcff_ebitda > 0.85:
-                        st.metric("Required", f"{required_fcff_ebitda*100:.0f}% 🔴")
-                        st.caption("Implausible (>85%)")
-                    elif comparison_conversion and required_fcff_ebitda > comparison_conversion + 0.15:
-                        st.metric("Required", f"{required_fcff_ebitda*100:.0f}% ⚠️")
-                        st.caption("Above forecast")
-                    else:
-                        st.metric("Required", f"{required_fcff_ebitda*100:.0f}% ✓")
-                        st.caption("Reasonable")
-                else:
-                    st.metric("Required", "N/A")
-        
-        # Industry classification
-        match_badge = "✅ Exact Match" if is_exact_match else "⚡ Approximate Match"
-        
-        with st.expander("Industry Classification & Methodology", icon="📚"):
-            st.markdown(f"""
-            **Industry Mapping:**
-            - Yahoo Finance Industry: `{yf_industry}`
-            - Damodaran Industry: `{damodaran_industry}` ({match_badge})
-            
-            📊 [View Damodaran Industry Multiples](https://pages.stern.nyu.edu/~adamodar/New_Home_Page/datafile/vebitda.html) | *Data as of January 2026*
-            
-            ---
-            
-            **Terminal Multiple Scenarios:**
-            - **Current**: Uses company's current EV/EBITDA (no rerating assumption)
-            - **Industry**: Uses Damodaran industry median
-            - **Blended**: 70% current + 30% industry (partial mean reversion)
-            - **Custom**: User-specified multiple
-            
-            **Cash Conversion Diagnostic:**
-            - Required FCFF/EBITDA = Exit Multiple × (WACC − g)
-            - If required >> observed, your multiple implies implausible efficiency gains
-            - >85% cash conversion is economically unrealistic for most businesses
-            """)
-        
-        # Calculation breakdown
-        st.markdown("#### Calculation Steps")
-        
-        # Get TTM EBITDA and project to Year N
-        ttm_ebitda_raw = ui_data.get('inputs', {}).get('ttm_ebitda', 0)
-        # Handle FinancialMetric object, dict, or raw value
-        if hasattr(ttm_ebitda_raw, 'value'):
-            ttm_ebitda = ttm_ebitda_raw.value or 0
-        elif isinstance(ttm_ebitda_raw, dict):
-            ttm_ebitda = ttm_ebitda_raw.get('value', 0) or 0
-        else:
-            ttm_ebitda = ttm_ebitda_raw or 0
-        
-        fcf_growth = assumptions.get('fcf_growth_rate', 0.08)
-        forecast_years = assumptions.get('forecast_years', 5)
-        wacc = assumptions.get('wacc', 0.08)
-        
-        year_n_ebitda = ttm_ebitda * ((1 + fcf_growth) ** forecast_years) if ttm_ebitda else 0
-        
-        # Build step 4 description based on multiple source
-        if multiple_source == "current":
-            step4_formula = f"Current EV/EBITDA (no rerating)"
-        elif multiple_source == "industry_fallback":
-            step4_formula = f"Industry fallback: {damodaran_industry}"
-        else:
-            step4_formula = f"Current company trading multiple"
-        
-        calc_table = [
-            {"Step": "1. TTM EBITDA", "Formula": "From financial statements", "Value": f"${ttm_ebitda/1e9:.2f}B" if ttm_ebitda else "N/A"},
-            {"Step": "2. EBITDA Growth Rate", "Formula": "Using FCF growth as proxy", "Value": f"{fcf_growth*100:.1f}%"},
-            {"Step": f"3. Year {forecast_years} EBITDA", "Formula": f"TTM EBITDA × (1 + g)^{forecast_years}", "Value": f"${year_n_ebitda/1e9:.2f}B" if year_n_ebitda else "N/A"},
-            {"Step": "4. Terminal Multiple", "Formula": step4_formula, "Value": f"{exit_multiple}x EV/EBITDA"},
-            {"Step": f"5. Terminal Value (Y{forecast_years})", "Formula": f"Year {forecast_years} EBITDA × Terminal Multiple", "Value": f"${tv_yearN/1e9:.1f}B"},
-            {"Step": "6. Discount Factor", "Formula": f"1 / (1 + WACC)^{forecast_years}", "Value": f"{1 / (1 + wacc)**forecast_years:.4f}"},
-            {"Step": "7. PV(Terminal Value)", "Formula": "Terminal Value × Discount Factor", "Value": f"${pv_tv/1e9:.1f}B"},
-        ]
-        df_calc = pd.DataFrame(calc_table)
-        st.dataframe(df_calc, use_container_width=True, hide_index=True)
-        
-    else:
-        # Gordon Growth Method
-        st.markdown("##### Gordon Growth Model")
-        
-        terminal_growth = assumptions.get('terminal_growth_rate', 0.03)
-        wacc = assumptions.get('wacc', 0.08)
-        forecast_years = assumptions.get('forecast_years', 5)
-        
-        # Get Year N FCF from projections
-        year_n_fcf = projections[-1].get('fcf', 0) if projections else 0
-        terminal_fcf = year_n_fcf * (1 + terminal_growth)
-        n_plus_1 = forecast_years + 1
-        
-        calc_table = [
-            {"Step": f"1. Year {forecast_years} FCF", "Formula": f"From {forecast_years}-year projection", "Value": f"${year_n_fcf/1e9:.2f}B"},
-            {"Step": "2. Terminal Growth Rate (g)", "Formula": "Long-term GDP growth proxy", "Value": f"{terminal_growth*100:.1f}%"},
-            {"Step": f"3. Terminal FCF (Year {n_plus_1})", "Formula": f"Year {forecast_years} FCF × (1 + g)", "Value": f"${terminal_fcf/1e9:.2f}B"},
-            {"Step": "4. WACC", "Formula": "Weighted average cost of capital", "Value": f"{wacc*100:.1f}%"},
-            {"Step": "5. Terminal Value", "Formula": "Terminal FCF / (WACC - g)", "Value": f"${tv_yearN/1e9:.1f}B"},
-            {"Step": "6. Discount Factor", "Formula": f"1 / (1 + WACC)^{forecast_years}", "Value": f"{1 / (1 + wacc)**forecast_years:.4f}"},
-            {"Step": "7. PV(Terminal Value)", "Formula": "Terminal Value × Discount Factor", "Value": f"${pv_tv/1e9:.1f}B"},
-        ]
-        df_calc = pd.DataFrame(calc_table)
-        st.dataframe(df_calc, use_container_width=True, hide_index=True)
-        
-        st.info(f"""
-        **Gordon Growth Formula:** TV = FCF_({n_plus_1}) / (WACC - g) = ${terminal_fcf/1e9:.2f}B / ({wacc*100:.1f}% - {terminal_growth*100:.1f}%) = ${tv_yearN/1e9:.1f}B
-        """)
-    
-    # ===== DUAL TV CROSS-CHECK SECTION =====
-    # ===== SECTION 1: INTRINSIC VALUE (GORDON GROWTH) =====
-    st.markdown("#### Intrinsic Value (Gordon Growth)")
-    
-    # Get all inputs for calculation trace
-    pv_tv_exit = assumptions.get('pv_tv_exit_multiple')
-    pv_tv_gordon = assumptions.get('pv_tv_gordon_growth')
-    tv_exit_raw = assumptions.get('tv_exit_multiple')  # Undiscounted TV
-    tv_gordon_raw = assumptions.get('tv_gordon_growth')  # Undiscounted TV
-    price_exit = assumptions.get('price_exit_multiple')
-    price_gordon = assumptions.get('price_gordon_growth')
-    
-    # Get underlying assumptions for trace
-    exit_multiple_used = assumptions.get('exit_multiple', 0)
-    terminal_growth = assumptions.get('terminal_growth_rate', 0.03)
-    fcf_growth = assumptions.get('fcf_growth_rate', 0.10)
-    wacc_used = assumptions.get('wacc', 0.10)
-    forecast_years = assumptions.get('forecast_years', 5)
-    tv_method_used = assumptions.get('terminal_value_method', 'exit_multiple')
-    
-    # Get TTM EBITDA and FCF from snapshot stored in session_state
-    ttm_ebitda = None
-    ttm_fcf = None
-    if snapshot and hasattr(snapshot, 'ttm_ebitda') and snapshot.ttm_ebitda:
-        ttm_ebitda = snapshot.ttm_ebitda.value
-    if snapshot and hasattr(snapshot, 'ttm_fcf') and snapshot.ttm_fcf:
-        ttm_fcf = snapshot.ttm_fcf.value
-    
-    if pv_tv_gordon:
-        # Get TTM FCFF from the proper FCFF calculation
-        ttm_fcff = assumptions.get('ttm_fcff')
-        fcff_to_use = ttm_fcff if ttm_fcff else ttm_fcf
-        
-        # Get ACTUAL Year N FCFF from driver-based projections
-        fcf_projections = ui_data.get("fcf_projections", [])
-        if fcf_projections:
-            year_n_fcf_actual = fcf_projections[-1].get('fcf', 0) or fcf_projections[-1].get('fcff', 0)
-        else:
-            year_n_fcf_actual = None
-        
-        # Calculate terminal FCF from the actual Year N value
-        if year_n_fcf_actual and terminal_growth:
-            terminal_fcf_actual = year_n_fcf_actual * (1 + terminal_growth)
-        elif tv_gordon_raw and (wacc_used - terminal_growth) > 0:
-            terminal_fcf_actual = tv_gordon_raw * (wacc_used - terminal_growth)
-            year_n_fcf_actual = terminal_fcf_actual / (1 + terminal_growth) if terminal_growth else terminal_fcf_actual
-        else:
-            terminal_fcf_actual = None
-
-        n_plus_1 = forecast_years + 1
-        
-        # Determine if we're using proper FCFF
-        using_proper_fcff = ttm_fcff is not None and ttm_fcff > 0
-        fcff_label = "FCFF" if using_proper_fcff else "FCF"
-        
-        # Calculate TV share of EV
-        pv_fcf_sum = assumptions.get('pv_fcf_sum', 0)
-        ev_gordon = ui_data.get('enterprise_value') or assumptions.get('ev_gordon_growth') or 0
-        if not ev_gordon and pv_fcf_sum:
-            ev_gordon = pv_fcf_sum + pv_tv_gordon
-        tv_share_pct = (pv_tv_gordon / ev_gordon * 100) if ev_gordon and ev_gordon > 0 else 0
-        
-        # Calculate discount factor
-        discount_factor = (1 + wacc_used) ** forecast_years
-        
-        # ===== HEADER ROW: Inputs (left chips) + Outputs (right stack) =====
-        col_inputs, col_outputs = st.columns([3, 2])
-        
-        with col_inputs:
-            # Compact input chips
-            if year_n_fcf_actual:
-                st.markdown(f"""
-<div style="display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px;">
-    <span class="input-chip">{fcff_label}₁₀ = <b>${year_n_fcf_actual/1e9:.2f}B</b></span>
-    <span class="input-chip">g = <b>{terminal_growth*100:.1f}%</b></span>
-    <span class="input-chip">WACC = <b>{wacc_used*100:.1f}%</b></span>
-    <span class="input-chip">n = <b>{forecast_years} years</b></span>
-</div>
-                """, unsafe_allow_html=True)
-        
-        with col_outputs:
-            # Output stack - key metrics as HTML to prevent truncation
-            st.markdown(f"""
-<div style="display: flex; gap: 24px; justify-content: flex-end;">
-    <div style="text-align: center;">
-        <div style="font-size: 12px; color: #666;">Intrinsic Value</div>
-        <div style="font-size: 20px; font-weight: 600;">{f"${price_gordon:.2f}" if price_gordon else "N/A"}</div>
-    </div>
-    <div style="text-align: center;">
-        <div style="font-size: 12px; color: #666;">PV(TV)</div>
-        <div style="font-size: 20px; font-weight: 600;">${pv_tv_gordon/1e9:.1f}B</div>
-    </div>
-    <div style="text-align: center;">
-        <div style="font-size: 12px; color: #666;">TV Share</div>
-        <div style="font-size: 20px; font-weight: 600;">{tv_share_pct:.1f}%</div>
-    </div>
-</div>
-            """, unsafe_allow_html=True)
-        
-        # ===== CALCULATION TRACE: Clean 3-step flow =====
-        if year_n_fcf_actual and terminal_fcf_actual and tv_gordon_raw:
-            wacc_minus_g = wacc_used - terminal_growth
-            
-            with st.expander("Calculation Details", expanded=False):
-                st.markdown(f"""
-| Step | Calculation | Result |
-|:-----|:------------|-------:|
-| 1. Terminal {fcff_label} (Year {n_plus_1}) | {fcff_label}₁₀ × (1 + g) = ${year_n_fcf_actual/1e9:.2f}B × {1 + terminal_growth:.2f} | ${terminal_fcf_actual/1e9:.2f}B |
-| 2. Terminal Value | {fcff_label}₁₁ / (WACC − g) = ${terminal_fcf_actual/1e9:.2f}B / {wacc_minus_g*100:.1f}% | ${tv_gordon_raw/1e9:.1f}B |
-| 3. Discount Factor | (1 + {wacc_used*100:.1f}%)^{forecast_years} | {discount_factor:.4f} |
-| 4. PV(TV) | TV / Discount Factor = ${tv_gordon_raw/1e9:.1f}B / {discount_factor:.4f} | ${pv_tv_gordon/1e9:.1f}B |
-                """)
-        
-        # Warning if WACC - g is too tight
-        wacc_minus_g = wacc_used - terminal_growth
-        if wacc_minus_g < 0.045:
-            st.error(f"""
-            🔴 **Gordon Growth Extremely Sensitive**: WACC - g = {wacc_minus_g*100:.1f}% (<4.5%)
-            
-            Small changes in growth or WACC cause massive swings in terminal value.
-            """)
-    else:
-        st.warning("Gordon Growth terminal value not available.")
-    
-    # ===== SECTION 2: EXIT MULTIPLE CROSS-CHECK (STRESS TEST) =====
-    st.markdown("---")
-    st.markdown("#### Exit Multiple Cross-Check (Stress Test)")
-    st.caption("⚠️ **These are stress tests, NOT base cases.** Today's market multiple embeds growth expectations and option value. A mature terminal state should trade at a LOWER multiple than today. If 'Required Conversion' shows >100%, that's expected — it means forcing today's multiple onto a mature business is unrealistic. The informative question: How much multiple compression does Gordon Growth imply?")
-    
-    # Get scenario data from engine
-    exit_scenarios = assumptions.get('exit_multiple_scenarios', [])
-    wacc_minus_g = wacc_used - terminal_growth
-    terminal_fcff_ebitda = assumptions.get('terminal_year_fcff_ebitda')
-    consistent_multiple = assumptions.get('consistent_exit_multiple')
-    
-    if exit_scenarios:
-        # Get Year N EBITDA for context
-        fcf_projections_exit = ui_data.get("fcf_projections", [])
-        year_n_ebitda = None
-        if fcf_projections_exit and len(fcf_projections_exit) > 0:
-            year_n_proj = fcf_projections_exit[-1]
-            year_n_ebitda = year_n_proj.get('ebitda', 0) or assumptions.get('projected_terminal_ebitda', 0)
-        
-        # ===== SHARED ASSUMPTIONS AS CHIPS =====
-        forecasted_str = f"{terminal_fcff_ebitda:.0%}" if terminal_fcff_ebitda else "N/A"
-        st.markdown(f"""
-<div style="display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px;">
-    <span class="param-chip">Spread (WACC − g) = <b>{wacc_minus_g*100:.1f}%</b></span>
-    <span class="param-chip">Terminal Cash Conversion = <b>{forecasted_str}</b> <span style="font-size:11px; color:var(--clr-text-muted);">(Year {forecast_years} forecast)</span></span>
-    <span class="param-chip">Terminal Year = <b>{forecast_years}</b></span>
-</div>
-        """, unsafe_allow_html=True)
-        
-        # ===== COMPACT ROW-CARD TABLE =====
-        # Header row
-        st.markdown("""
-<div style="display: grid; grid-template-columns: 2fr 1fr 1fr 1.5fr 1fr; gap: 8px; font-size: 12px; color: #666; padding: 4px 8px; border-bottom: 1px solid #ddd;">
-    <span>Scenario</span>
-    <span style="text-align: right;">Multiple</span>
-    <span style="text-align: right;">Implied Price</span>
-    <span style="text-align: right;">Required Conversion <span title="The FCFF/EBITDA ratio needed at terminal year to justify this multiple. Compare to the forecast ratio to assess plausibility." style="cursor: help; color: #888;">ⓘ</span></span>
-    <span style="text-align: right;">Gap vs Forecast</span>
-</div>
-        """, unsafe_allow_html=True)
-        
-        # Show each scenario as a compact row
-        for scenario in exit_scenarios:
-            status = scenario.get('status', 'N/A')
-            required_conv = scenario.get('required_fcff_ebitda', 0)
-            price = scenario.get('price')
-            multiple = scenario.get('multiple', 0)
-            name = scenario.get('name', 'Unknown')
-            source = scenario.get('source', '')
-            gap = scenario.get('gap', '')
-            is_industry = scenario.get('is_industry', False)
-            
-            # Status pill styling
-            status_styles = {
-                'PASS': ('✅', 'var(--clr-success-bg)', 'var(--clr-success-text)'),
-                'WARN': ('⚠️', 'var(--clr-warn-bg)', 'var(--clr-warn-text)'),
-                'FAIL': ('🔴', 'var(--clr-danger-bg)', 'var(--clr-danger-text)')
-            }
-            icon, bg_color, text_color = status_styles.get(status, ('❓', 'var(--clr-bg)', 'var(--clr-text-secondary)'))
-            
-            # One-line explanation based on status
-            if status == 'PASS':
-                explanation = f"Plausible terminal economics"
-            elif status == 'WARN':
-                explanation = f"Elevated but possible for asset-light"
-            else:
-                if required_conv > 1.0:
-                    explanation = f"Inconsistent with steady-state economics"
-                else:
-                    explanation = f"Requires unusually high conversion"
-            
-            # Source citation with explanation for Model-implied
-            if is_industry:
-                source_cite = "(Damodaran industry avg — ref only)"
-            elif 'Implied by Gordon' in name or 'Model-implied' in name:
-                source_cite = "= TV_gordon / EBITDA₁₀ (baseline from forecast)"
-            elif source:
-                source_cite = f"({source})"
-            else:
-                source_cite = "(current trading)"
-            
-            # Gap display
-            gap_display = gap if gap else "—"
-            if terminal_fcff_ebitda and required_conv:
-                gap_pct = ((required_conv / terminal_fcff_ebitda) - 1) * 100 if terminal_fcff_ebitda > 0 else 0
-                gap_display = f"{gap_pct:+.0f}%"
-            
-            # Row card
-            price_str = f"${price:.0f}" if price else "N/A"
-            st.markdown(f"""
-<div style="display: grid; grid-template-columns: 2fr 1fr 1fr 1.5fr 1fr; gap: 8px; align-items: center; padding: 10px 8px; margin: 4px 0; background: var(--clr-surface); border-radius: 6px; border-left: 3px solid {bg_color}; box-shadow: var(--shadow-sm);">
-    <div>
-        <span style="font-weight: 600;">{name}</span><br/>
-        <span style="font-size: 11px; color: #666;">{source_cite}</span>
-    </div>
-    <span style="text-align: right; font-weight: 600;">{multiple:.1f}x</span>
-    <span style="text-align: right; font-weight: 600;">{price_str}</span>
-    <span style="text-align: right; font-weight: 600;">{required_conv*100:.0f}%</span>
-    <span style="text-align: right; color: {'var(--clr-danger)' if gap_display.startswith('+') and float(gap_display[:-1]) > 50 else 'var(--clr-text-muted)'};">{gap_display}</span>
-</div>
-<div style="font-size: 13px; color: var(--clr-text-secondary); margin-left: 12px; margin-bottom: 8px;">{icon} {explanation}</div>
-            """, unsafe_allow_html=True)
-        
-        # Model-implied multiple callout
-        if consistent_multiple and tv_method_used == 'gordon_growth':
-            st.info(f"Model-Implied Multiple: {consistent_multiple:.1f}x — the EV/EBITDA directly implied by TV_gordon / EBITDA₁₀. Multiples above this require higher terminal cash conversion than the forecast.")
-    else:
-        # Fallback: show simple metrics if scenario data not computed but we have multiples
-        implied_gordon_ev_ebitda = assumptions.get('implied_gordon_ev_ebitda') or assumptions.get('consistent_exit_multiple')
-        current_mult = assumptions.get('current_ev_ebitda') or exit_multiple_used
-        industry_mult = assumptions.get('industry_ev_ebitda')
-        
-        if implied_gordon_ev_ebitda or current_mult or industry_mult:
-            # We have data - show it without the warning
-            col_s1, col_s2, col_s3 = st.columns(3)
-            with col_s1:
-                if implied_gordon_ev_ebitda:
-                    st.metric("Model-Implied", f"{implied_gordon_ev_ebitda:.1f}x")
-                    st.caption("TV_gordon / EBITDA₁₀")
-                else:
-                    st.metric("Model-Implied", "N/A")
-            with col_s2:
-                if current_mult:
-                    st.metric("Current Trading", f"{current_mult:.1f}x")
-                    st.caption("Market EV/EBITDA")
-                else:
-                    st.metric("Current Trading", "N/A")
-            with col_s3:
-                if industry_mult:
-                    st.metric("Industry (ref)", f"{industry_mult:.1f}x")
-                    st.caption("Damodaran")
-                else:
-                    st.metric("Industry (ref)", "N/A")
-        else:
-            # Truly no data available
-            st.warning("Exit multiple data not available. Check that EBITDA is present.")
-    
-    if not pv_tv_gordon:
-        has_exit_tv = pv_tv_exit is not None
-        has_gordon_tv = pv_tv_gordon is not None
-        has_terminal_ebitda = assumptions.get('projected_terminal_ebitda') is not None and assumptions.get('projected_terminal_ebitda') > 0
-        has_exit_multiple = exit_multiple_used is not None and exit_multiple_used > 0
-
-        st.warning("Terminal value cross-check is partially unavailable.")
-        st.markdown(
-            f"- Exit multiple cross-check available: {'✅ yes' if has_exit_tv else '❌ no'}\n"
-            f"- Gordon Growth available: {'✅ yes' if has_gordon_tv else '❌ no'}"
         )
 
-        if not has_exit_tv:
-            reasons = assumptions.get('exit_multiple_unavailable_reasons') or []
-            if not reasons:
-                if not has_exit_multiple:
-                    reasons.append("missing terminal exit multiple")
-                if not has_terminal_ebitda:
-                    reasons.append(f"missing projected terminal EBITDA (Year {forecast_years})")
-            if not reasons:
-                reasons.append("exit-multiple terminal value not computed for this run")
-            st.caption("Exit multiple unavailable because: " + ", ".join(reasons) + ".")
-    
-    # Summary metrics row
-    st.markdown("#### Summary")
-    
-    if tv_method == "exit_multiple":
-        # Show 4 columns for exit multiple method with current/industry/terminal
-        col_tv1, col_tv2, col_tv3, col_tv4 = st.columns(4)
-        with col_tv1:
-            current_mult = assumptions.get('current_ev_ebitda')
-            if current_mult:
-                st.metric("Current EV/EBITDA", f"{current_mult:.1f}x")
-                st.caption("DEFAULT (no rerating)")
-            else:
-                st.metric("Current EV/EBITDA", "N/A")
-                st.caption("Cannot compute")
-        with col_tv2:
-            industry_mult = assumptions.get('industry_ev_ebitda')
-            if industry_mult:
-                st.metric("Industry EV/EBITDA", f"{industry_mult:.1f}x")
-                st.caption("Damodaran (ref only)")
-            else:
-                st.metric("Industry EV/EBITDA", "N/A")
-                st.caption("Not applicable")
-        with col_tv3:
-            st.metric("Terminal EV/EBITDA", f"{assumptions.get('exit_multiple', 'N/A')}x")
-            st.caption("Used in DCF")
-        with col_tv4:
-            st.metric("PV(Terminal Value)", f"${pv_tv/1e9:.1f}B")
-            tv_ratio = (pv_tv / ev) * 100 if ev > 0 else 0
-            st.caption(f"{tv_ratio:.1f}% of EV")
-    else:
-        # Gordon Growth - original 3-column layout
-        col_tv1, col_tv2, col_tv3 = st.columns(3)
-        forecast_years_summary = assumptions.get('forecast_years', 5)
-        with col_tv1:
-            st.metric(f"Terminal Value (Year {forecast_years_summary})", f"${tv_yearN/1e9:.1f}B")
-            st.caption("Method: Gordon Growth")
-        with col_tv2:
-            wacc = assumptions.get('wacc', 0.08)
-            st.metric("Discount Factor", f"{1 / (1 + wacc)**forecast_years_summary:.4f}")
-            st.caption(f"1 / (1 + {wacc*100:.1f}%)^{forecast_years_summary}")
-        with col_tv3:
-            st.metric("PV(Terminal Value)", f"${pv_tv/1e9:.1f}B")
-            tv_ratio = (pv_tv / ev) * 100 if ev > 0 else 0
-            st.caption(f"{tv_ratio:.1f}% of EV")
-    
-    # VALUATION BRIDGE
-    st.markdown("### Valuation")
-    st.caption("From enterprise value through to intrinsic value per share")
-    bridge_table = ui_adapter.format_bridge_table()
-    df_bridge = pd.DataFrame(bridge_table)
-    st.dataframe(df_bridge, use_container_width=True, hide_index=True)
-    
-    # TRACE JSON EXPORT
-    st.markdown("### 📥 Export Trace")
-    trace_data = {
-        "inputs": {k: str(v) for k, v in ui_data.get("inputs", {}).items()},
-        "assumptions": ui_data.get("assumptions", {}),
-        "results": {
-            "enterprise_value": ui_data.get("enterprise_value"),
-            "equity_value": ui_data.get("equity_value"),
-            "price_per_share": ui_data.get("price_per_share"),
-            "pv_fcf_sum": ui_data.get("pv_fcf_sum"),
-            "pv_terminal_value": ui_data.get("pv_terminal_value")
+    st.dataframe(pd.DataFrame(input_table), use_container_width=True, hide_index=True)
+    if low_reliability_inputs:
+        st.warning("Low reliability inputs: " + ", ".join(low_reliability_inputs))
+
+    st.markdown("### 2. Assumptions")
+    assumption_rows = [
+        {
+            "Assumption": "Forecast Horizon",
+            "Value": f"{forecast_years} years",
+            "Where Used": "Projection length and discount periods",
         },
-        "trace_steps": engine_result.get("trace", []) if engine_result else []
+        {
+            "Assumption": "WACC",
+            "Value": _fmt_rate(wacc_used),
+            "Where Used": "Discounting explicit cash flows and terminal value",
+        },
+        {
+            "Assumption": "Near-Term Growth",
+            "Value": _fmt_rate(assumptions.get("fcf_growth_rate")),
+            "Where Used": "Starting point for growth schedule",
+        },
+        {
+            "Assumption": "Terminal Growth (g)",
+            "Value": _fmt_rate(terminal_growth),
+            "Where Used": "Terminal value and spread checks",
+        },
+        {
+            "Assumption": "Tax Rate",
+            "Value": _fmt_rate(assumptions.get("tax_rate")),
+            "Where Used": "NOPAT and FCFF calculations",
+        },
+        {
+            "Assumption": "Terminal Method",
+            "Value": str(tv_method).replace("_", " ").title(),
+            "Where Used": "Primary terminal valuation branch",
+        },
+        {
+            "Assumption": "Exit Multiple",
+            "Value": _fmt_multiple(assumptions.get("exit_multiple")),
+            "Where Used": "Exit-multiple terminal valuation",
+        },
+        {
+            "Assumption": "Growth Schedule",
+            "Value": assumptions.get("growth_schedule_method", "N/A"),
+            "Where Used": "Shape of year-by-year growth path",
+        },
+    ]
+    st.dataframe(pd.DataFrame(assumption_rows), use_container_width=True, hide_index=True)
+
+    if snapshot:
+        beta = _to_float(getattr(getattr(snapshot, "beta", None), "value", None))
+        risk_free_rate = _to_float(getattr(snapshot, "risk_free_rate", None))
+        market_risk_premium = 0.05
+        rf_source = getattr(snapshot, "rf_source", "10-Year Treasury")
+
+        capm_rows = [
+            {"Input": "Risk-Free Rate", "Value": _fmt_rate(risk_free_rate), "Source": rf_source},
+            {"Input": "Market Risk Premium", "Value": _fmt_rate(market_risk_premium), "Source": "Damodaran implied ERP"},
+            {"Input": "Beta", "Value": _fmt_number(beta, 2), "Source": "Yahoo Finance (5Y monthly)"},
+        ]
+
+        st.markdown("#### CAPM Inputs")
+        st.dataframe(pd.DataFrame(capm_rows), use_container_width=True, hide_index=True)
+
+        if risk_free_rate is not None and beta is not None:
+            cost_of_equity = risk_free_rate + beta * market_risk_premium
+            st.caption(
+                "CAPM: Cost of Equity = Rf + Beta * ERP = "
+                f"{_fmt_rate(risk_free_rate)} + {_fmt_number(beta, 2)} * {_fmt_rate(market_risk_premium)} = {_fmt_rate(cost_of_equity)}"
+            )
+
+    st.markdown("### 3. Forecast and Present Value")
+    fcff_method = assumptions.get("fcff_method")
+    fcff_reliability = assumptions.get("fcff_reliability")
+    fcff_method_labels = {
+        "proper_fcff": "Proper FCFF",
+        "approx_unlevered": "Approximate Unlevered FCFF",
+        "unlevered_proxy": "Approximate Unlevered FCFF",
+        "levered_proxy": "Levered FCF Proxy",
     }
-    trace_json = json.dumps(trace_data, indent=2, default=str)
+    method_label = fcff_method_labels.get(fcff_method, "Unknown")
+
+    if fcff_reliability is not None:
+        st.caption(
+            "Driver chain: Revenue -> EBIT -> NOPAT -> Reinvestment -> FCFF. "
+            f"FCFF basis: {method_label} ({fcff_reliability}/100 reliability)."
+        )
+    else:
+        st.caption(
+            "Driver chain: Revenue -> EBIT -> NOPAT -> Reinvestment -> FCFF. "
+            f"FCFF basis: {method_label}."
+        )
+
+    growth_summary_rows = [
+        {"Parameter": "Near-Term Growth", "Value": _fmt_rate(assumptions.get("near_term_growth_rate"))},
+        {"Parameter": "Effective Near-Term Growth", "Value": _fmt_rate(assumptions.get("effective_near_term_growth_rate"))},
+        {"Parameter": "Analyst Long-Term Growth Anchor", "Value": _fmt_rate(assumptions.get("analyst_long_term_growth_rate"))},
+        {"Parameter": "Terminal Growth", "Value": _fmt_rate(assumptions.get("stable_growth_rate"))},
+        {"Parameter": "Current ROIC", "Value": _fmt_rate(assumptions.get("base_roic"))},
+        {"Parameter": "Terminal ROIC", "Value": _fmt_rate(assumptions.get("terminal_roic"))},
+        {"Parameter": "Terminal Reinvestment Rate", "Value": _fmt_rate(assumptions.get("terminal_reinvestment_rate"))},
+    ]
+    st.dataframe(pd.DataFrame(growth_summary_rows), use_container_width=True, hide_index=True)
+
+    projection_rows = []
+    if yearly_projections:
+        for proj in yearly_projections:
+            year = proj.get("year")
+            projection_rows.append(
+                {
+                    "Year": f"Y{int(year)}" if isinstance(year, (int, float)) else "N/A",
+                    "Revenue": _fmt_money(proj.get("revenue")),
+                    "Growth": _fmt_rate(proj.get("revenue_growth")),
+                    "EBIT Margin": _fmt_rate(proj.get("ebit_margin")),
+                    "EBIT": _fmt_money(proj.get("ebit")),
+                    "NOPAT": _fmt_money(proj.get("nopat")),
+                    "Reinvestment": _fmt_money(proj.get("reinvestment")),
+                    "Reinvestment Rate": _fmt_rate(proj.get("reinvestment_rate")),
+                    "FCFF": _fmt_money(proj.get("fcff")),
+                    "PV(FCFF)": _fmt_money(proj.get("pv_fcff")),
+                    "Revenue Source": proj.get("revenue_source", "driver_growth"),
+                    "FCFF Source": proj.get("fcf_source", "driver_model"),
+                }
+            )
+    elif fcf_projections:
+        for proj in fcf_projections:
+            year = proj.get("year")
+            projection_rows.append(
+                {
+                    "Year": f"Y{int(year)}" if isinstance(year, (int, float)) else "N/A",
+                    "FCFF": _fmt_money(proj.get("fcff", proj.get("fcf"))),
+                    "Discount Factor": _fmt_number(proj.get("discount_factor"), 4),
+                    "PV(FCFF)": _fmt_money(proj.get("pv")),
+                }
+            )
+
+    if projection_rows:
+        st.dataframe(pd.DataFrame(projection_rows), use_container_width=True, hide_index=True)
+    else:
+        st.warning("No forecast rows are available for this run.")
+
+    st.markdown("### 4. Terminal Value")
+    st.caption(f"Primary terminal method: {str(tv_method).replace('_', ' ').title()}")
+
+    discount_factor = None
+    if _to_float(wacc_used) is not None and forecast_years > 0:
+        discount_factor = 1 / ((1 + float(wacc_used)) ** forecast_years)
+
+    terminal_rows = []
+    if tv_method == "exit_multiple":
+        terminal_ebitda = assumptions.get("terminal_year_ebitda") or assumptions.get("projected_terminal_ebitda")
+        terminal_rows = [
+            {
+                "Step": "Terminal EBITDA (Year N)",
+                "Formula": "Projected EBITDA in final forecast year",
+                "Value": _fmt_money(terminal_ebitda),
+            },
+            {
+                "Step": "Exit Multiple",
+                "Formula": "Selected EV/EBITDA terminal multiple",
+                "Value": _fmt_multiple(assumptions.get("exit_multiple")),
+            },
+            {
+                "Step": "Terminal Value (Year N)",
+                "Formula": "Terminal EBITDA * Exit Multiple",
+                "Value": _fmt_money(terminal_value_yearN),
+            },
+            {
+                "Step": "Discount Factor",
+                "Formula": "1 / (1 + WACC)^N",
+                "Value": _fmt_number(discount_factor, 4) if discount_factor is not None else "N/A",
+            },
+            {
+                "Step": "PV(Terminal Value)",
+                "Formula": "Terminal Value * Discount Factor",
+                "Value": _fmt_money(pv_tv),
+            },
+        ]
+    else:
+        terminal_fcff = assumptions.get("terminal_year_fcff")
+        if terminal_fcff is None and yearly_projections:
+            terminal_fcff = yearly_projections[-1].get("fcff")
+        if terminal_fcff is None and fcf_projections:
+            terminal_fcff = fcf_projections[-1].get("fcff", fcf_projections[-1].get("fcf"))
+
+        terminal_fcff_n1 = None
+        if _to_float(terminal_fcff) is not None and _to_float(terminal_growth) is not None:
+            terminal_fcff_n1 = float(terminal_fcff) * (1 + float(terminal_growth))
+
+        terminal_rows = [
+            {
+                "Step": "FCFF (Year N)",
+                "Formula": "Projected FCFF in final forecast year",
+                "Value": _fmt_money(terminal_fcff),
+            },
+            {
+                "Step": "Terminal Growth (g)",
+                "Formula": "Long-run growth assumption",
+                "Value": _fmt_rate(terminal_growth),
+            },
+            {
+                "Step": "FCFF (Year N+1)",
+                "Formula": "FCFF_N * (1 + g)",
+                "Value": _fmt_money(terminal_fcff_n1),
+            },
+            {
+                "Step": "Terminal Value (Year N)",
+                "Formula": "FCFF_(N+1) / (WACC - g)",
+                "Value": _fmt_money(terminal_value_yearN),
+            },
+            {
+                "Step": "Discount Factor",
+                "Formula": "1 / (1 + WACC)^N",
+                "Value": _fmt_number(discount_factor, 4) if discount_factor is not None else "N/A",
+            },
+            {
+                "Step": "PV(Terminal Value)",
+                "Formula": "Terminal Value * Discount Factor",
+                "Value": _fmt_money(pv_tv),
+            },
+        ]
+
+    st.dataframe(pd.DataFrame(terminal_rows), use_container_width=True, hide_index=True)
+
+    st.markdown("#### Terminal Method Cross-Check")
+    cross_check_rows = [
+        {
+            "Method": "Gordon Growth",
+            "TV (Year N)": _fmt_money(assumptions.get("tv_gordon_growth")),
+            "PV(TV)": _fmt_money(assumptions.get("pv_tv_gordon_growth")),
+            "Implied Price": (
+                f"${_to_float(assumptions.get('price_gordon_growth')):.2f}"
+                if _to_float(assumptions.get("price_gordon_growth")) is not None
+                else "N/A"
+            ),
+            "Used in EV": "Yes" if tv_method == "gordon_growth" else "No",
+        },
+        {
+            "Method": "Exit Multiple",
+            "TV (Year N)": _fmt_money(assumptions.get("tv_exit_multiple")),
+            "PV(TV)": _fmt_money(assumptions.get("pv_tv_exit_multiple")),
+            "Implied Price": (
+                f"${_to_float(assumptions.get('price_exit_multiple')):.2f}"
+                if _to_float(assumptions.get("price_exit_multiple")) is not None
+                else "N/A"
+            ),
+            "Used in EV": "Yes" if tv_method == "exit_multiple" else "No",
+        },
+    ]
+    st.dataframe(pd.DataFrame(cross_check_rows), use_container_width=True, hide_index=True)
+
+    exit_scenarios = assumptions.get("exit_multiple_scenarios", []) or []
+    if exit_scenarios:
+        st.markdown("#### Exit Multiple Scenarios")
+        scenario_rows = []
+        for scenario in exit_scenarios:
+            scenario_rows.append(
+                {
+                    "Scenario": scenario.get("name", "N/A"),
+                    "Multiple": _fmt_multiple(scenario.get("multiple")),
+                    "Implied Price": (
+                        f"${_to_float(scenario.get('price')):.0f}"
+                        if _to_float(scenario.get("price")) is not None
+                        else "N/A"
+                    ),
+                    "Required FCFF/EBITDA": _fmt_rate(scenario.get("required_fcff_ebitda"), 0),
+                    "Gap vs Forecast": scenario.get("gap", "N/A"),
+                    "Status": scenario.get("status", "N/A"),
+                }
+            )
+        st.dataframe(pd.DataFrame(scenario_rows), use_container_width=True, hide_index=True)
+
+    st.markdown("### 5. Enterprise to Equity Bridge")
+    bridge_rows = [
+        {
+            "Step": "PV of Explicit FCFF",
+            "Formula": "Sum of discounted yearly FCFF",
+            "Value": _fmt_money(pv_fcf_sum),
+        },
+        {
+            "Step": "PV of Terminal Value",
+            "Formula": "Discounted terminal value",
+            "Value": _fmt_money(pv_tv),
+        },
+        {
+            "Step": "Enterprise Value",
+            "Formula": "PV(FCFF) + PV(TV)",
+            "Value": _fmt_money(ev),
+        },
+        {
+            "Step": "Net Debt",
+            "Formula": "Total Debt - Cash and Equivalents",
+            "Value": _fmt_money(net_debt),
+        },
+        {
+            "Step": "Equity Value",
+            "Formula": "Enterprise Value - Net Debt",
+            "Value": _fmt_money(equity),
+        },
+        {
+            "Step": "Intrinsic Value / Share",
+            "Formula": "Equity Value / Shares Outstanding",
+            "Value": f"${_to_float(price_per_share):.2f}" if _to_float(price_per_share) is not None else "N/A",
+        },
+    ]
+    st.dataframe(pd.DataFrame(bridge_rows), use_container_width=True, hide_index=True)
+
+    calc_ev = (_to_float(pv_fcf_sum) or 0.0) + (_to_float(pv_tv) or 0.0)
+    calc_equity = (_to_float(ev) or 0.0) - (_to_float(net_debt) or 0.0)
+    calc_price = calc_equity / _to_float(shares_outstanding) if _to_float(shares_outstanding) else None
+
+    ev_delta = (_to_float(ev) - calc_ev) if _to_float(ev) is not None else None
+    equity_delta = (_to_float(equity) - calc_equity) if _to_float(equity) is not None else None
+    price_delta = (
+        (_to_float(price_per_share) - calc_price)
+        if (_to_float(price_per_share) is not None and calc_price is not None)
+        else None
+    )
+
+    def _delta_status(delta, scale):
+        if delta is None:
+            return "N/A"
+        tolerance = max(1.0, abs(scale) * 0.001)
+        return "PASS" if abs(delta) <= tolerance else "CHECK"
+
+    reconciliation_rows = [
+        {
+            "Check": "EV = PV(FCFF) + PV(TV)",
+            "Computed": _fmt_money(calc_ev),
+            "Reported": _fmt_money(ev),
+            "Delta": _fmt_money(ev_delta),
+            "Status": _delta_status(ev_delta, _to_float(ev) or calc_ev),
+        },
+        {
+            "Check": "Equity = EV - Net Debt",
+            "Computed": _fmt_money(calc_equity),
+            "Reported": _fmt_money(equity),
+            "Delta": _fmt_money(equity_delta),
+            "Status": _delta_status(equity_delta, _to_float(equity) or calc_equity),
+        },
+        {
+            "Check": "Price = Equity / Shares",
+            "Computed": f"${calc_price:.4f}" if calc_price is not None else "N/A",
+            "Reported": f"${_to_float(price_per_share):.4f}" if _to_float(price_per_share) is not None else "N/A",
+            "Delta": f"${price_delta:.4f}" if price_delta is not None else "N/A",
+            "Status": _delta_status(price_delta, _to_float(price_per_share) or (calc_price or 0.0)),
+        },
+    ]
+    st.markdown("#### Reconciliation Checks")
+    st.dataframe(pd.DataFrame(reconciliation_rows), use_container_width=True, hide_index=True)
+
+    st.markdown("### 6. Warnings, Diagnostics, and Trace")
+    errors = [err for err in ui_data.get("errors", []) if err]
+    warnings = [warn for warn in ui_data.get("warnings", []) if warn]
+    diagnostics = [diag for diag in ui_data.get("diagnostics", []) if diag]
+
+    if errors:
+        st.error("Errors")
+        for err in errors:
+            st.markdown(f"- {err}")
+    if warnings:
+        st.warning("Warnings")
+        for warn in warnings:
+            st.markdown(f"- {warn}")
+    if diagnostics:
+        st.info("Diagnostics")
+        for diag in diagnostics:
+            st.markdown(f"- {diag}")
+    if not errors and not warnings and not diagnostics:
+        st.caption("No errors or warnings were returned for this run.")
+
+    if trace_steps:
+        trace_rows = []
+        for idx, step in enumerate(trace_steps, start=1):
+            output = step.get("output")
+            output_units = step.get("output_units")
+            if isinstance(output, (int, float)) and output_units == "USD":
+                output_text = _fmt_money(output)
+            elif isinstance(output, (int, float)):
+                output_text = _fmt_number(output, 4)
+            else:
+                output_text = str(output) if output is not None else "N/A"
+
+            inputs = step.get("inputs", {})
+            input_keys = ", ".join(inputs.keys()) if isinstance(inputs, dict) and inputs else "N/A"
+            trace_rows.append(
+                {
+                    "Step #": idx,
+                    "Name": step.get("name", "N/A"),
+                    "Formula": step.get("formula", "N/A") or "N/A",
+                    "Input Keys": input_keys,
+                    "Output": output_text,
+                    "Notes": step.get("notes", "N/A") or "N/A",
+                }
+            )
+        st.dataframe(pd.DataFrame(trace_rows), use_container_width=True, hide_index=True)
+    else:
+        st.caption("No trace steps available.")
+
+    trace_payload = {
+        "inputs": {k: str(v) for k, v in ui_data.get("inputs", {}).items()},
+        "assumptions": assumptions,
+        "results": {
+            "enterprise_value": ev,
+            "equity_value": equity,
+            "price_per_share": price_per_share,
+            "pv_fcf_sum": pv_fcf_sum,
+            "pv_terminal_value": pv_tv,
+        },
+        "trace_steps": trace_steps,
+    }
+    trace_json = json.dumps(trace_payload, indent=2, default=str)
     st.download_button(
         label="Download Trace (JSON)",
         data=trace_json,
         file_name=f"{st.session_state.get('ticker', 'valuation')}_dcf_trace.json",
-        mime="application/json"
+        mime="application/json",
     )
-    
-    # Back to summary
+
     st.divider()
-    if st.button("← Back to Summary", key="back_from_details_bottom"):
+    if st.button("<- Back to Summary", key="back_from_details_bottom"):
         st.session_state.show_dcf_details = False
         st.rerun()
-
-
 # --- App Configuration ---
 st.set_page_config(
     page_title="Analyst Co-Pilot",
@@ -1582,6 +1305,29 @@ st.markdown("""
     .badge-warn  { background: var(--clr-warn-bg);    color: var(--clr-warn-text);    border: 1px solid var(--clr-warn); }
     .badge-fail  { background: var(--clr-danger-bg);  color: var(--clr-danger-text);  border: 1px solid var(--clr-danger); }
     .badge-neutral-plain { background: var(--clr-bg); color: var(--clr-text-secondary); border: 1px solid var(--clr-border-strong); }
+
+    /* Prominent disclaimer banner */
+    .disclaimer-banner {
+        background: var(--clr-warn-bg);
+        border: 1px solid #fcd34d;
+        border-left: 4px solid var(--clr-warn);
+        border-radius: var(--radius-md);
+        padding: 10px 12px;
+        margin-bottom: 12px;
+    }
+    .disclaimer-title {
+        font-size: .7rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: .08em;
+        color: var(--clr-warn-text);
+        margin-bottom: 4px;
+    }
+    .disclaimer-text {
+        font-size: .8rem;
+        color: #78350f;
+        line-height: 1.35;
+    }
 
     /* Stance cards */
     .stance-card {
@@ -2270,6 +2016,12 @@ if st.session_state.quarterly_analysis:
         st.warning(warning)
     if st.session_state.get("cache_restore_notice"):
         st.info(st.session_state.cache_restore_notice)
+    st.markdown("""
+<div class="disclaimer-banner">
+  <div class="disclaimer-title">Disclaimer</div>
+  <div class="disclaimer-text">AI-generated outputs may contain mistakes. This is not investment advice. Results are highly dependent on assumptions and input data quality.</div>
+</div>
+    """, unsafe_allow_html=True)
 
     # Top context strip
     _market_data = analysis.get("market_data", {})
@@ -2547,6 +2299,8 @@ if st.session_state.quarterly_analysis:
             tv_dominance = assumptions.get("tv_dominance_pct", 0)
             price_exit = assumptions.get("price_exit_multiple")
             price_gordon = assumptions.get("price_gordon_growth")
+            terminal_method = assumptions.get("terminal_value_method", "gordon_growth")
+            high_growth_profile = bool(assumptions.get("high_growth_company", False))
 
             upside_downside = None
             verdict_label = "Pending"
@@ -2556,9 +2310,13 @@ if st.session_state.quarterly_analysis:
                 upside_downside = ((intrinsic - current_price) / current_price * 100)
                 verdict_label, verdict_badge, verdict_hint = get_valuation_verdict(upside_downside)
 
-            divergence_pct = None
-            if price_exit and price_gordon and abs(price_gordon) > 0.01:
-                divergence_pct = ((price_exit - price_gordon) / price_gordon) * 100
+            terminal_method_label = "Exit Multiple" if terminal_method == "exit_multiple" else "Gordon Growth"
+            if terminal_method == "exit_multiple" and high_growth_profile:
+                terminal_method_context = "High-Growth Adaptive"
+            elif terminal_method == "exit_multiple":
+                terminal_method_context = "Adaptive Fallback"
+            else:
+                terminal_method_context = "Default"
 
             current_price_text = f"${current_price:.2f}" if current_price else "—"
             intrinsic_text = f"${intrinsic:.2f}" if intrinsic else "—"
@@ -2575,14 +2333,11 @@ if st.session_state.quarterly_analysis:
 </div>
             """, unsafe_allow_html=True)
 
-            divergence_text = "n/a"
-            if divergence_pct is not None:
-                divergence_text = f"{divergence_pct:+.1f}%"
             st.markdown(f"""
 <div class="confidence-strip">
   <span class="confidence-pill">Data Quality: {data_quality:.0f}/100</span>
   <span class="confidence-pill">TV Dominance: {tv_dominance:.0f}%</span>
-  <span class="confidence-pill">TV Cross-check: {divergence_text}</span>
+  <span class="confidence-pill">Terminal Method: {terminal_method_label} ({terminal_method_context})</span>
 </div>
             """, unsafe_allow_html=True)
             st.caption(verdict_hint)
@@ -2597,20 +2352,32 @@ if st.session_state.quarterly_analysis:
     st.markdown('<div class="section-header"><span class="step-badge">Step 02</span><span class="section-title">Valuation Drivers</span></div>', unsafe_allow_html=True)
     st.caption("Tune assumptions, rerun the model, and review core valuation outputs.")
 
-    snapshot_for_suggestions = cached_financial_snapshot(ticker)
+    snapshot_for_suggestions = cached_financial_snapshot(ticker, suggestion_algo_version="v3_forward_consensus")
     suggested_wacc = 9.0
     suggested_fcf_growth = 8.0
+    suggested_fcf_reliability = None
+    suggested_fcf_period_type = None
     if snapshot_for_suggestions:
         if snapshot_for_suggestions.suggested_wacc.value:
             suggested_wacc = round(snapshot_for_suggestions.suggested_wacc.value * 100, 1)
-        if snapshot_for_suggestions.suggested_fcf_growth.value:
+        if snapshot_for_suggestions.suggested_fcf_growth.value is not None:
             suggested_fcf_growth = round(snapshot_for_suggestions.suggested_fcf_growth.value * 100, 1)
+            suggested_fcf_reliability = snapshot_for_suggestions.suggested_fcf_growth.reliability_score
+            suggested_fcf_period_type = snapshot_for_suggestions.suggested_fcf_growth.period_type
 
     stored_wacc = st.session_state.get("dcf_wacc")
     stored_fcf_growth = st.session_state.get("dcf_fcf_growth")
     stored_terminal_growth = st.session_state.get("dcf_terminal_growth")
     default_wacc = stored_wacc if stored_wacc is not None else suggested_wacc
-    default_fcf_growth = stored_fcf_growth if stored_fcf_growth is not None else suggested_fcf_growth
+    if stored_fcf_growth is not None:
+        default_fcf_growth = stored_fcf_growth
+    else:
+        # Keep defaults conservative if suggestion quality is low.
+        if suggested_fcf_reliability is not None and suggested_fcf_reliability < 65:
+            default_fcf_growth = 8.0
+        else:
+            default_fcf_growth = suggested_fcf_growth
+    default_fcf_growth = max(0.0, min(25.0, default_fcf_growth))
     default_terminal_growth = stored_terminal_growth if stored_terminal_growth is not None else 3.0
 
     col_wacc, col_growth, col_terminal = st.columns(3)
@@ -2639,8 +2406,21 @@ if st.session_state.quarterly_analysis:
             key=f"fcf_growth_slider_{ticker}",
             help="Annual free-cash-flow growth for projection period."
         )
-        if snapshot_for_suggestions and snapshot_for_suggestions.suggested_fcf_growth.value:
-            st.caption(f"Suggested: {suggested_fcf_growth:.1f}%")
+        if snapshot_for_suggestions and snapshot_for_suggestions.suggested_fcf_growth.value is not None:
+            source_label = "fallback"
+            if suggested_fcf_period_type == "forward_analyst_consensus":
+                source_label = "analyst consensus"
+            elif suggested_fcf_period_type == "forward_analyst_long_term":
+                source_label = "analyst LT only"
+            elif suggested_fcf_period_type == "trailing_historical":
+                source_label = "trailing historical"
+            elif suggested_fcf_period_type == "calculated_fallback":
+                source_label = "historical fallback"
+
+            quality_text = f", quality {suggested_fcf_reliability}/100" if suggested_fcf_reliability is not None else ""
+            st.caption(f"Suggested: {suggested_fcf_growth:.1f}% ({source_label}{quality_text})")
+            if stored_fcf_growth is None and suggested_fcf_reliability is not None and suggested_fcf_reliability < 65:
+                st.caption("Default set to 8.0% because suggestion quality is low.")
 
     with col_terminal:
         terminal_growth_min = 0.0
@@ -2729,11 +2509,18 @@ if st.session_state.quarterly_analysis:
             assumptions = dcf_ui_data.get("assumptions", {})
             price_exit = assumptions.get("price_exit_multiple")
             price_gordon = assumptions.get("price_gordon_growth")
-            if price_exit and price_gordon and abs(price_gordon) > 0.01:
-                diff_pct = ((price_exit - price_gordon) / price_gordon) * 100
-                st.caption(f"TV cross-check: Exit Multiple ${price_exit:.2f} vs Gordon Growth ${price_gordon:.2f} ({diff_pct:+.1f}%).")
-                if abs(diff_pct) > 30:
-                    st.warning("Large divergence between TV methods indicates higher model uncertainty.")
+            terminal_method = assumptions.get("terminal_value_method", "gordon_growth")
+            high_growth_profile = bool(assumptions.get("high_growth_company", False))
+            if terminal_method == "exit_multiple":
+                if high_growth_profile:
+                    st.caption("Terminal method in use: Exit Multiple (adaptive method for high-growth profiles).")
+                else:
+                    st.caption("Terminal method in use: Exit Multiple (adaptive fallback when Gordon is overly punitive).")
+            else:
+                st.caption("Terminal method in use: Gordon Growth (default for mature and steady-state valuation).")
+
+            if price_exit and price_gordon:
+                st.caption(f"Method outputs: Exit Multiple ${price_exit:.2f} | Gordon Growth ${price_gordon:.2f}.")
 
             with st.expander("Deep DCF Detail", expanded=False, icon="🧮"):
                 st.caption("For full traceability use 'View DCF Details'.")
@@ -2999,7 +2786,8 @@ if st.session_state.quarterly_analysis:
             st.error(forecast["error"])
         else:
             extracted = forecast.get("extracted_forecast") or {}
-            full_analysis = (forecast.get("full_analysis", "") or "").replace("$", "\\$")
+            full_analysis = _sanitize_ai_valuation_language(forecast.get("full_analysis", "") or "")
+            full_analysis = full_analysis.replace("$", "\\$")
             has_extracted = extracted and (extracted.get("short_term_stance") or extracted.get("fundamental_outlook"))
             expanded_default = bool(st.session_state.get("forecast_just_generated", False))
 
@@ -3038,13 +2826,17 @@ if st.session_state.quarterly_analysis:
 </div>
                     """, unsafe_allow_html=True)
 
-                key_conditional = extracted.get("key_conditional", "")
+                key_conditional = _sanitize_ai_valuation_language(extracted.get("key_conditional", ""))
                 if key_conditional and "null" not in str(key_conditional).lower():
                     st.info(f"**Key Conditional:** {key_conditional}")
 
                 evidence_gaps = extracted.get("evidence_gaps", [])
                 if evidence_gaps:
-                    gaps_text = " • ".join([g for g in evidence_gaps if g and "null" not in str(g).lower()])
+                    sanitized_gaps = [
+                        _sanitize_ai_valuation_language(g) for g in evidence_gaps
+                        if g and "null" not in str(g).lower()
+                    ]
+                    gaps_text = " • ".join(sanitized_gaps)
                     if gaps_text:
                         st.caption(f"Evidence gaps: {gaps_text}")
 

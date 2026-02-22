@@ -132,8 +132,14 @@ class DCFAssumptions:
     analyst_fcf_anchors_used: bool = False  # Backward-compatible flag: True if analyst consensus anchored Years 1-3 revenue
     consensus_revenue_used_years: List[int] = field(default_factory=list)  # Years using analyst consensus revenue anchors
     effective_near_term_growth_rate: float = None  # Realized Y1-3 growth implied by anchored revenues
+    analyst_long_term_growth_rate: float = None  # Analyst long-term growth (e.g., +5Y consensus), if available
     fcf_sources: List[str] = field(default_factory=list)  # Per-year source: "analyst_revenue_estimate" or "driver_model"
     revenue_sources: List[str] = field(default_factory=list)  # Per-year source: "analyst_consensus" or "driver_growth"
+    growth_schedule_method: str = None  # "analyst_anchored_curve" or "convex_fade"
+
+    # High-growth profile flags (diagnostic + fallback guardrail context)
+    high_growth_company: bool = False
+    high_growth_reasons: List[str] = field(default_factory=list)
 
     # Driver-based mode flag
     use_driver_model: bool = True  # True = textbook, False = legacy simple growth
@@ -394,6 +400,13 @@ class NetDebtCalculator:
 
 class DCFEngine:
     """Main DCF valuation engine."""
+
+    HIGH_GROWTH_TICKERS = {"TSLA", "NFLX"}
+    HIGH_GROWTH_NEAR_TERM_THRESHOLD = 0.12
+    HIGH_GROWTH_LONG_TERM_THRESHOLD = 0.10
+    # Auto-fallback to Exit Multiple only when Gordon is clearly implausible vs market.
+    EXTREME_GORDON_PRICE_TO_MARKET_THRESHOLD = 0.35
+    EXTREME_GORDON_EXIT_UPLIFT_THRESHOLD = 0.25
     
     def __init__(self, snapshot: NormalizedFinancialSnapshot, assumptions: DCFAssumptions = None):
         self.snapshot = snapshot
@@ -401,6 +414,55 @@ class DCFEngine:
         self.trace = []
         self.warnings = []
         self.errors = []
+
+    @staticmethod
+    def _parse_forecast_year_label(label: Optional[str]) -> Optional[int]:
+        """
+        Parse analyst period labels like:
+          - "0y"  -> 0
+          - "+1y" -> 1
+        Returns None for unknown formats.
+        """
+        if label == "0y":
+            return 0
+        if isinstance(label, str) and label.startswith("+") and label.endswith("y"):
+            num = label[1:-1]
+            if num.isdigit():
+                return int(num)
+        return None
+
+    def _detect_high_growth_profile(self) -> Tuple[bool, List[str]]:
+        """Identify elevated-growth profiles for diagnostics and terminal-value guardrails."""
+        reasons = []
+        ticker = (self.snapshot.ticker or "").upper()
+
+        if ticker in self.HIGH_GROWTH_TICKERS:
+            reasons.append(f"{ticker} high-growth watchlist ticker")
+
+        near_term_growth = self.assumptions.fcf_growth_rate
+        if near_term_growth is not None and near_term_growth >= self.HIGH_GROWTH_NEAR_TERM_THRESHOLD:
+            reasons.append(f"near-term growth {near_term_growth:.1%} >= {self.HIGH_GROWTH_NEAR_TERM_THRESHOLD:.0%}")
+
+        analyst_lt = getattr(getattr(self.snapshot, "analyst_long_term_growth", None), "value", None)
+        if analyst_lt is not None and analyst_lt >= self.HIGH_GROWTH_LONG_TERM_THRESHOLD:
+            reasons.append(f"analyst LT growth {analyst_lt:.1%} >= {self.HIGH_GROWTH_LONG_TERM_THRESHOLD:.0%}")
+
+        estimates = getattr(self.snapshot, "analyst_revenue_estimates", []) or []
+        ranked_estimates = []
+        for est in estimates:
+            rank = self._parse_forecast_year_label(est.get("year_label"))
+            rev = est.get("revenue")
+            if rank is not None and rev and rev > 0:
+                ranked_estimates.append((rank, rev))
+        ranked_estimates.sort(key=lambda item: item[0])
+        if len(ranked_estimates) >= 2:
+            rev0 = ranked_estimates[0][1]
+            rev1 = ranked_estimates[1][1]
+            consensus_y2_growth = (rev1 / rev0) - 1
+            if consensus_y2_growth >= self.HIGH_GROWTH_NEAR_TERM_THRESHOLD:
+                reasons.append(f"consensus revenue growth {consensus_y2_growth:.1%} >= {self.HIGH_GROWTH_NEAR_TERM_THRESHOLD:.0%}")
+
+        return (len(reasons) > 0, reasons)
     
     def validate_inputs(self) -> bool:
         """Check that we have minimum data to run DCF."""
@@ -506,22 +568,51 @@ class DCFEngine:
         
         # FCF Growth Rate
         if self.assumptions.fcf_growth_rate is None:
-            # Estimate from historical revenue growth (if available)
-            if self.snapshot.quarterly_history and len(self.snapshot.quarterly_history) >= 8:
+            growth_source = "default_8pct"
+            estimated_growth = None
+
+            # Priority 1: reuse adapter's suggestion (already quality-weighted and Yahoo-aware)
+            suggested_growth = getattr(self.snapshot.suggested_fcf_growth, "value", None)
+            if suggested_growth is not None:
+                estimated_growth = float(suggested_growth)
+                growth_source = "snapshot.suggested_fcf_growth"
+
+            # Priority 2: annualized growth from quarterly revenue history
+            elif self.snapshot.quarterly_history and len(self.snapshot.quarterly_history) >= 8:
                 revenues = [q["revenue"] for q in self.snapshot.quarterly_history[:8] if q["revenue"]]
-                if len(revenues) >= 2:
-                    growth = (revenues[0] / revenues[-1]) ** (1.0 / (len(revenues) - 1)) - 1
-                    self.assumptions.fcf_growth_rate = max(0.03, min(growth, 0.25))
-                else:
-                    self.assumptions.fcf_growth_rate = 0.08
-            else:
-                self.assumptions.fcf_growth_rate = 0.08
+                if len(revenues) >= 2 and revenues[-1] > 0:
+                    # Quarterly cadence -> annualized growth for a yearly DCF assumption.
+                    quarters = len(revenues) - 1
+                    quarterly_growth = (revenues[0] / revenues[-1]) ** (1.0 / quarters) - 1
+                    estimated_growth = (1 + quarterly_growth) ** 4 - 1
+                    growth_source = "quarterly_revenue_annualized"
+
+            # Priority 3: default fallback
+            if estimated_growth is None:
+                estimated_growth = 0.08
+
+            # Guardrails for near-term growth used in a 10-year model
+            self.assumptions.fcf_growth_rate = max(0.00, min(estimated_growth, 0.30))
             self.trace.append(CalculationTraceStep(
                 name="FCF Growth Rate Assignment",
-                formula="Estimated from historical revenue growth or default 8%",
-                inputs={},
+                formula="Suggested growth -> annualized quarterly history -> default 8%",
+                inputs={"source": growth_source},
                 output=self.assumptions.fcf_growth_rate,
                 output_units="rate"
+            ))
+
+        # High-growth detection (used for TV method choice)
+        is_high_growth, high_growth_reasons = self._detect_high_growth_profile()
+        self.assumptions.high_growth_company = is_high_growth
+        self.assumptions.high_growth_reasons = high_growth_reasons
+        if is_high_growth:
+            self.trace.append(CalculationTraceStep(
+                name="High-Growth Profile Detection",
+                formula="Ticker watchlist OR elevated analyst/near-term growth",
+                inputs={"reasons": "; ".join(high_growth_reasons)},
+                output=True,
+                output_units="bool",
+                notes="Diagnostic flag only. Gordon remains primary unless fallback guardrails trigger later."
             ))
         
         # ===== TEXTBOOK DCF: GORDON GROWTH IS PRIMARY =====
@@ -553,8 +644,10 @@ class DCFEngine:
             # Force fail - this is non-negotiable
             return
         
-        # TEXTBOOK DEFAULT: Use Gordon Growth as primary
-        # Only use exit multiple if explicitly requested AND EBITDA available
+        # Terminal method policy:
+        # 1) Explicit Exit Multiple request -> honor if EBITDA available
+        # 2) Otherwise -> Gordon Growth primary (textbook baseline)
+        # 3) Fallback -> Exit Multiple only when Gordon is invalid (or later if Gordon implies an extreme discount)
         if self.assumptions.terminal_value_method == "exit_multiple":
             # User explicitly requested exit multiple
             if not (ttm_ebitda and ttm_ebitda > 0):
@@ -567,6 +660,18 @@ class DCFEngine:
                 )
         else:
             # DEFAULT: Gordon Growth (textbook standard)
+            if is_high_growth:
+                self.trace.append(CalculationTraceStep(
+                    name="TV Method Policy: Gordon-First",
+                    formula="High-growth flags do not auto-override textbook method",
+                    inputs={"high_growth_reasons": "; ".join(high_growth_reasons)},
+                    output="gordon_growth",
+                    output_units="",
+                    notes=(
+                        "Exit Multiple is only promoted later when Gordon implies an extreme market discount "
+                        "and exit cross-check is materially higher."
+                    )
+                ))
             if gordon_is_valid:
                 self.assumptions.terminal_value_method = "gordon_growth"
                 self.trace.append(CalculationTraceStep(
@@ -678,30 +783,26 @@ class DCFEngine:
                     f"TTM EBITDA={(ttm_ebitda or 0) > 0}. Will use industry multiple only."
                 )
             
-            # Industry multiple already fetched above - check if available
+            # Industry multiple may be unavailable for some sectors (e.g., banks).
+            # Do not force Gordon fallback if current-company EV/EBITDA is available.
             if industry_multiple is None:
-                # Industry is NA (e.g., banks) - fall back to Gordon Growth
-                self.assumptions.terminal_value_method = "gordon_growth"
-                self.assumptions.industry_multiple_source = "fallback_gordon"
-                
                 self.warnings.append(
-                    f"EV/EBITDA multiple not applicable for industry '{self.snapshot.industry}' "
-                    f"(Damodaran: {damodaran_industry or 'not found'}). Using Gordon Growth terminal value."
+                    f"Industry EV/EBITDA unavailable for '{self.snapshot.industry or 'Unknown'}' "
+                    f"(Damodaran: {damodaran_industry or 'not found'}). "
+                    "Using current-company multiple where applicable."
                 )
                 self.trace.append(CalculationTraceStep(
-                    name="Exit Multiple Not Available",
-                    formula="Fallback to Gordon Growth Model",
+                    name="Industry Multiple Unavailable",
+                    formula="Proceed with current-company EV/EBITDA (if available)",
                     inputs={
                         "yf_industry": self.snapshot.industry,
                         "yf_sector": self.snapshot.sector,
                         "damodaran_industry": damodaran_industry,
-                        "reason": "EV/EBITDA not applicable for this industry (e.g., banks use P/B)"
                     },
                     output=None,
                     output_units="multiple",
-                    notes=f"Industry multiple N/A. Using Gordon Growth with {self.assumptions.terminal_growth_rate:.1%} perpetual growth."
+                    notes="Industry reference missing; scenario logic may fall back to current/company-specific multiple."
                 ))
-                return  # Exit early - Gordon Growth will be used
             
             # Step 3: Apply terminal multiple based on scenario selection
             # Scenarios: "current", "industry", "blended", "custom"
@@ -837,7 +938,8 @@ class DCFEngine:
             
             # Calculate BOTH terminal value methods for cross-check
             terminal_value, pv_terminal_value, dual_tv = self._calculate_dual_terminal_values(
-                fcf_projections[-1]["fcf"]
+                fcf_projections[-1]["fcf"],
+                pv_fcf_sum=pv_fcf_sum
             )
             
             # Enterprise Value (using primary TV method)
@@ -1165,8 +1267,8 @@ class DCFEngine:
           - FCFF_t = NOPAT_t - Reinvestment_t
           
         Growth Fade Schedule (per textbook):
-          - Years 1-3: Near-term growth (analyst CAGR if available, else historical proxy)
-          - Years 4-N: Linear fade toward g_perp (terminal growth)
+          - Explicit consensus years: analyst revenue anchors when available
+          - Remaining years: smooth fade toward g_perp (terminal growth)
           - g_perp: 2.5-3.0% for developed markets, must be < WACC
           
         Terminal Reinvestment (ROIC-based):
@@ -1247,58 +1349,180 @@ class DCFEngine:
         self.assumptions.terminal_roic = round(terminal_roic, 4)
         
         # ===== STEP 4: Build Growth Fade Schedule =====
-        near_term_g = self.assumptions.fcf_growth_rate or 0.10  # From analyst/historical
-        stable_g = self.assumptions.terminal_growth_rate  # 2.5-3.0% default
-        
+        near_term_g = self.assumptions.fcf_growth_rate or 0.10  # User/input near-term growth
+        stable_g = self.assumptions.terminal_growth_rate  # Long-run perpetual growth
+
         # Validate g_perp < WACC
         if stable_g >= wacc:
             old_g = stable_g
-            stable_g = wacc * 0.3  # Default to 30% of WACC if invalid
+            stable_g = wacc * 0.3  # Conservative fallback if invalid
             self.assumptions.terminal_growth_rate = stable_g
             self.warnings.append(
                 f"Terminal growth ({old_g:.1%}) >= WACC ({wacc:.1%}); adjusted to {stable_g:.1%}"
             )
-        
+
+        # Build analyst revenue anchors from all available consensus years. FCFF remains driver-based.
+        analyst_revenue_anchors = {}  # {year_index (1-based): revenue_value}
+        analyst_estimates = getattr(self.snapshot, "analyst_revenue_estimates", []) or []
+        if analyst_estimates:
+            ranked_consensus = {}
+            for est in analyst_estimates:
+                rank = self._parse_forecast_year_label(est.get("year_label"))
+                rev = est.get("revenue")
+                if rank is None or rev is None:
+                    continue
+                try:
+                    rev = float(rev)
+                except Exception:
+                    continue
+                if rev <= 0:
+                    continue
+                ranked_consensus[rank] = rev  # last seen value wins for duplicate labels
+
+            if ranked_consensus:
+                min_rank = min(ranked_consensus.keys())
+                for rank in sorted(ranked_consensus.keys()):
+                    year_idx = (rank - min_rank) + 1
+                    if 1 <= year_idx <= n_years:
+                        analyst_revenue_anchors[year_idx] = ranked_consensus[rank]
+
+        consensus_revenue_years = sorted(analyst_revenue_anchors.keys())
+        effective_near_term_growth = near_term_g
+        latest_anchor_growth = None
+        if consensus_revenue_years and ttm_revenue > 0:
+            anchor_growths = []
+            prior_revenue = ttm_revenue
+            prior_year = 0
+            for year in consensus_revenue_years:
+                anchored_revenue = analyst_revenue_anchors.get(year)
+                if anchored_revenue and prior_revenue > 0:
+                    year_span = max(1, year - prior_year)
+                    annualized_growth = (anchored_revenue / prior_revenue) ** (1.0 / year_span) - 1
+                    anchor_growths.append(annualized_growth)
+                    latest_anchor_growth = annualized_growth
+                    prior_revenue = anchored_revenue
+                    prior_year = year
+            if anchor_growths:
+                effective_near_term_growth = sum(anchor_growths) / len(anchor_growths)
+
+        # Use latest analyst-implied growth as fade start to keep continuity after consensus years.
+        if consensus_revenue_years:
+            near_term_growth_for_fade = (
+                latest_anchor_growth if latest_anchor_growth is not None else effective_near_term_growth
+            )
+        else:
+            near_term_growth_for_fade = near_term_g
+
+        analyst_lt_growth_raw = getattr(getattr(self.snapshot, "analyst_long_term_growth", None), "value", None)
+        analyst_lt_growth = None
+        if analyst_lt_growth_raw is not None:
+            try:
+                analyst_lt_growth = float(analyst_lt_growth_raw)
+            except Exception:
+                analyst_lt_growth = None
+        if analyst_lt_growth is not None:
+            # Keep LT growth within economically plausible bounds.
+            analyst_lt_growth = max(-0.10, min(0.30, analyst_lt_growth))
+            # LT anchor should not drop below terminal g in a going-concern fade path.
+            analyst_lt_growth = max(stable_g, analyst_lt_growth)
+            self.assumptions.analyst_long_term_growth_rate = round(analyst_lt_growth, 4)
+        else:
+            self.assumptions.analyst_long_term_growth_rate = None
+
         self.assumptions.near_term_growth_rate = near_term_g
         self.assumptions.stable_growth_rate = stable_g
-        self.assumptions.near_term_growth_source = "analyst_cagr" if hasattr(self.snapshot, 'analyst_growth') else "yahoo_trailing"
-        
-        # Growth fade: smooth linear fade from near-term to g_perp across all years
-        # (Avoids cliff at Year 4 when analyst anchors are unavailable)
-        growth_rates = []
-        for year in range(1, n_years + 1):
-            fade_progress = (year - 1) / max(n_years - 1, 1)
-            g = near_term_g + fade_progress * (stable_g - near_term_g)
-            growth_rates.append(round(g, 4))
-        
+        if consensus_revenue_years:
+            self.assumptions.near_term_growth_source = "analyst_consensus_anchor"
+        elif getattr(self.snapshot.suggested_fcf_growth, "value", None) is not None:
+            self.assumptions.near_term_growth_source = "yahoo_trailing"
+        else:
+            self.assumptions.near_term_growth_source = "historical_quarterly_annualized"
+
+        def _build_growth_schedule(start_growth: float, terminal_growth: float, years: int, mid_growth: float = None) -> List[float]:
+            """Growth path for explicit horizon with analyst anchors when available."""
+            if years <= 0:
+                return []
+
+            if mid_growth is not None:
+                # Prevent accidental re-acceleration from noisy LT estimates in decay regimes.
+                if start_growth >= terminal_growth:
+                    mid_growth = min(mid_growth, start_growth)
+                else:
+                    mid_growth = max(mid_growth, start_growth)
+
+            # Analyst-informed curve for long-horizon models:
+            # Y1-3 hold near-term, by Y5 approach analyst LT growth, then fade to terminal by Year N.
+            if mid_growth is not None and years >= 6:
+                rates = []
+                mid_year = min(5, years - 1)
+                hold_years = min(3, mid_year)
+                rates.extend([start_growth] * hold_years)
+
+                to_mid_steps = max(mid_year - hold_years, 0)
+                if to_mid_steps > 0:
+                    for step in range(1, to_mid_steps + 1):
+                        p = step / to_mid_steps
+                        rates.append(start_growth + p * (mid_growth - start_growth))
+
+                remaining = years - len(rates)
+                if remaining > 0:
+                    for step in range(1, remaining + 1):
+                        p = step / remaining
+                        curved = p ** 1.25 if mid_growth > terminal_growth else p
+                        rates.append(mid_growth + curved * (terminal_growth - mid_growth))
+            else:
+                hold_years = min(3, years)
+                rates = [start_growth] * hold_years
+                remaining_years = years - hold_years
+
+                if remaining_years > 0:
+                    for step in range(1, remaining_years + 1):
+                        progress = step / remaining_years
+                        curved_progress = progress ** 1.35 if start_growth > terminal_growth else progress
+                        g = start_growth + curved_progress * (terminal_growth - start_growth)
+                        rates.append(g)
+
+            rates = rates[:years]
+            rates[-1] = terminal_growth  # Ensure explicit horizon ends at g_perp.
+            return [round(max(-0.50, min(0.50, g)), 4) for g in rates]
+
+        if n_years >= 10 and (analyst_lt_growth is not None or consensus_revenue_years):
+            self.assumptions.growth_schedule_method = "analyst_anchored_curve"
+        else:
+            self.assumptions.growth_schedule_method = "convex_fade"
+
+        growth_rates = _build_growth_schedule(
+            near_term_growth_for_fade,
+            stable_g,
+            n_years,
+            analyst_lt_growth if n_years >= 10 else None,
+        )
         self.assumptions.revenue_growth_rates = growth_rates
-        
+
         # ===== STEP 5: Build Reinvestment Rate Schedule (ROIC-based) =====
         # Terminal reinvestment rate = g_perp / ROIC_terminal
         terminal_reinv_rate = stable_g / terminal_roic if terminal_roic > 0 else 0.25
         self.assumptions.terminal_reinvestment_rate = round(terminal_reinv_rate, 4)
-        
-        # Fade reinvestment rate from current to terminal
-        # Current reinvestment rate implied from sales-to-capital
-        # reinv_rate = g / (ROIC) where ROIC ≈ margin × sales_to_capital
-        current_reinv_rate = near_term_g / current_roic if current_roic > 0 else 0.5
+
+        # Current reinvestment rate implied from near-term growth and current ROIC.
+        current_reinv_rate = near_term_growth_for_fade / current_roic if current_roic > 0 else 0.5
         current_reinv_rate = max(0, min(current_reinv_rate, 0.95))  # Cap at 95%
-        
+
         reinv_rates = []
         for year in range(1, n_years + 1):
             fade_progress = (year - 1) / max(n_years - 1, 1)
             rr = current_reinv_rate + fade_progress * (terminal_reinv_rate - current_reinv_rate)
             reinv_rates.append(round(rr, 4))
-        
+
         self.assumptions.reinvestment_rates = reinv_rates
-        
+
         # ===== STEP 6: Margin fade (stable or slight improvement for mature) =====
         stable_margin = self.assumptions.stable_ebit_margin or base_ebit_margin
         self.assumptions.stable_ebit_margin = stable_margin
-        
+
         ebit_margins = [base_ebit_margin] * n_years  # No margin fade by default
         self.assumptions.ebit_margins = ebit_margins
-        
+
         # ===== STEP 6b: D&A Ratio (for EBITDA projection) =====
         # D&A as % of revenue - used to project EBITDA = EBIT + D&A
         # ttm_da is passed from _project_fcf(), which may have derived it from EBITDA - EBIT
@@ -1321,34 +1545,6 @@ class DCFEngine:
         
         horizon_note = f"{n_years}-year forecast" if n_years == 10 else "5-year forecast"
 
-        # Build analyst revenue anchors (Years 1-3). FCFF remains driver-based.
-        analyst_revenue_anchors = {}  # {year_index (1-based): revenue_value}
-        analyst_estimates = getattr(self.snapshot, "analyst_revenue_estimates", [])
-        if analyst_estimates:
-            raw_revs = [e.get("revenue") for e in analyst_estimates if e.get("revenue") and e.get("revenue") > 0]
-            for i, rev in enumerate(raw_revs[:2]):  # Year 1, Year 2
-                analyst_revenue_anchors[i + 1] = rev
-            # Year 3 extrapolation from Year 1->2 trend (fallback to near-term model growth)
-            if len(raw_revs) >= 2 and raw_revs[0] > 0:
-                yr2_growth = raw_revs[1] / raw_revs[0] - 1
-                analyst_revenue_anchors[3] = raw_revs[1] * (1 + yr2_growth)
-            elif len(raw_revs) == 1:
-                analyst_revenue_anchors[2] = raw_revs[0] * (1 + near_term_g)
-                analyst_revenue_anchors[3] = analyst_revenue_anchors[2] * (1 + near_term_g)
-
-        consensus_revenue_years = sorted(analyst_revenue_anchors.keys())
-        effective_near_term_growth = near_term_g
-        if consensus_revenue_years and ttm_revenue > 0:
-            anchor_growths = []
-            prior_revenue = ttm_revenue
-            for year in consensus_revenue_years:
-                anchored_revenue = analyst_revenue_anchors.get(year)
-                if anchored_revenue and prior_revenue > 0:
-                    anchor_growths.append((anchored_revenue / prior_revenue) - 1)
-                    prior_revenue = anchored_revenue
-            if anchor_growths:
-                effective_near_term_growth = sum(anchor_growths) / len(anchor_growths)
-
         self.assumptions.analyst_fcf_anchors_used = bool(consensus_revenue_years)
         self.assumptions.consensus_revenue_used_years = consensus_revenue_years
         self.assumptions.effective_near_term_growth_rate = round(effective_near_term_growth, 4)
@@ -1366,6 +1562,8 @@ class DCFEngine:
                 "terminal_roic": f"{terminal_roic:.1%} (faded {fade_factor:.0%} toward industry {industry_roic:.1%})",
                 "near_term_growth_assumption": f"{near_term_g:.1%}",
                 "near_term_growth_effective": f"{effective_near_term_growth:.1%}",
+                "analyst_long_term_growth": f"{analyst_lt_growth:.1%}" if analyst_lt_growth is not None else "N/A",
+                "growth_schedule_method": self.assumptions.growth_schedule_method,
                 "consensus_revenue_years": consensus_years_label,
                 "terminal_growth": f"{stable_g:.1%} (g_perp)",
                 "terminal_reinv_rate": f"{terminal_reinv_rate:.1%} (= g_perp / ROIC_terminal)"
@@ -1373,8 +1571,8 @@ class DCFEngine:
             output="",
             output_units="",
             notes=(
-                f"Textbook DCF: {horizon_note}, growth fades Y4-{n_years}, ROIC-based terminal reinvestment. "
-                "When analyst consensus exists, it anchors revenue (Years 1-3) while FCFF remains driver-derived."
+                f"Textbook DCF: {horizon_note}, growth fades to terminal by Y{n_years}, ROIC-based terminal reinvestment. "
+                "When analyst consensus exists, it anchors available revenue years while FCFF remains driver-derived."
             )
         ))
 
@@ -1545,7 +1743,7 @@ class DCFEngine:
         
         return projections
     
-    def _calculate_dual_terminal_values(self, final_year_fcf: float) -> Tuple[float, float, Dict]:
+    def _calculate_dual_terminal_values(self, final_year_fcf: float, pv_fcf_sum: float = None) -> Tuple[float, float, Dict]:
         """
         Calculate BOTH terminal value methods and return primary + cross-check.
         
@@ -1707,7 +1905,76 @@ class DCFEngine:
         else:
             dual_tv['tv_exit_multiple'] = None
             dual_tv['pv_tv_exit_multiple'] = None
-        
+
+        # Optional guardrail: if Gordon-implied price is extremely low vs market and
+        # Exit Multiple produces a materially higher value, promote Exit Multiple.
+        shares = self.snapshot.shares_outstanding.value or self.snapshot.latest_annual_diluted_shares.value
+        net_debt = (
+            (self.snapshot.total_debt.value if self.snapshot.total_debt else 0)
+            - (self.snapshot.cash_and_equivalents.value if self.snapshot.cash_and_equivalents else 0)
+        )
+        price_gordon = None
+        price_exit = None
+        if shares and shares > 0 and pv_fcf_sum is not None:
+            if dual_tv.get('pv_tv_gordon_growth') is not None:
+                ev_gordon = pv_fcf_sum + dual_tv['pv_tv_gordon_growth']
+                price_gordon = (ev_gordon - net_debt) / shares
+                self.assumptions.price_gordon_growth = round(price_gordon, 2)
+                dual_tv['price_gordon_growth'] = round(price_gordon, 2)
+            if dual_tv.get('pv_tv_exit_multiple') is not None:
+                ev_exit = pv_fcf_sum + dual_tv['pv_tv_exit_multiple']
+                price_exit = (ev_exit - net_debt) / shares
+                self.assumptions.price_exit_multiple = round(price_exit, 2)
+                dual_tv['price_exit_multiple'] = round(price_exit, 2)
+
+        market_price = self.snapshot.price.value if self.snapshot.price else None
+        gordon_ratio_to_market = None
+        if price_gordon is not None and market_price and market_price > 0:
+            gordon_ratio_to_market = price_gordon / market_price
+
+        should_override_to_exit = False
+        if (
+            self.assumptions.terminal_value_method != "exit_multiple"
+            and dual_tv.get('pv_tv_exit_multiple') is not None
+            and price_gordon is not None
+            and price_exit is not None
+            and market_price is not None
+            and market_price > 0
+        ):
+            gordon_extremely_low = (
+                price_gordon <= 0
+                or gordon_ratio_to_market <= self.EXTREME_GORDON_PRICE_TO_MARKET_THRESHOLD
+            )
+            exit_materially_higher = (
+                price_gordon <= 0
+                or ((price_exit / price_gordon) - 1) >= self.EXTREME_GORDON_EXIT_UPLIFT_THRESHOLD
+            )
+            should_override_to_exit = gordon_extremely_low and exit_materially_higher
+
+        if should_override_to_exit:
+            self.assumptions.terminal_value_method = "exit_multiple"
+            self.warnings.append(
+                "Gordon implied an extreme discount vs market; using Exit Multiple as primary terminal method fallback."
+            )
+            self.trace.append(CalculationTraceStep(
+                name="TV Method Override: Exit Multiple (Extreme Gordon Discount)",
+                formula=(
+                    "If Gordon implied price <= 35% of market and Exit Multiple is materially higher, "
+                    "promote Exit Multiple"
+                ),
+                inputs={
+                    "market_price": market_price,
+                    "price_gordon_growth": round(price_gordon, 2) if price_gordon is not None else None,
+                    "price_exit_multiple": round(price_exit, 2) if price_exit is not None else None,
+                    "gordon_to_market_ratio": round(gordon_ratio_to_market, 4) if gordon_ratio_to_market is not None else None,
+                    "threshold": self.EXTREME_GORDON_PRICE_TO_MARKET_THRESHOLD,
+                    "min_exit_uplift": self.EXTREME_GORDON_EXIT_UPLIFT_THRESHOLD
+                },
+                output="exit_multiple",
+                output_units="",
+                notes="Guardrail fallback. Gordon remains default in normal cases."
+            ))
+
         # Determine primary method and calculate with proper trace
         if self.assumptions.terminal_value_method == "exit_multiple":
             if ttm_ebitda and ttm_ebitda > 0 and self.assumptions.exit_multiple:
@@ -1821,8 +2088,7 @@ class DCFEngine:
             terminal_fcff_ebitda=terminal_fcff_ebitda if terminal_fcff_ebitda else fcff_ebitda_ratio_ttm,
             terminal_year_ebitda=terminal_year_ebitda,
             shares_outstanding=self.snapshot.shares_outstanding.value if self.snapshot.shares_outstanding else 1,
-            net_debt=(self.snapshot.total_debt.value if self.snapshot.total_debt else 0) - 
-                     (self.snapshot.cash_and_equivalents.value if self.snapshot.cash_and_equivalents else 0),
+            net_debt=net_debt,
             pv_fcf_sum=None  # Will be set later in calculate()
         )
         

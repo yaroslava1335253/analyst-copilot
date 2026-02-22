@@ -106,6 +106,7 @@ class NormalizedFinancialSnapshot:
         self.suggested_wacc = DataQualityMetadata()
         self.suggested_fcf_growth = DataQualityMetadata()
         self.analyst_revenue_estimates = []  # List of {year_label, revenue, source, reliability_score}
+        self.analyst_long_term_growth = DataQualityMetadata()  # Analyst long-term growth (e.g., +5Y consensus)
 
         # Latest annual
         self.latest_annual_date = None
@@ -170,6 +171,8 @@ class NormalizedFinancialSnapshot:
             "beta": self.beta.to_dict(),
             "suggested_wacc": self.suggested_wacc.to_dict(),
             "suggested_fcf_growth": self.suggested_fcf_growth.to_dict(),
+            "analyst_revenue_estimates": self.analyst_revenue_estimates,
+            "analyst_long_term_growth": self.analyst_long_term_growth.to_dict(),
             "num_quarters_available": self.num_quarters_available,
             "overall_quality_score": self.overall_quality_score,
             "warnings": self.warnings,
@@ -204,11 +207,12 @@ class DataAdapter:
             # Step 5: Quarterly history for trends
             self._fetch_quarterly_history(stock)
             
-            # Step 6: Calculate suggested WACC and FCF growth
-            self._calculate_suggested_assumptions()
-
-            # Step 7: Fetch analyst revenue consensus estimates (for DCF anchor)
+            # Step 6: Fetch analyst revenue and long-term growth consensus
             self._fetch_analyst_revenue_estimates(stock)
+
+            # Step 7: Calculate suggested WACC and FCF growth
+            # (can use analyst forecasts fetched above)
+            self._calculate_suggested_assumptions()
             
         except Exception as e:
             self.snapshot.add_warning(
@@ -944,18 +948,111 @@ class DataAdapter:
             )
         
         # ═══════════════════════════════════════════════════════════════
-        # SUGGESTED FCF GROWTH RATE: Yahoo trailing > YoY fallback
+        # SUGGESTED FCF GROWTH RATE PRIORITY
+        # 1) Analyst forward consensus (revenue estimate chain; no LT blending)
+        # 2) Yahoo trailing growth
+        # 3) Historical YoY fallback
+        # 4) Default
         # ═══════════════════════════════════════════════════════════════
-        
-        # Priority 1: Use Yahoo Finance trailing revenue growth (more reliable than our 5-quarter calc)
+
+        def _period_rank(label: str):
+            if label == "0y":
+                return 0
+            if isinstance(label, str) and label.startswith("+") and label.endswith("y"):
+                num = label[1:-1]
+                if num.isdigit():
+                    return int(num)
+            return 999
+
+        analyst_estimates = sorted(
+            self.snapshot.analyst_revenue_estimates or [],
+            key=lambda x: _period_rank(x.get("year_label"))
+        )
+        analyst_lt_growth = getattr(self.snapshot.analyst_long_term_growth, "value", None)
+        ttm_revenue = self.snapshot.ttm_revenue.value
+
+        if analyst_estimates:
+            # Build an annualized forward growth chain from consensus estimates only:
+            # 0y->+1y, +1y->+2y, etc. This avoids mixing in potentially misaligned TTM->0y jumps.
+            ranked_estimates = []
+            for est in analyst_estimates:
+                label = est.get("year_label")
+                rank = _period_rank(label)
+                rev = est.get("revenue")
+                try:
+                    rev = float(rev) if rev is not None else None
+                except Exception:
+                    rev = None
+                if rank != 999 and rev is not None and rev > 0:
+                    ranked_estimates.append((rank, label, rev))
+            ranked_estimates.sort(key=lambda x: x[0])
+
+            forward_growth_candidates = []
+            forward_chain_labels = []
+            for i in range(1, len(ranked_estimates)):
+                prev_rank, prev_label, prev_rev = ranked_estimates[i - 1]
+                curr_rank, curr_label, curr_rev = ranked_estimates[i]
+                if prev_rev > 0 and curr_rev > 0 and curr_rank > prev_rank:
+                    year_span = max(1, curr_rank - prev_rank)
+                    annualized_growth = (curr_rev / prev_rev) ** (1.0 / year_span) - 1
+                    forward_growth_candidates.append(annualized_growth)
+                    forward_chain_labels.append(f"{prev_label}->{curr_label}")
+
+            suggested_fcf_growth = None
+            reliability = 0
+            source_note = ""
+
+            if forward_growth_candidates:
+                suggested_fcf_growth = sum(forward_growth_candidates) / len(forward_growth_candidates)
+                reliability = 88 if len(forward_growth_candidates) >= 2 else 82
+                source_note = ", ".join(forward_chain_labels)
+            else:
+                # Single-point fallback if only one forward estimate is available.
+                if ranked_estimates and ttm_revenue and ttm_revenue > 0:
+                    _, label0, rev0 = ranked_estimates[0]
+                    suggested_fcf_growth = (rev0 / ttm_revenue) - 1
+                    reliability = 72
+                    source_note = f"TTM->{label0}"
+
+            if suggested_fcf_growth is not None:
+                suggested_fcf_growth = max(0.00, min(0.35, suggested_fcf_growth))
+                lt_text = f" (LT anchor available: {analyst_lt_growth*100:.1f}%, used in fade, not in near-term suggestion)" if analyst_lt_growth is not None else ""
+
+                self.snapshot.suggested_fcf_growth = DataQualityMetadata(
+                    value=suggested_fcf_growth,
+                    units="rate",
+                    period_type="forward_analyst_consensus",
+                    source_path="yf.Ticker.revenue_estimate (forward consensus chain)",
+                    retrieved_at=datetime.utcnow().isoformat(),
+                    reliability_score=reliability,
+                    is_estimated=True,
+                    notes=(
+                        f"Analyst forward revenue chain: {source_note}. "
+                        f"Suggested near-term growth = {suggested_fcf_growth*100:.1f}%."
+                        f"{lt_text}"
+                    )
+                )
+                return
+
+        if analyst_lt_growth is not None and analyst_lt_growth > 0:
+            suggested_fcf_growth = max(0.00, min(0.35, analyst_lt_growth))
+            self.snapshot.suggested_fcf_growth = DataQualityMetadata(
+                value=suggested_fcf_growth,
+                units="rate",
+                period_type="forward_analyst_long_term",
+                source_path=self.snapshot.analyst_long_term_growth.source_path,
+                retrieved_at=datetime.utcnow().isoformat(),
+                reliability_score=max(70, self.snapshot.analyst_long_term_growth.reliability_score or 70),
+                is_estimated=True,
+                notes=f"Analyst long-term growth anchor used as fallback: {suggested_fcf_growth*100:.1f}%."
+            )
+            return
+
+        # Priority 2: Yahoo trailing revenue growth
         yf_revenue_growth = getattr(self, '_ticker_info', {}).get('revenueGrowth')
-        
         if yf_revenue_growth is not None and yf_revenue_growth > 0:
-            # Use Yahoo's trailing revenue growth directly
-            # This is based on longer history and more reliable than our 5-quarter YoY
-            suggested_fcf_growth = yf_revenue_growth
-            suggested_fcf_growth = max(0.03, min(0.30, suggested_fcf_growth))  # Clamp 3-30%
-            
+            suggested_fcf_growth = max(0.03, min(0.30, yf_revenue_growth))
+
             self.snapshot.suggested_fcf_growth = DataQualityMetadata(
                 value=suggested_fcf_growth,
                 units="rate",
@@ -964,11 +1061,11 @@ class DataAdapter:
                 retrieved_at=datetime.utcnow().isoformat(),
                 reliability_score=80,
                 is_estimated=True,
-                notes=f"Yahoo Finance trailing revenue growth: {suggested_fcf_growth*100:.1f}% (historical, not analyst forward estimate)"
+                notes=f"Yahoo Finance trailing revenue growth: {suggested_fcf_growth*100:.1f}% (historical fallback)"
             )
             return
-        
-        # Priority 2: Fallback to our calculated YoY (less reliable - only 5 quarters)
+
+        # Priority 3: Historical YoY fallback (less reliable - only 5 quarters)
         quarterly_history = self.snapshot.quarterly_history
         if len(quarterly_history) >= 5:
             revenues = [q['revenue'] for q in quarterly_history[:5] if q.get('revenue')]
@@ -994,7 +1091,7 @@ class DataAdapter:
                     )
                     return
         
-        # Priority 3: Default fallback
+        # Priority 4: Default fallback
         self.snapshot.suggested_fcf_growth = DataQualityMetadata(
             value=0.08,
             units="rate",
@@ -1007,29 +1104,139 @@ class DataAdapter:
         )
 
     def _fetch_analyst_revenue_estimates(self, stock):
-        """Fetch analyst consensus revenue estimates for DCF Year 1-2 anchoring."""
-        try:
-            rev_est = stock.revenue_estimate
-            if rev_est is None or rev_est.empty:
-                return
+        """Fetch analyst consensus revenue and long-term growth estimates."""
 
+        def _safe_rate(raw):
+            if raw is None:
+                return None
+            try:
+                if isinstance(raw, str):
+                    value = raw.strip()
+                    is_pct = value.endswith("%")
+                    if is_pct:
+                        value = value[:-1]
+                    parsed = float(value)
+                    raw = parsed / 100.0 if is_pct else parsed
+                else:
+                    raw = float(raw)
+                if pd.isna(raw):
+                    return None
+                if abs(raw) > 1.0:
+                    raw = raw / 100.0
+                return raw
+            except Exception:
+                return None
+
+        def _period_rank(label: str):
+            if label == "0y":
+                return 0
+            if isinstance(label, str) and label.startswith("+") and label.endswith("y"):
+                num = label[1:-1]
+                if num.isdigit():
+                    return int(num)
+            return None
+
+        try:
             estimates = []
-            reliability_map = {"0y": 85, "+1y": 80}
-            for label in ["0y", "+1y"]:
-                if label in rev_est.index:
+            reliability_map = {
+                "0y": 85,
+                "+1y": 80,
+                "+2y": 75,
+                "+3y": 70,
+                "+4y": 65,
+                "+5y": 60,
+            }
+
+            rev_est = stock.revenue_estimate
+            if rev_est is not None and not rev_est.empty:
+                labels = [idx for idx in rev_est.index if _period_rank(idx) is not None]
+                labels = sorted(labels, key=lambda x: _period_rank(x))
+                for label in labels:
                     row = rev_est.loc[label]
                     avg_rev = row.get("avg") if hasattr(row, "get") else row["avg"] if "avg" in row else None
-                    if avg_rev is not None and not (isinstance(avg_rev, float) and avg_rev != avg_rev):
-                        estimates.append({
-                            "year_label": label,
-                            "revenue": float(avg_rev),
-                            "source": "Yahoo Finance consensus",
-                            "reliability_score": reliability_map.get(label, 75),
-                        })
+                    try:
+                        avg_rev = float(avg_rev)
+                    except Exception:
+                        avg_rev = None
+                    if avg_rev is not None and not pd.isna(avg_rev) and avg_rev > 0:
+                        estimates.append(
+                            {
+                                "year_label": label,
+                                "revenue": avg_rev,
+                                "source": "Yahoo Finance analyst consensus",
+                                "reliability_score": reliability_map.get(label, 60),
+                            }
+                        )
 
             self.snapshot.analyst_revenue_estimates = estimates
+
+            # Long-term analyst growth (used as a 10Y curve anchor when available)
+            lt_growth = None
+            lt_source = None
+            lt_reliability = 0
+
+            try:
+                growth_est = stock.growth_estimates
+                if growth_est is not None and isinstance(growth_est, pd.DataFrame) and not growth_est.empty and "+5y" in growth_est.columns:
+                    row_key = None
+                    for candidate in ["stock", self.ticker]:
+                        if candidate in growth_est.index:
+                            row_key = candidate
+                            break
+                    if row_key is None:
+                        row_key = growth_est.index[0]
+                    candidate_rate = _safe_rate(growth_est.loc[row_key, "+5y"])
+                    if candidate_rate is not None:
+                        lt_growth = candidate_rate
+                        lt_source = f"yf.Ticker.growth_estimates[{row_key}]['+5y']"
+                        lt_reliability = 85
+            except Exception:
+                pass
+
+            if lt_growth is None:
+                try:
+                    earnings_trend = stock.earnings_trend
+                    if earnings_trend is not None and isinstance(earnings_trend, pd.DataFrame) and not earnings_trend.empty:
+                        candidate_rate = None
+                        if "+5y" in earnings_trend.index:
+                            row = earnings_trend.loc["+5y"]
+                            if hasattr(row, "get"):
+                                candidate_rate = row.get("growth")
+                        elif "+5y" in earnings_trend.columns:
+                            candidate_rate = earnings_trend["+5y"].iloc[0]
+                        candidate_rate = _safe_rate(candidate_rate)
+                        if candidate_rate is not None:
+                            lt_growth = candidate_rate
+                            lt_source = "yf.Ticker.earnings_trend['+5y']"
+                            lt_reliability = 78
+                except Exception:
+                    pass
+
+            if lt_growth is None:
+                info = getattr(self, "_ticker_info", {}) or {}
+                info_rate = _safe_rate(
+                    info.get("longTermPotentialGrowthRate")
+                    or info.get("earningsGrowth")
+                )
+                if info_rate is not None:
+                    lt_growth = info_rate
+                    lt_source = "yf.Ticker.info['longTermPotentialGrowthRate' or 'earningsGrowth']"
+                    lt_reliability = 60
+
+            if lt_growth is not None:
+                lt_growth = max(-0.10, min(0.40, lt_growth))
+                self.snapshot.analyst_long_term_growth = DataQualityMetadata(
+                    value=lt_growth,
+                    units="rate",
+                    period_type="forward_long_term",
+                    source_path=lt_source,
+                    retrieved_at=datetime.utcnow().isoformat(),
+                    reliability_score=lt_reliability,
+                    notes="Long-term analyst growth estimate (used as 10Y mid-curve anchor when available).",
+                )
+
         except Exception as e:
             self.snapshot.add_warning(
                 "ANALYST_REVENUE_ESTIMATES_ERROR",
-                f"Could not fetch analyst revenue estimates: {str(e)[:80]}"
+                f"Could not fetch analyst revenue/growth estimates: {str(e)[:80]}"
             )

@@ -263,7 +263,7 @@ class DCFUIAdapter:
             "exit_multiple": assumptions.get("exit_multiple") or 15,  # Default 15x
             "forecast_years": assumptions.get("forecast_years") or 5,
             "discount_convention": assumptions.get("discount_convention") or "end_of_year",
-            "terminal_value_method": assumptions.get("terminal_value_method") or "exit_multiple",
+            "terminal_value_method": assumptions.get("terminal_value_method") or "gordon_growth",
             "tax_rate": assumptions.get("tax_rate") or 0.15,  # Default 15%
             # Industry multiple metadata
             "industry_multiple_source": assumptions.get("industry_multiple_source"),
@@ -322,6 +322,10 @@ class DCFUIAdapter:
             "horizon_reason": assumptions.get("horizon_reason"),
             "near_term_growth_rate": assumptions.get("near_term_growth_rate"),
             "effective_near_term_growth_rate": assumptions.get("effective_near_term_growth_rate"),
+            "analyst_long_term_growth_rate": assumptions.get("analyst_long_term_growth_rate"),
+            "growth_schedule_method": assumptions.get("growth_schedule_method"),
+            "high_growth_company": assumptions.get("high_growth_company", False),
+            "high_growth_reasons": assumptions.get("high_growth_reasons", []),
             "stable_growth_rate": assumptions.get("stable_growth_rate"),
             "base_roic": assumptions.get("base_roic"),
             "terminal_roic": assumptions.get("terminal_roic"),
@@ -439,7 +443,7 @@ class DCFUIAdapter:
         assumptions = self.ui_data.get("assumptions", {})
         
         # Determine exit multiple source description
-        tv_method = assumptions.get('terminal_value_method', 'exit_multiple')
+        tv_method = assumptions.get('terminal_value_method', 'gordon_growth')
         if tv_method == 'exit_multiple':
             damodaran_industry = assumptions.get('damodaran_industry')
             is_exact = assumptions.get('is_exact_industry_match', False)

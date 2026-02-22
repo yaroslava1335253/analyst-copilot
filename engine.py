@@ -7,11 +7,35 @@ Includes financial math logic to pre-process data for the LLM.
 """
 
 import os
+import re
 import requests
 import yfinance as yf
 import pandas as pd
 import google.generativeai as genai
 from industry_multiples import get_industry_multiple, DAMODARAN_SOURCE_URL, DAMODARAN_DATA_DATE
+
+
+def _sanitize_valuation_language(value):
+    """
+    Prevent overconfident valuation phrasing in AI text.
+    Intrinsic value should always be framed as model-implied under assumptions.
+    """
+    if isinstance(value, str):
+        text = value
+        replacements = [
+            (r"(?i)\bfundamental floor\b", "model-implied value under current assumptions"),
+            (r"(?i)\bvaluation floor\b", "model-implied value under current assumptions"),
+            (r"(?i)\bintrinsic floor\b", "model-implied value under current assumptions"),
+            (r"(?i)\bhard floor\b", "assumption-sensitive downside case"),
+        ]
+        for pattern, replacement in replacements:
+            text = re.sub(pattern, replacement, text)
+        return text
+    if isinstance(value, list):
+        return [_sanitize_valuation_language(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _sanitize_valuation_language(v) for k, v in value.items()}
+    return value
 
 def config_genai():
     """Configures the Gemini API."""
@@ -1622,6 +1646,10 @@ def generate_independent_forecast(quarterly_analysis: dict, company_name: str = 
            - You provide an external citation with URL
         
         7. DO NOT produce a next-quarter forecast unless explicit quarter-level guidance is provided.
+
+        8. DO NOT describe DCF intrinsic value as a "floor", "hard floor", or "guaranteed downside level".
+           Treat it as one model output under one assumption set.
+           Preferred wording: "model-implied intrinsic value under current assumptions."
         
         ═══════════════════════════════════════════════════════════════
         DATA PACKET FOR {ticker}
@@ -1757,7 +1785,7 @@ def generate_independent_forecast(quarterly_analysis: dict, company_name: str = 
         """
         
         response = model.generate_content(forecast_prompt)
-        response_text = response.text.strip()
+        response_text = _sanitize_valuation_language(response.text.strip())
         
         # Also try to extract structured data from the response
         result = {
@@ -1817,6 +1845,7 @@ def generate_independent_forecast(quarterly_analysis: dict, company_name: str = 
                 extract_text = "\n".join(lines[1:-1] if lines[-1] == "```" else lines[1:])
             
             extracted = json.loads(extract_text)
+            extracted = _sanitize_valuation_language(extracted)
             result["extracted_forecast"] = extracted
         except:
             result["extracted_forecast"] = None

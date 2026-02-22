@@ -232,6 +232,95 @@ class TestDCFEngine:
         assert engine.assumptions.fcf_growth_rate is not None
         # Should auto-assign exit multiple
         assert engine.assumptions.exit_multiple is not None
+
+    def test_high_growth_watchlist_defaults_to_gordon_first(self):
+        snap = NormalizedFinancialSnapshot("TSLA")
+        snap.ttm_revenue.value = 100e9
+        snap.ttm_fcf.value = 8e9
+        snap.ttm_ebitda.value = 20e9
+        snap.market_cap.value = 700e9
+        snap.shares_outstanding.value = 3e9
+        snap.total_debt.value = 10e9
+        snap.cash_and_equivalents.value = 20e9
+        snap.effective_tax_rate.value = 0.20
+
+        assumptions = DCFAssumptions(
+            wacc=0.11,
+            terminal_growth_rate=0.03,
+            terminal_value_method="gordon_growth"
+        )
+        engine = DCFEngine(snap, assumptions)
+        engine.set_assumptions_from_defaults()
+
+        assert engine.assumptions.high_growth_company is True
+        assert engine.assumptions.terminal_value_method == "gordon_growth"
+
+    def test_extreme_gordon_discount_triggers_exit_fallback(self):
+        snap = NormalizedFinancialSnapshot("TSLA")
+        snap.price.value = 500
+        snap.market_cap.value = 500e9
+        snap.shares_outstanding.value = 1e9
+        snap.ttm_revenue.value = 100e9
+        snap.ttm_fcf.value = 5e9
+        snap.ttm_operating_income.value = 8e9
+        snap.ttm_ebitda.value = 20e9
+        snap.ttm_depreciation_amortization.value = 12e9
+        snap.ttm_capex.value = 10e9
+        snap.ttm_delta_nwc.value = 1e9
+        snap.total_debt.value = 10e9
+        snap.cash_and_equivalents.value = 5e9
+        snap.effective_tax_rate.value = 0.20
+
+        assumptions = DCFAssumptions(
+            wacc=0.13,
+            terminal_growth_rate=0.03,
+            fcf_growth_rate=0.02,
+            terminal_value_method="gordon_growth"
+        )
+        engine = DCFEngine(snap, assumptions)
+        result = engine.run()
+
+        assert result["success"] is True
+        assert engine.assumptions.price_gordon_growth is not None
+        assert engine.assumptions.price_exit_multiple is not None
+        assert engine.assumptions.price_gordon_growth < (
+            snap.price.value * DCFEngine.EXTREME_GORDON_PRICE_TO_MARKET_THRESHOLD
+        )
+        assert engine.assumptions.terminal_value_method == "exit_multiple"
+
+    def test_analyst_consensus_anchors_all_available_years(self):
+        snap = NormalizedFinancialSnapshot("ANCHOR")
+        snap.ttm_revenue.value = 100e9
+        snap.ttm_fcf.value = 10e9
+        snap.ttm_operating_income.value = 12e9
+        snap.ttm_ebitda.value = 18e9
+        snap.ttm_depreciation_amortization.value = 6e9
+        snap.ttm_capex.value = 4e9
+        snap.ttm_delta_nwc.value = 0.5e9
+        snap.market_cap.value = 300e9  # Forces 10-year horizon
+        snap.shares_outstanding.value = 1e9
+        snap.total_debt.value = 5e9
+        snap.cash_and_equivalents.value = 10e9
+        snap.effective_tax_rate.value = 0.21
+        snap.suggested_fcf_growth.value = 0.10
+        snap.analyst_revenue_estimates = [
+            {"year_label": "0y", "revenue": 110e9},
+            {"year_label": "+1y", "revenue": 125e9},
+            {"year_label": "+2y", "revenue": 140e9},
+            {"year_label": "+3y", "revenue": 160e9},
+            {"year_label": "+4y", "revenue": 180e9},
+        ]
+
+        engine = DCFEngine(snap, DCFAssumptions(wacc=0.10, terminal_growth_rate=0.03))
+        result = engine.run()
+
+        assert result["success"] is True
+        assert engine.assumptions.consensus_revenue_used_years[:5] == [1, 2, 3, 4, 5]
+        assert len(engine.assumptions.yearly_projections) >= 5
+
+        expected_revenues = [110e9, 125e9, 140e9, 160e9, 180e9]
+        for idx, expected in enumerate(expected_revenues):
+            assert engine.assumptions.yearly_projections[idx]["revenue"] == pytest.approx(expected)
     
     def test_dcf_run_success(self):
         assumptions = DCFAssumptions(
