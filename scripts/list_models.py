@@ -1,6 +1,6 @@
 
 import os
-import google.generativeai as genai
+from google import genai
 
 # We need the API key to be set. 
 # Attempt to read from environment or ask user to provide it in the code just for this test if needed.
@@ -17,11 +17,11 @@ if not api_key:
     # The terminal session might NOT have the env var set if it was set inside the Streamlit session state/process.
     print("API Key not found in environment. Please export GEMINI_API_KEY='...'")
 else:
-    genai.configure(api_key=api_key)
+    client = genai.Client(api_key=api_key)
     try:
         print("Listing models...")
-        for m in genai.list_models():
-            if 'generateContent' in m.supported_generation_methods:
-                print(m.name)
+        pager = client.models.list()
+        for m in pager:
+            print(m.name)
     except Exception as e:
         print(f"Error listing models: {e}")

@@ -11,8 +11,11 @@ import re
 import requests
 import yfinance as yf
 import pandas as pd
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from industry_multiples import get_industry_multiple, DAMODARAN_SOURCE_URL, DAMODARAN_DATA_DATE
+
+_genai_client: "genai.Client | None" = None
 
 
 def _sanitize_valuation_language(value):
@@ -38,10 +41,11 @@ def _sanitize_valuation_language(value):
     return value
 
 def config_genai():
-    """Configures the Gemini API."""
+    """Configures the Gemini API client."""
+    global _genai_client
     api_key = os.getenv("GEMINI_API_KEY") or os.getenv("OPENAI_API_KEY")
     if api_key:
-        genai.configure(api_key=api_key)
+        _genai_client = genai.Client(api_key=api_key)
     return api_key
 
 def get_financials(ticker_symbol: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -489,13 +493,11 @@ def calculate_comprehensive_analysis(
     return analysis
 
 
-def get_gemini_model():
-    """Returns a configured Gemini GenerativeModel."""
-    try:
-        return genai.GenerativeModel("gemini-3-flash-preview")
-    except Exception:
-        # Fallback keeps a fixed model name (no dynamic model lookup).
-        return genai.GenerativeModel("gemini-2.5-flash")
+_GEMINI_MODEL = "gemini-2.5-flash"
+
+def get_gemini_model() -> tuple:
+    """Returns (client, model_name) for use with the google.genai SDK."""
+    return _genai_client, _GEMINI_MODEL
 
 def run_structured_prompt(system_role: str, user_prompt: str, context_data: str) -> str:
     """
@@ -515,8 +517,8 @@ def run_structured_prompt(system_role: str, user_prompt: str, context_data: str)
     """
     
     try:
-        model = get_gemini_model()
-        response = model.generate_content(full_prompt)
+        client, model_name = get_gemini_model()
+        response = client.models.generate_content(model=model_name, contents=full_prompt)
         return response.text
     except Exception as e:
         return f"AI Error: {e}"
@@ -530,26 +532,26 @@ def run_chat(chat_history: list, new_message: str, context_data: str) -> str:
         return "Error: No API key found."
 
     try:
-        model = get_gemini_model()
+        client, model_name = get_gemini_model()
         
         # Construct history for Gemini (user/model)
         gemini_history = []
         
         # Seed context in the first message
-        gemini_history.append({
-            "role": "user", 
-            "parts": [f"You are a financial analyst. Use this data for all answers:\n\n{context_data}"]
-        })
-        gemini_history.append({
-            "role": "model", 
-            "parts": ["Understood. I have analyzed the data you provided."]
-        })
+        gemini_history.append(types.Content(
+            role="user",
+            parts=[types.Part(text=f"You are a financial analyst. Use this data for all answers:\n\n{context_data}")]
+        ))
+        gemini_history.append(types.Content(
+            role="model",
+            parts=[types.Part(text="Understood. I have analyzed the data you provided.")]
+        ))
             
         for msg in chat_history:
             role = "user" if msg["role"] == "user" else "model"
-            gemini_history.append({"role": role, "parts": [msg["content"]]})
+            gemini_history.append(types.Content(role=role, parts=[types.Part(text=msg["content"])]))
             
-        chat = model.start_chat(history=gemini_history)
+        chat = client.chats.create(model=model_name, history=gemini_history)
         response = chat.send_message(new_message)
         return response.text
     except Exception as e:
@@ -1067,9 +1069,13 @@ def analyze_quarterly_trends(ticker_symbol: str, num_quarters: int = 8, end_date
                 
                 result["projections"]["next_quarter_estimate"] = projected
         
-        # --- PART 4: Fetch Consensus Estimates via AI Web Search ---
+        # --- PART 4: Fetch consensus estimates (fast path, no AI on initial load) ---
         next_q_label = result.get("next_forecast_quarter", {}).get("label", "next quarter")
-        result["consensus_estimates"] = fetch_consensus_estimates(ticker_symbol, next_q_label)
+        result["consensus_estimates"] = fetch_consensus_estimates(
+            ticker_symbol,
+            next_q_label,
+            include_qualitative=False,
+        )
         
     except Exception as e:
         result["errors"].append(f"Analysis error: {str(e)}")
@@ -1077,10 +1083,14 @@ def analyze_quarterly_trends(ticker_symbol: str, num_quarters: int = 8, end_date
     return result
 
 
-def fetch_consensus_estimates(ticker_symbol: str, next_quarter_label: str = "next quarter") -> dict:
+def fetch_consensus_estimates(
+    ticker_symbol: str,
+    next_quarter_label: str = "next quarter",
+    include_qualitative: bool = False,
+) -> dict:
     """
     Fetches consensus analyst estimates directly from Yahoo Finance via yfinance.
-    Falls back to AI search only for qualitative summary.
+    Optionally enriches with AI qualitative commentary.
     
     Args:
         ticker_symbol: Stock ticker
@@ -1232,10 +1242,10 @@ def fetch_consensus_estimates(ticker_symbol: str, next_quarter_label: str = "nex
             "last_updated": "current"
         }
         
-        # Generate qualitative summary using AI with source citations
+        # Optional qualitative summary using AI (disabled for initial-load performance).
         try:
-            if config_genai():
-                model = get_gemini_model()
+            if include_qualitative and config_genai():
+                client, model_name = get_gemini_model()
                 company_name = info.get('longName', ticker_symbol)
                 industry = info.get('industry', 'technology')
                 
@@ -1266,7 +1276,7 @@ def fetch_consensus_estimates(ticker_symbol: str, next_quarter_label: str = "nex
                 Return ONLY valid JSON, no markdown.
                 """
                 
-                response = model.generate_content(qual_prompt)
+                response = client.models.generate_content(model=model_name, contents=qual_prompt)
                 response_text = response.text.strip()
                 
                 # Clean up response
@@ -1283,7 +1293,7 @@ def fetch_consensus_estimates(ticker_symbol: str, next_quarter_label: str = "nex
                     # If JSON parsing fails, use the raw text as summary
                     result["qualitative_summary"] = response_text[:200] if len(response_text) < 200 else response_text[:200] + "..."
                     result["qualitative_sources"] = []
-        except Exception as e:
+        except Exception:
             pass  # No qualitative summary if AI fails
         
         return result
@@ -1597,7 +1607,7 @@ def generate_independent_forecast(quarterly_analysis: dict, company_name: str = 
     """
     
     try:
-        model = get_gemini_model()
+        client, model_name = get_gemini_model()
         
         # Get DCF-specific data for the prompt
         dcf_intrinsic = dcf_data.get('price_per_share', 0) if dcf_data else 0
@@ -1784,7 +1794,7 @@ def generate_independent_forecast(quarterly_analysis: dict, company_name: str = 
         Do NOT use dollar signs ($) - use 'USD' instead.
         """
         
-        response = model.generate_content(forecast_prompt)
+        response = client.models.generate_content(model=model_name, contents=forecast_prompt)
         response_text = _sanitize_valuation_language(response.text.strip())
         
         # Also try to extract structured data from the response
@@ -1838,7 +1848,7 @@ def generate_independent_forecast(quarterly_analysis: dict, company_name: str = 
             
             Return ONLY the JSON, no other text.
             """
-            extract_response = model.generate_content(extract_prompt)
+            extract_response = client.models.generate_content(model=model_name, contents=extract_prompt)
             extract_text = extract_response.text.strip()
             if extract_text.startswith("```"):
                 lines = extract_text.split("\n")

@@ -13,11 +13,21 @@ import re
 import streamlit as st
 import streamlit.components.v1 as components
 from pathlib import Path
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 # Load API keys from .env file (if exists)
 load_dotenv()
+try:
+    if not os.environ.get("GEMINI_API_KEY"):
+        secret_key = st.secrets.get("GEMINI_API_KEY")
+        if secret_key:
+            os.environ["GEMINI_API_KEY"] = str(secret_key)
+except Exception:
+    # st.secrets is not always available locally.
+    pass
 import pandas as pd
 import json
 from engine import get_financials, run_structured_prompt, calculate_metrics, run_chat, analyze_quarterly_trends, generate_independent_forecast, get_latest_date_info, get_available_report_dates, calculate_comprehensive_analysis
@@ -31,11 +41,16 @@ UI_CACHE_PATH = Path(__file__).resolve().parent / "data" / "user_ui_cache.json"
 MAX_TICKER_LIBRARY_SIZE = 100
 TICKER_PATTERN = re.compile(r"^[A-Z0-9.\-]{1,10}$")
 MAG7_TICKERS = ["AAPL", "AMZN", "GOOGL", "META", "MSFT", "NVDA", "TSLA"]
+AVAILABLE_DATES_TIMEOUT_SECONDS = 8
+FINANCIALS_TIMEOUT_SECONDS = 20
+QUARTERLY_ANALYSIS_TIMEOUT_SECONDS = 25
+SNAPSHOT_TIMEOUT_SECONDS = 12
 SNAPSHOT_METADATA_FIELDS = [
     "price",
     "shares_outstanding",
     "market_cap",
     "total_debt",
+    "average_total_debt",
     "cash_and_equivalents",
     "ttm_revenue",
     "ttm_operating_cash_flow",
@@ -47,6 +62,8 @@ SNAPSHOT_METADATA_FIELDS = [
     "effective_tax_rate",
     "beta",
     "suggested_wacc",
+    "suggested_cost_of_equity",
+    "suggested_cost_of_debt",
     "suggested_fcf_growth",
     "analyst_long_term_growth",
 ]
@@ -198,6 +215,9 @@ def snapshot_from_dict(raw: dict) -> NormalizedFinancialSnapshot:
     snapshot.overall_quality_score = base.get("overall_quality_score", snapshot.overall_quality_score)
     snapshot.warnings = base.get("warnings", []) if isinstance(base.get("warnings", []), list) else []
     snapshot.errors = base.get("errors", []) if isinstance(base.get("errors", []), list) else []
+    snapshot.wacc_components = base.get("wacc_components", {}) if isinstance(base.get("wacc_components", {}), dict) else {}
+    snapshot.risk_free_rate = base.get("risk_free_rate")
+    snapshot.rf_source = base.get("rf_source")
     snapshot.analyst_revenue_estimates = (
         base.get("analyst_revenue_estimates", [])
         if isinstance(base.get("analyst_revenue_estimates", []), list)
@@ -345,6 +365,24 @@ def _persist_ai_result_for_context(ticker: str, end_date: str, num_quarters: int
     st.session_state.ui_cache = cache
     save_ui_cache(cache)
 
+
+def _call_with_timeout(func, *args, timeout_seconds: int, fallback=None):
+    """
+    Prevent long-running upstream data calls from blocking the first paint forever.
+    Returns fallback on timeout/error.
+    """
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(func, *args)
+    try:
+        return future.result(timeout=timeout_seconds)
+    except FuturesTimeoutError:
+        return fallback
+    except Exception:
+        return fallback
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
 # --- Cached API Functions ---
 # These decorators cache results so API calls only happen once per input
 # TTL (time-to-live) of 1 hour = 3600 seconds
@@ -352,12 +390,36 @@ def _persist_ai_result_for_context(ticker: str, end_date: str, num_quarters: int
 @st.cache_data(ttl=3600, show_spinner=False)
 def cached_quarterly_analysis(ticker: str, num_quarters: int = 8, end_date: str = None) -> dict:
     """Cached version of analyze_quarterly_trends to avoid API rate limits."""
-    return analyze_quarterly_trends(ticker, num_quarters, end_date)
+    fallback = {
+        "ticker": ticker,
+        "analysis_date": datetime.now().strftime("%Y-%m-%d"),
+        "historical_trends": {},
+        "growth_rates": {},
+        "projections": {},
+        "consensus_estimates": {},
+        "next_forecast_quarter": {},
+        "errors": [f"Quarterly analysis timed out after {QUARTERLY_ANALYSIS_TIMEOUT_SECONDS}s."],
+    }
+    result = _call_with_timeout(
+        analyze_quarterly_trends,
+        ticker,
+        num_quarters,
+        end_date,
+        timeout_seconds=QUARTERLY_ANALYSIS_TIMEOUT_SECONDS,
+        fallback=fallback,
+    )
+    return result if isinstance(result, dict) else fallback
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def cached_available_dates(ticker: str) -> list:
     """Cached wrapper for get_available_report_dates."""
-    return get_available_report_dates(ticker)
+    result = _call_with_timeout(
+        get_available_report_dates,
+        ticker,
+        timeout_seconds=AVAILABLE_DATES_TIMEOUT_SECONDS,
+        fallback=[],
+    )
+    return result if isinstance(result, list) else []
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def cached_independent_forecast(ticker: str, quarterly_data_hash: str, company_name: str, dcf_data: dict = None) -> dict:
@@ -372,7 +434,16 @@ def cached_independent_forecast(ticker: str, quarterly_data_hash: str, company_n
 @st.cache_data(ttl=3600, show_spinner=False)
 def cached_financials(ticker: str) -> tuple:
     """Cached version of get_financials."""
-    return get_financials(ticker)
+    fallback = (pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
+    result = _call_with_timeout(
+        get_financials,
+        ticker,
+        timeout_seconds=FINANCIALS_TIMEOUT_SECONDS,
+        fallback=fallback,
+    )
+    if not isinstance(result, tuple) or len(result) != 4:
+        return fallback
+    return result
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def cached_latest_date_info(ticker: str) -> dict:
@@ -385,7 +456,11 @@ def cached_financial_snapshot(ticker: str, suggestion_algo_version: str = "v2"):
     _ = suggestion_algo_version  # cache-key salt for suggestion logic revisions
     try:
         adapter = DataAdapter(ticker)
-        snapshot = adapter.fetch()
+        snapshot = _call_with_timeout(
+            adapter.fetch,
+            timeout_seconds=SNAPSHOT_TIMEOUT_SECONDS,
+            fallback=None,
+        )
         return snapshot
     except Exception:
         return None
@@ -411,6 +486,8 @@ def run_dcf_analysis(ticker: str, wacc: float = None, fcf_growth: float = None,
         assumptions.terminal_multiple_scenario = terminal_scenario
         if terminal_scenario == "custom" and custom_multiple is not None:
             assumptions.exit_multiple = custom_multiple
+        assumptions.cashflow_discount_policy = "adaptive"
+        assumptions.proxy_risk_premium_pct = 1.0
         
         engine = DCFEngine(snapshot, assumptions)
         engine_result = engine.run()
@@ -499,6 +576,187 @@ def _show_dcf_details_page():
             except ValueError:
                 return None
         return None
+
+    def _format_trace_chat_response(raw_text: str) -> str:
+        """Normalize model output into a consistent, readable structure."""
+        if not isinstance(raw_text, str) or not raw_text.strip():
+            return (
+                "**Answer:** Unable to generate a structured response.\n\n"
+                "**Value:** N/A\n\n"
+                "**Formula Path:** N/A\n\n"
+                "**Source Path:** N/A"
+            )
+
+        cleaned = raw_text.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", cleaned)
+            cleaned = re.sub(r"\s*```$", "", cleaned)
+            cleaned = cleaned.strip()
+
+        parsed = None
+        try:
+            parsed = json.loads(cleaned)
+        except Exception:
+            start = cleaned.find("{")
+            end = cleaned.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                try:
+                    parsed = json.loads(cleaned[start:end + 1])
+                except Exception:
+                    parsed = None
+
+        if isinstance(parsed, dict):
+            direct_answer = str(parsed.get("direct_answer") or parsed.get("answer") or "").strip()
+            value_text = str(parsed.get("value") or "").strip()
+            formula_text = str(parsed.get("formula_path") or parsed.get("formula") or "").strip()
+            source_text = str(parsed.get("source_path") or parsed.get("source") or "").strip()
+        else:
+            lines = [ln.strip() for ln in cleaned.splitlines() if ln.strip()]
+            direct_answer = lines[0] if lines else cleaned
+
+            value_match = re.search(r"(?i)\bValue:\s*(.+)", cleaned)
+            formula_match = re.search(r"(?i)\bFormula(?:\s*path)?:\s*(.+)", cleaned)
+            source_match = re.search(r"(?i)\bSource(?:\s*path)?:\s*(.+)", cleaned)
+
+            value_text = value_match.group(1).strip() if value_match else ""
+            formula_text = formula_match.group(1).strip() if formula_match else ""
+            source_text = source_match.group(1).strip() if source_match else ""
+
+        if not direct_answer:
+            direct_answer = "Direct answer not provided."
+        if not value_text:
+            value_text = "Not explicitly provided."
+        if not formula_text:
+            formula_text = "Not explicitly provided."
+        if not source_text:
+            source_text = "Not explicitly provided."
+
+        return (
+            f"**Answer:** {direct_answer}\n\n"
+            f"**Value:** {value_text}\n\n"
+            f"**Formula Path:** {formula_text}\n\n"
+            f"**Source Path:** {source_text}"
+        )
+
+    def _sanitize_notice_text(text: str) -> str:
+        """Remove decorative emoji/icons and normalize spacing for professional warning copy."""
+        if not isinstance(text, str):
+            return str(text)
+        cleaned = text.strip()
+        for marker in ["⚠️", "⚠", "🔴", "🟡", "🟠", "🟢", "✅", "❌", "📊", "📈", "📉", "ℹ️", "ℹ"]:
+            cleaned = cleaned.replace(marker, "")
+        cleaned = re.sub(r"^[\s\-\u2022]+", "", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return cleaned
+
+    def _classify_notice(text: str, source_kind: str) -> str:
+        """Classify message severity for grouped display."""
+        if source_kind == "error":
+            return "critical"
+
+        lower = text.lower()
+        critical_tokens = [
+            "fatal",
+            "invalid",
+            "implausible",
+            "framework mixing",
+            "cannot calculate",
+            "terminal growth",
+            "dominates",
+        ]
+        review_tokens = [
+            "very low",
+            "very high",
+            "disagree",
+            "sensitive",
+            "fallback",
+            "approximate",
+            "proxy",
+            "elevated",
+            "defaulted",
+            "missing",
+            "low ",
+            "high ",
+        ]
+
+        if any(token in lower for token in critical_tokens):
+            return "critical"
+        if any(token in lower for token in review_tokens):
+            return "review"
+        return "info"
+
+    def _estimate_quota_reset_text(error_text: str) -> str:
+        """Estimate next usable time from rate-limit text; fall back to next daily reset estimate."""
+        text = str(error_text or "")
+        lower = text.lower()
+
+        retry_seconds = None
+        retry_patterns = [
+            r"retry in\s+(\d+)\s*(?:seconds|secs|sec|s)\b",
+            r"try again in\s+(\d+)\s*(?:seconds|secs|sec|s)\b",
+            r"retry_delay[^\d]{0,20}(\d+)",
+            r"seconds[\"']?\s*:\s*(\d+)",
+        ]
+        for pattern in retry_patterns:
+            match = re.search(pattern, lower)
+            if match:
+                try:
+                    retry_seconds = int(match.group(1))
+                    break
+                except Exception:
+                    pass
+
+        if retry_seconds is not None and retry_seconds > 0:
+            retry_dt_utc = datetime.now(timezone.utc) + timedelta(seconds=retry_seconds)
+            retry_local = retry_dt_utc.astimezone()
+            return retry_local.strftime("%b %d, %Y %I:%M %p %Z")
+
+        # Quota resets are provider-plan dependent; this is an explicit estimate.
+        try:
+            pt = ZoneInfo("America/Los_Angeles")
+            now_pt = datetime.now(pt)
+            next_reset_pt = (now_pt + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            return next_reset_pt.strftime("%b %d, %Y %I:%M %p PT (estimated)")
+        except Exception:
+            return "next daily quota reset (estimated)"
+
+    def _format_chat_runtime_message(raw_text: str) -> str:
+        """Create user-facing assistant status when API/chat call fails."""
+        message = str(raw_text or "").strip()
+        lower = message.lower()
+        if lower.startswith("chat error:"):
+            message = message.split(":", 1)[1].strip()
+            lower = message.lower()
+        elif lower.startswith("error:"):
+            message = message.split(":", 1)[1].strip()
+            lower = message.lower()
+
+        quota_markers = [
+            "resource_exhausted",
+            "quota",
+            "rate limit",
+            "too many requests",
+            "429",
+        ]
+        if any(marker in lower for marker in quota_markers):
+            reset_text = _estimate_quota_reset_text(message)
+            return (
+                "**Assistant temporarily unavailable (API request limit reached).**\n\n"
+                f"**Estimated retry/reset time:** {reset_text}\n\n"
+                "The DCF tables and trace above are still available for manual verification."
+            )
+
+        if "api key" in lower:
+            return (
+                "**Assistant unavailable (API key missing or invalid).**\n\n"
+                "Set `GEMINI_API_KEY` and rerun."
+            )
+
+        return (
+            "**Assistant unavailable right now.**\n\n"
+            f"**Details:** {message}\n\n"
+            "You can still inspect the trace and source tables above."
+        )
 
     st.caption("Sequential view of inputs, assumptions, calculations, and outputs.")
 
@@ -599,29 +857,184 @@ def _show_dcf_details_page():
             "Where Used": "Shape of year-by-year growth path",
         },
     ]
+    if snapshot:
+        wacc_components = getattr(snapshot, "wacc_components", {}) or {}
+        if wacc_components.get("wacc_mode_label"):
+            assumption_rows.insert(2, {
+                "Assumption": "WACC Mode",
+                "Value": str(wacc_components.get("wacc_mode_label")),
+                "Where Used": "Interpretation confidence for discount-rate construction",
+            })
     st.dataframe(pd.DataFrame(assumption_rows), use_container_width=True, hide_index=True)
 
     if snapshot:
-        beta = _to_float(getattr(getattr(snapshot, "beta", None), "value", None))
-        risk_free_rate = _to_float(getattr(snapshot, "risk_free_rate", None))
-        market_risk_premium = 0.05
-        rf_source = getattr(snapshot, "rf_source", "10-Year Treasury")
-
-        capm_rows = [
-            {"Input": "Risk-Free Rate", "Value": _fmt_rate(risk_free_rate), "Source": rf_source},
-            {"Input": "Market Risk Premium", "Value": _fmt_rate(market_risk_premium), "Source": "Damodaran implied ERP"},
-            {"Input": "Beta", "Value": _fmt_number(beta, 2), "Source": "Yahoo Finance (5Y monthly)"},
-        ]
-
-        st.markdown("#### CAPM Inputs")
-        st.dataframe(pd.DataFrame(capm_rows), use_container_width=True, hide_index=True)
-
-        if risk_free_rate is not None and beta is not None:
-            cost_of_equity = risk_free_rate + beta * market_risk_premium
-            st.caption(
-                "CAPM: Cost of Equity = Rf + Beta * ERP = "
-                f"{_fmt_rate(risk_free_rate)} + {_fmt_number(beta, 2)} * {_fmt_rate(market_risk_premium)} = {_fmt_rate(cost_of_equity)}"
+        wacc_components = getattr(snapshot, "wacc_components", {}) or {}
+        if wacc_components:
+            wacc_mode = wacc_components.get("wacc_mode", "")
+            wacc_mode_label = wacc_components.get("wacc_mode_label", "Component-based WACC estimate")
+            wacc_confidence = str(wacc_components.get("wacc_confidence", "n/a")).title()
+            mode_explanations = {
+                "full_wacc_observed_debt": "Debt cost is directly inferred from interest expense and debt basis.",
+                "estimated_wacc_debt_fallback": "Debt cost uses a synthetic spread fallback where observed debt cost is unreliable.",
+                "coe_only_proxy_no_debt": "No debt was detected, so discount rate collapses to cost of equity.",
+                "coe_only_proxy_financial_sector": "Financial-sector guardrail is active; CoE proxy is used instead of standard WACC.",
+            }
+            st.markdown("#### WACC Trace")
+            st.info(
+                "Forward WACC is inherently estimated from observable inputs (it is not directly observable as a single live metric). "
+                f"{wacc_mode_label} (confidence: {wacc_confidence}). "
+                f"{mode_explanations.get(wacc_mode, 'Discount rate is built from component inputs with explicit source labels.')}"
             )
+
+            rf = _to_float(wacc_components.get("risk_free_rate"))
+            erp = _to_float(wacc_components.get("market_risk_premium"))
+            beta = _to_float(wacc_components.get("beta"))
+            cost_of_equity_rate = _to_float(wacc_components.get("cost_of_equity"))
+            rd = _to_float(wacc_components.get("cost_of_debt_pre_tax"))
+            rd_after_tax = _to_float(wacc_components.get("cost_of_debt_after_tax"))
+            tax_rate = _to_float(wacc_components.get("tax_rate"))
+            we = _to_float(wacc_components.get("equity_weight"))
+            wd = _to_float(wacc_components.get("debt_weight"))
+
+            rd_mode = wacc_components.get("rd_mode")
+            rd_observed_raw = _to_float(wacc_components.get("rd_observed_raw"))
+            debt_basis_value = _to_float(wacc_components.get("debt_basis_value"))
+            equity_value_used = _to_float(wacc_components.get("equity_value_used"))
+            total_debt = _to_float(wacc_components.get("total_debt"))
+            ttm_interest_expense = _to_float(getattr(getattr(snapshot, "ttm_interest_expense", None), "value", None))
+            suggested_wacc_value = _to_float(getattr(getattr(snapshot, "suggested_wacc", None), "value", None))
+
+            capm_formula = "Re = Rf + beta * ERP"
+            if all(v is not None for v in [rf, erp, beta, cost_of_equity_rate]):
+                capm_formula = (
+                    f"Re = {rf*100:.2f}% + {beta:.2f} * {erp*100:.2f}% = {cost_of_equity_rate*100:.2f}%"
+                )
+
+            if rd_mode == "observed":
+                rd_formula = "Rd = Interest Expense / Debt Basis"
+                if all(v is not None for v in [ttm_interest_expense, debt_basis_value, rd_observed_raw]):
+                    rd_formula = (
+                        f"Rd = {_fmt_money(ttm_interest_expense)} / {_fmt_money(debt_basis_value)}"
+                        f" = {rd_observed_raw*100:.2f}%"
+                    )
+            elif rd_mode == "synthetic_fallback":
+                rd_formula = "Rd = Rf + synthetic spread fallback"
+                if all(v is not None for v in [rf, rd]):
+                    spread = rd - rf
+                    rd_formula = f"Rd = {rf*100:.2f}% + {spread*100:.2f}% = {rd*100:.2f}%"
+            elif rd_mode == "no_debt":
+                rd_formula = "No debt detected -> Rd branch is not used"
+            else:
+                rd_formula = "Rd path unavailable"
+
+            rd_after_tax_formula = "Rd_after_tax = Rd * (1 - T)"
+            if all(v is not None for v in [rd, tax_rate, rd_after_tax]):
+                rd_after_tax_formula = (
+                    f"Rd_after_tax = {rd*100:.2f}% * (1 - {tax_rate*100:.2f}%) = {rd_after_tax*100:.2f}%"
+                )
+
+            weight_formula = "We = E / (E + D), Wd = D / (E + D)"
+            if all(v is not None for v in [equity_value_used, total_debt]) and (equity_value_used + total_debt) > 0:
+                weight_formula = (
+                    f"We = {_fmt_money(equity_value_used)} / ({_fmt_money(equity_value_used)} + {_fmt_money(total_debt)})"
+                    f" = {((we or 0.0) * 100):.2f}%, "
+                    f"Wd = {_fmt_money(total_debt)} / ({_fmt_money(equity_value_used)} + {_fmt_money(total_debt)})"
+                    f" = {((wd or 0.0) * 100):.2f}%"
+                )
+
+            if wacc_mode in {"coe_only_proxy_no_debt", "coe_only_proxy_financial_sector"}:
+                final_formula = "Discount rate = Re (CoE proxy mode)"
+                if cost_of_equity_rate is not None and suggested_wacc_value is not None:
+                    final_formula = f"Discount rate = Re = {cost_of_equity_rate*100:.2f}%"
+            else:
+                final_formula = "WACC = We * Re + Wd * Rd_after_tax"
+                if all(v is not None for v in [we, cost_of_equity_rate, wd, rd_after_tax, suggested_wacc_value]):
+                    final_formula = (
+                        f"WACC = {we*100:.2f}% * {cost_of_equity_rate*100:.2f}% + {wd*100:.2f}% * {rd_after_tax*100:.2f}%"
+                        f" = {suggested_wacc_value*100:.2f}%"
+                    )
+
+            wacc_trace_rows = [
+                {
+                    "Step": "1. CAPM Inputs",
+                    "Formula / Calculation": (
+                        f"Rf={_fmt_rate(rf)}, ERP={_fmt_rate(erp)}, beta={_fmt_number(beta, 2)}"
+                    ),
+                    "Result": "Inputs loaded",
+                    "Source": f"{wacc_components.get('rf_source', '10Y Treasury')} + Damodaran + Yahoo",
+                },
+                {
+                    "Step": "2. Cost of Equity",
+                    "Formula / Calculation": capm_formula,
+                    "Result": _fmt_rate(cost_of_equity_rate),
+                    "Source": wacc_components.get("cost_of_equity_source", "CAPM"),
+                },
+                {
+                    "Step": "3. Cost of Debt (pre-tax)",
+                    "Formula / Calculation": rd_formula,
+                    "Result": _fmt_rate(rd),
+                    "Source": wacc_components.get("debt_cost_source", "N/A"),
+                },
+                {
+                    "Step": "4. Cost of Debt (after-tax)",
+                    "Formula / Calculation": rd_after_tax_formula,
+                    "Result": _fmt_rate(rd_after_tax),
+                    "Source": "Tax-adjusted debt cost",
+                },
+                {
+                    "Step": "5. Capital Structure Weights",
+                    "Formula / Calculation": weight_formula,
+                    "Result": f"We={_fmt_rate(we)}, Wd={_fmt_rate(wd)}",
+                    "Source": wacc_components.get("weights_source", "N/A"),
+                },
+                {
+                    "Step": "6. Final Discount Rate",
+                    "Formula / Calculation": final_formula,
+                    "Result": _fmt_rate(suggested_wacc_value),
+                    "Source": wacc_mode_label,
+                },
+            ]
+            st.dataframe(pd.DataFrame(wacc_trace_rows), use_container_width=True, hide_index=True)
+
+            wacc_rows = [
+                {"Component": "WACC Mode", "Value": str(wacc_mode_label), "Source": "Method classification"},
+                {"Component": "WACC Confidence", "Value": wacc_confidence, "Source": "Data quality and fallback diagnostics"},
+                {"Component": "Debt Basis", "Value": _fmt_money(debt_basis_value), "Source": wacc_components.get("debt_basis_source", "N/A")},
+                {"Component": "Tax Rate (T)", "Value": _fmt_rate(tax_rate), "Source": "Income statement / fallback"},
+            ]
+            st.markdown("#### WACC Component Sources")
+            st.dataframe(pd.DataFrame(wacc_rows), use_container_width=True, hide_index=True)
+
+            rd_guardrail_note = wacc_components.get("rd_guardrail_note")
+            if rd_guardrail_note:
+                st.caption(f"Rd guardrail: {rd_guardrail_note}")
+        else:
+            beta = _to_float(getattr(getattr(snapshot, "beta", None), "value", None))
+            risk_free_rate = _to_float(getattr(snapshot, "risk_free_rate", None))
+            market_risk_premium = 0.05
+            rf_source_raw = getattr(snapshot, "rf_source", None)
+            rf_source = str(rf_source_raw).strip() if rf_source_raw is not None else ""
+            legacy_rf_fallback = False
+            if risk_free_rate is None:
+                risk_free_rate = 0.045
+                legacy_rf_fallback = True
+            if not rf_source or rf_source.lower() in {"none", "n/a", "na"}:
+                rf_source = (
+                    "Fallback default (legacy cache snapshot)"
+                    if legacy_rf_fallback
+                    else "10-Year Treasury"
+                )
+
+            capm_rows = [
+                {"Input": "Risk-Free Rate (Rf)", "Value": _fmt_rate(risk_free_rate), "Source": rf_source},
+                {"Input": "Equity Risk Premium (ERP)", "Value": _fmt_rate(market_risk_premium), "Source": "Damodaran implied ERP"},
+                {"Input": "Beta (beta)", "Value": _fmt_number(beta, 2), "Source": "Yahoo Finance (5Y monthly)"},
+            ]
+
+            st.markdown("#### Discount Rate Inputs")
+            st.dataframe(pd.DataFrame(capm_rows), use_container_width=True, hide_index=True)
+            if legacy_rf_fallback:
+                st.caption("This run came from older cached data missing Rf metadata. Using a 4.5% fallback here; rerun DCF to restore full WACC trace.")
 
     st.markdown("### 3. Forecast and Present Value")
     fcff_method = assumptions.get("fcff_method")
@@ -907,21 +1320,55 @@ def _show_dcf_details_page():
     errors = [err for err in ui_data.get("errors", []) if err]
     warnings = [warn for warn in ui_data.get("warnings", []) if warn]
     diagnostics = [diag for diag in ui_data.get("diagnostics", []) if diag]
+    grouped_notices = {"critical": [], "review": [], "info": []}
+    seen_notices = set()
 
-    if errors:
-        st.error("Errors")
-        for err in errors:
-            st.markdown(f"- {err}")
-    if warnings:
-        st.warning("Warnings")
-        for warn in warnings:
-            st.markdown(f"- {warn}")
-    if diagnostics:
-        st.info("Diagnostics")
-        for diag in diagnostics:
-            st.markdown(f"- {diag}")
-    if not errors and not warnings and not diagnostics:
-        st.caption("No errors or warnings were returned for this run.")
+    for message in errors:
+        cleaned = _sanitize_notice_text(message)
+        key = ("critical", cleaned)
+        if cleaned and key not in seen_notices:
+            grouped_notices["critical"].append(cleaned)
+            seen_notices.add(key)
+
+    for message in warnings:
+        cleaned = _sanitize_notice_text(message)
+        severity = _classify_notice(cleaned, "warning")
+        key = (severity, cleaned)
+        if cleaned and key not in seen_notices:
+            grouped_notices[severity].append(cleaned)
+            seen_notices.add(key)
+
+    for message in diagnostics:
+        cleaned = _sanitize_notice_text(message)
+        severity = _classify_notice(cleaned, "diagnostic")
+        key = (severity, cleaned)
+        if cleaned and key not in seen_notices:
+            grouped_notices[severity].append(cleaned)
+            seen_notices.add(key)
+
+    total_notices = sum(len(items) for items in grouped_notices.values())
+    if total_notices > 0:
+        c_count = len(grouped_notices["critical"])
+        r_count = len(grouped_notices["review"])
+        i_count = len(grouped_notices["info"])
+        st.caption(f"Organized by severity: Critical {c_count} | Review {r_count} | Info {i_count}")
+
+        if grouped_notices["critical"]:
+            st.error("Critical Checks")
+            for idx, item in enumerate(grouped_notices["critical"], start=1):
+                st.markdown(f"{idx}. {item}")
+
+        if grouped_notices["review"]:
+            st.warning("Review Items")
+            for idx, item in enumerate(grouped_notices["review"], start=1):
+                st.markdown(f"{idx}. {item}")
+
+        if grouped_notices["info"]:
+            st.info("Model Notes")
+            for idx, item in enumerate(grouped_notices["info"], start=1):
+                st.markdown(f"{idx}. {item}")
+    else:
+        st.caption("No warnings or diagnostics were returned for this run.")
 
     if trace_steps:
         trace_rows = []
@@ -940,11 +1387,11 @@ def _show_dcf_details_page():
             trace_rows.append(
                 {
                     "Step #": idx,
-                    "Name": step.get("name", "N/A"),
+                    "Name": _sanitize_notice_text(step.get("name", "N/A") or "N/A"),
                     "Formula": step.get("formula", "N/A") or "N/A",
                     "Input Keys": input_keys,
                     "Output": output_text,
-                    "Notes": step.get("notes", "N/A") or "N/A",
+                    "Notes": _sanitize_notice_text(step.get("notes", "N/A") or "N/A"),
                 }
             )
         st.dataframe(pd.DataFrame(trace_rows), use_container_width=True, hide_index=True)
@@ -971,9 +1418,247 @@ def _show_dcf_details_page():
         mime="application/json",
     )
 
+    st.markdown("---")
+    st.markdown(
+        '<div class="qa-chatbot-hero"><span class="qa-chatbot-pill">Q&A Chatbot</span></div>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Ask where any number came from. Answers are grounded in this run's inputs, assumptions, "
+        "WACC components, projections, and trace steps."
+    )
+
+    details_ticker = _normalize_ticker(
+        st.session_state.get("ticker") or getattr(snapshot, "ticker", "UNKNOWN")
+    ) or "UNKNOWN"
+    details_chat_key = f"dcf_details_chat_history_{details_ticker}"
+    details_chat_input_key = f"dcf_details_chat_input_{details_ticker}"
+
+    if details_chat_key not in st.session_state or not isinstance(st.session_state[details_chat_key], list):
+        st.session_state[details_chat_key] = []
+
+    chat_history = st.session_state[details_chat_key]
+
+    col_chat_meta, col_chat_clear = st.columns([4, 1])
+    with col_chat_meta:
+        st.caption("Assistant responses can make mistakes. Verify against the trace and source columns.")
+    with col_chat_clear:
+        if st.button("Clear Q&A", key=f"clear_{details_chat_key}"):
+            st.session_state[details_chat_key] = []
+            st.rerun()
+
+    for msg in chat_history[-10:]:
+        role = msg.get("role", "assistant")
+        content = msg.get("content", "")
+        with st.chat_message(role):
+            st.markdown(content)
+
+    user_question = ""
+    submitted = False
+    with st.form(key=f"dcf_details_chat_form_{details_ticker}", clear_on_submit=True):
+        user_question = st.text_input(
+            "Ask a clarification question",
+            placeholder="Example: Why is PV(TV) 47.8% of EV? Where does Rd come from?",
+            key=details_chat_input_key,
+            label_visibility="collapsed",
+        )
+        submitted = st.form_submit_button("Ask")
+
+    if submitted and user_question:
+        context_packet = {
+            "ticker": details_ticker,
+            "company_name": getattr(snapshot, "company_name", None) if snapshot else None,
+            "inputs_table": input_table,
+            "assumptions_table": assumption_rows,
+            "growth_summary": growth_summary_rows,
+            "results": {
+                "enterprise_value": ev,
+                "equity_value": equity,
+                "price_per_share": price_per_share,
+                "pv_fcf_sum": pv_fcf_sum,
+                "pv_terminal_value": pv_tv,
+                "terminal_value_yearN": terminal_value_yearN,
+                "net_debt": net_debt,
+                "shares_outstanding": shares_outstanding,
+                "implied_fcf_yield": ui_data.get("implied_fcf_yield"),
+                "implied_ev_fcf": ui_data.get("implied_ev_fcf"),
+                "discount_rate_used": assumptions.get("discount_rate_used"),
+                "wacc_input": assumptions.get("wacc"),
+                "terminal_growth_rate": assumptions.get("terminal_growth_rate"),
+            },
+            "wacc_components": getattr(snapshot, "wacc_components", {}) if snapshot else {},
+            "projection_rows": projection_rows[:40],
+            "terminal_rows": terminal_rows,
+            "bridge_rows": bridge_rows,
+            "reconciliation_rows": reconciliation_rows,
+            "trace_steps": trace_steps[:120],
+        }
+
+        context_data = json.dumps(context_packet, indent=2, default=str)
+        trace_prompt = (
+            "User question: " + user_question + "\n\n"
+            "Answer rules:\n"
+            "1) Use only the provided DCF context.\n"
+            "2) Return ONLY valid JSON (no markdown, no prose outside JSON) with this exact schema:\n"
+            "{\n"
+            "  \"direct_answer\": \"one-sentence direct answer\",\n"
+            "  \"value\": \"specific numeric value(s) used\",\n"
+            "  \"formula_path\": \"equation or calculation chain\",\n"
+            "  \"source_path\": \"table/field/trace step names and source labels\"\n"
+            "}\n"
+            "3) If missing, be explicit and provide nearest available fields in source_path.\n"
+            "4) Do not provide investment advice.\n"
+        )
+
+        prior_history = [m for m in chat_history if isinstance(m, dict) and m.get("role") in {"user", "assistant"}]
+
+        with st.chat_message("user"):
+            st.markdown(user_question)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Tracing value..."):
+                assistant_raw = run_chat(prior_history, trace_prompt, context_data)
+                raw_lower = str(assistant_raw or "").lower()
+                if raw_lower.startswith("chat error:") or raw_lower.startswith("error:"):
+                    assistant_reply = _format_chat_runtime_message(assistant_raw)
+                else:
+                    assistant_reply = _format_trace_chat_response(assistant_raw)
+            st.markdown(assistant_reply)
+
+        st.session_state[details_chat_key].append({"role": "user", "content": user_question})
+        st.session_state[details_chat_key].append({"role": "assistant", "content": assistant_reply})
+
     st.divider()
     if st.button("<- Back to Summary", key="back_from_details_bottom"):
         st.session_state.show_dcf_details = False
+        st.rerun()
+
+
+def _show_user_guide_page():
+    """Render standalone user guide so the main analysis page stays uncluttered."""
+    st.markdown("---")
+    st.markdown(
+        '<div class="section-header"><span class="step-badge">Guide</span><span class="section-title">User Guide</span></div>',
+        unsafe_allow_html=True,
+    )
+    st.caption("How to run the workflow, interpret outputs, and avoid common mistakes.")
+
+    if st.button("<- Back to Analysis", key="back_from_user_guide_top"):
+        st.session_state.show_user_guide = False
+        st.rerun()
+
+    st.markdown(
+        """
+<div class="guide-shell">
+  <div class="guide-hero">
+    <div>
+      <div class="guide-kicker">Instruction Manual</div>
+      <div class="guide-hero-title">How to Use Analyst Co-Pilot</div>
+      <div class="guide-hero-sub">Use this workflow to go from raw financials to assumption-based valuation decisions with full traceability.</div>
+    </div>
+    <div class="guide-hero-chip">Research Workflow</div>
+  </div>
+</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    col_qs, col_pw = st.columns(2)
+    with col_qs:
+        st.markdown(
+            """
+<div class="guide-card">
+  <div class="guide-card-title">Quick Start</div>
+  <ol class="guide-list guide-list-numbered">
+    <li>Open the sidebar and choose a ticker.</li>
+    <li>Select ending report date and historical quarter count.</li>
+    <li>Click <code>Load Data</code>.</li>
+    <li>In <code>Step 02</code>, set assumptions and run <code>Run DCF Analysis</code>.</li>
+    <li>Review <code>Step 01</code> through <code>Step 06</code> in order.</li>
+    <li>Generate <code>Step 05</code> AI Synthesis after DCF is complete.</li>
+  </ol>
+</div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with col_pw:
+        st.markdown(
+            """
+<div class="guide-card">
+  <div class="guide-card-title">Practical Workflow</div>
+  <ol class="guide-list guide-list-numbered">
+    <li>Start from suggested assumptions for a base case.</li>
+    <li>Create bull/base/bear scenarios by changing one input at a time.</li>
+    <li>Check whether the conclusion survives realistic ranges.</li>
+    <li>Use <code>View DCF Details</code> to audit formulas and lineage.</li>
+  </ol>
+</div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    st.markdown(
+        """
+<div class="guide-card">
+  <div class="guide-card-title">Step Map</div>
+  <div class="guide-step-grid">
+    <div class="guide-step-row"><span class="guide-step-pill">Step 01</span><div><div class="guide-step-name">Investment Verdict</div><div class="guide-step-desc">Primary valuation call from current assumptions.</div></div></div>
+    <div class="guide-step-row"><span class="guide-step-pill">Step 02</span><div><div class="guide-step-name">Valuation Drivers</div><div class="guide-step-desc">Input controls, model reruns, and core valuation outputs.</div></div></div>
+    <div class="guide-step-row"><span class="guide-step-pill">Step 03</span><div><div class="guide-step-name">Business Momentum</div><div class="guide-step-desc">Historical trend context for operating performance.</div></div></div>
+    <div class="guide-step-row"><span class="guide-step-pill">Step 04</span><div><div class="guide-step-name">Street Context</div><div class="guide-step-desc">Analyst expectations and target distribution context.</div></div></div>
+    <div class="guide-step-row"><span class="guide-step-pill">Step 05</span><div><div class="guide-step-name">AI Synthesis</div><div class="guide-step-desc">Narrative interpretation grounded in model + market inputs.</div></div></div>
+    <div class="guide-step-row"><span class="guide-step-pill">Step 06</span><div><div class="guide-step-name">Sources & Methodology</div><div class="guide-step-desc">Reference links and method notes for verification.</div></div></div>
+  </div>
+</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    col_rules, col_dq = st.columns(2)
+    with col_rules:
+        st.markdown(
+            """
+<div class="guide-card">
+  <div class="guide-card-title">DCF Interpretation Rules</div>
+  <ul class="guide-list">
+    <li>Intrinsic value is model-implied under assumptions, not a guaranteed level.</li>
+    <li>Terminal assumptions can dominate EV, so monitor <code>TV Dominance</code>.</li>
+    <li>Gordon Growth is usually default for mature steady-state cases.</li>
+    <li>Exit Multiple can be used adaptively for high-growth or punitive Gordon outcomes.</li>
+    <li>Interpret results through sensitivity, not a single point estimate.</li>
+  </ul>
+</div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with col_dq:
+        st.markdown(
+            """
+<div class="guide-card">
+  <div class="guide-card-title">Data Quality and Common Mistakes</div>
+  <ul class="guide-list">
+    <li>Treat <code>Data Quality</code> as a confidence lens, not pass/fail.</li>
+    <li>Lower reliability can materially shift valuation conclusions.</li>
+    <li>Avoid setting terminal growth too close to or above WACC.</li>
+    <li>Do not compare outputs across dates without reloading context.</li>
+  </ul>
+</div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    st.markdown(
+        """
+<div class="guide-disclaimer-card">
+  <div class="guide-disclaimer-title">Important Disclaimer</div>
+  <div class="guide-disclaimer-text">This tool supports research workflows only. Outputs may contain mistakes and are highly assumption-dependent. It is not investment advice.</div>
+</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if st.button("<- Back to Analysis", key="back_from_user_guide_bottom"):
+        st.session_state.show_user_guide = False
         st.rerun()
 # --- App Configuration ---
 st.set_page_config(
@@ -1546,11 +2231,173 @@ st.markdown("""
         background: var(--clr-bg); border: 1px solid var(--clr-border);
         border-radius: 999px; padding: 4px 10px;
     }
+    .qa-chatbot-hero {
+        margin: 2px 0 8px 0;
+    }
+    .qa-chatbot-pill {
+        display: inline-block;
+        padding: 10px 14px;
+        border-radius: 10px;
+        background: #1d4ed8;
+        border: 1px solid #1e40af;
+        color: #ffffff;
+        font-weight: 700;
+        font-size: 1.02rem;
+        letter-spacing: .02em;
+        box-shadow: 0 2px 10px rgba(29, 78, 216, 0.25);
+    }
+
+    /* User guide page */
+    .guide-shell {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        margin: 10px 0 12px 0;
+    }
+    .guide-hero {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 16px;
+        background: linear-gradient(135deg, #0f172a 0%, #1e3a8a 100%);
+        border: 1px solid #1d4ed8;
+        border-radius: var(--radius-lg);
+        padding: 16px 18px;
+        color: #e2e8f0;
+        box-shadow: var(--shadow-md);
+    }
+    .guide-kicker {
+        font-size: .62rem;
+        font-weight: 700;
+        letter-spacing: .10em;
+        text-transform: uppercase;
+        color: #93c5fd;
+        margin-bottom: 5px;
+    }
+    .guide-hero-title {
+        font-size: 1.2rem;
+        font-weight: 700;
+        letter-spacing: -.01em;
+        color: #f8fafc;
+        margin-bottom: 5px;
+    }
+    .guide-hero-sub {
+        font-size: .83rem;
+        line-height: 1.4;
+        color: #cbd5e1;
+        max-width: 820px;
+    }
+    .guide-hero-chip {
+        border: 1px solid rgba(147, 197, 253, 0.45);
+        background: rgba(148, 163, 184, 0.15);
+        color: #dbeafe;
+        border-radius: 999px;
+        padding: 6px 10px;
+        font-size: .65rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: .06em;
+        white-space: nowrap;
+    }
+    .guide-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 12px;
+    }
+    .guide-card {
+        background: var(--clr-surface);
+        border: 1px solid var(--clr-border);
+        border-radius: var(--radius-md);
+        padding: 14px 16px;
+        box-shadow: var(--shadow-sm);
+    }
+    .guide-card-title {
+        font-size: .72rem;
+        font-weight: 700;
+        color: var(--clr-accent);
+        text-transform: uppercase;
+        letter-spacing: .08em;
+        margin-bottom: 10px;
+    }
+    .guide-list {
+        margin: 0;
+        padding-left: 1.1rem;
+        color: var(--clr-text-secondary);
+        font-size: .84rem;
+        line-height: 1.45;
+    }
+    .guide-list li {
+        margin-bottom: 6px;
+    }
+    .guide-list-numbered li::marker {
+        color: var(--clr-accent);
+        font-weight: 700;
+    }
+    .guide-step-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 10px;
+    }
+    .guide-step-row {
+        display: grid;
+        grid-template-columns: auto 1fr;
+        gap: 10px;
+        align-items: start;
+        border: 1px solid var(--clr-border);
+        background: #f8fafc;
+        border-radius: var(--radius-sm);
+        padding: 9px 10px;
+    }
+    .guide-step-pill {
+        display: inline-block;
+        font-size: .62rem;
+        font-weight: 700;
+        letter-spacing: .08em;
+        text-transform: uppercase;
+        color: var(--clr-accent);
+        background: #dbeafe;
+        border: 1px solid #bfdbfe;
+        border-radius: 999px;
+        padding: 3px 8px;
+        line-height: 1.4;
+    }
+    .guide-step-name {
+        font-size: .82rem;
+        font-weight: 700;
+        color: var(--clr-text-primary);
+        margin-bottom: 2px;
+    }
+    .guide-step-desc {
+        font-size: .78rem;
+        color: var(--clr-text-secondary);
+        line-height: 1.35;
+    }
+    .guide-disclaimer-card {
+        background: #fff7ed;
+        border: 1px solid #fdba74;
+        border-left: 4px solid #f97316;
+        border-radius: var(--radius-md);
+        padding: 12px 14px;
+    }
+    .guide-disclaimer-title {
+        font-size: .66rem;
+        font-weight: 700;
+        letter-spacing: .08em;
+        text-transform: uppercase;
+        color: #9a3412;
+        margin-bottom: 4px;
+    }
+    .guide-disclaimer-text {
+        font-size: .82rem;
+        color: #7c2d12;
+        line-height: 1.35;
+    }
 
     @media (max-width: 1024px) {
         .decision-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
         .floating-toc-wrap { right: 10px; }
         .floating-toc { width: 176px; }
+        .guide-step-grid { grid-template-columns: 1fr; }
     }
     @media (max-width: 640px) {
         .decision-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -1565,6 +2412,10 @@ st.markdown("""
         .hero-divider { display: none; }
         .hero-ticker { width: 100%; text-align: left; }
         .floating-toc-wrap { display: none; }
+        .guide-grid { grid-template-columns: 1fr; }
+        .guide-hero { flex-direction: column; }
+        .guide-hero-chip { align-self: flex-start; }
+        .guide-step-row { grid-template-columns: 1fr; gap: 6px; }
     }
 
     /* Step progress indicator */
@@ -1657,8 +2508,12 @@ if 'dcf_snapshot' not in st.session_state:
     st.session_state.dcf_snapshot = None
 if 'show_dcf_details' not in st.session_state:
     st.session_state.show_dcf_details = False
+if 'show_user_guide' not in st.session_state:
+    st.session_state.show_user_guide = False
 if 'forecast_just_generated' not in st.session_state:
     st.session_state.forecast_just_generated = False
+if 'ai_outlook_error' not in st.session_state:
+    st.session_state.ai_outlook_error = None
 if 'ui_cache' not in st.session_state:
     st.session_state.ui_cache = load_ui_cache()
 if 'ticker_library' not in st.session_state:
@@ -1667,22 +2522,23 @@ if 'last_restore_key' not in st.session_state:
     st.session_state.last_restore_key = None
 if 'cache_restore_notice' not in st.session_state:
     st.session_state.cache_restore_notice = ""
-if 'custom_ticker_input' not in st.session_state:
-    st.session_state.custom_ticker_input = ""
 if 'ticker_dropdown' not in st.session_state:
     last_selected = _normalize_ticker(st.session_state.ui_cache.get("last_selected_ticker", "MSFT"))
     library = st.session_state.ticker_library
     st.session_state.ticker_dropdown = last_selected if last_selected in library else library[0]
 if 'pending_ticker_dropdown' not in st.session_state:
     st.session_state.pending_ticker_dropdown = None
-if 'clear_custom_ticker_input' not in st.session_state:
-    st.session_state.clear_custom_ticker_input = False
+if 'assumption_suggestions_loaded' not in st.session_state:
+    st.session_state.assumption_suggestions_loaded = False
+if 'assumption_suggestions_ticker' not in st.session_state:
+    st.session_state.assumption_suggestions_ticker = None
 
 # --- Helper Functions ---
 def reset_analysis():
     st.session_state.quarterly_analysis = None
     st.session_state.independent_forecast = None
     st.session_state.forecast_just_generated = False
+    st.session_state.ai_outlook_error = None
     st.session_state.cache_restore_notice = ""
     st.session_state.last_restore_key = None
     # Reset DCF assumptions so they get re-calculated for new ticker
@@ -1692,6 +2548,8 @@ def reset_analysis():
     st.session_state.dcf_ui_adapter = None
     st.session_state.dcf_engine_result = None
     st.session_state.dcf_snapshot = None
+    st.session_state.assumption_suggestions_loaded = False
+    st.session_state.assumption_suggestions_ticker = None
 
 def display_stock_call(call: str):
     """Displays the stock call with clean styling."""
@@ -1727,6 +2585,42 @@ def parse_price_value(value):
     text = str(value).replace(",", "").strip()
     match = re.search(r"[-+]?\d*\.?\d+", text)
     return float(match.group(0)) if match else None
+
+def is_quota_or_rate_limit_error(error_text: str) -> bool:
+    text = str(error_text or "").lower()
+    markers = ["resource_exhausted", "quota", "rate limit", "too many requests", "429"]
+    return any(marker in text for marker in markers)
+
+def estimate_api_retry_time(error_text: str) -> str:
+    text = str(error_text or "").lower()
+    retry_seconds = None
+    retry_patterns = [
+        r"retry in\s+(\d+)\s*(?:seconds|secs|sec|s)\b",
+        r"try again in\s+(\d+)\s*(?:seconds|secs|sec|s)\b",
+        r"retry_delay[^\d]{0,20}(\d+)",
+        r"seconds[\"']?\s*:\s*(\d+)",
+    ]
+    for pattern in retry_patterns:
+        match = re.search(pattern, text)
+        if match:
+            try:
+                retry_seconds = int(match.group(1))
+                break
+            except Exception:
+                pass
+
+    if retry_seconds is not None and retry_seconds > 0:
+        retry_dt_utc = datetime.now(timezone.utc) + timedelta(seconds=retry_seconds)
+        return retry_dt_utc.astimezone().strftime("%b %d, %Y %I:%M %p %Z")
+
+    # Provider quota reset timing is plan-dependent; this is an explicit estimate fallback.
+    try:
+        pt = ZoneInfo("America/Los_Angeles")
+        now_pt = datetime.now(pt)
+        next_reset_pt = (now_pt + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        return next_reset_pt.strftime("%b %d, %Y %I:%M %p PT (estimated)")
+    except Exception:
+        return "next daily reset window (estimated)"
 
 def get_valuation_verdict(upside_pct: float):
     """Map upside/downside to verdict label, style class, and short rationale."""
@@ -1794,20 +2688,14 @@ with st.sidebar:
     if pending_dropdown and pending_dropdown in ticker_options:
         st.session_state.ticker_dropdown = pending_dropdown
     st.session_state.pending_ticker_dropdown = None
-    if st.session_state.get("clear_custom_ticker_input"):
-        st.session_state.custom_ticker_input = ""
-        st.session_state.clear_custom_ticker_input = False
 
     if st.session_state.ticker_dropdown not in ticker_options:
         st.session_state.ticker_dropdown = ticker_options[0]
 
     selected_ticker = st.selectbox("Stock Ticker", options=ticker_options, key="ticker_dropdown")
-    st.text_input("Custom Ticker (optional)", key="custom_ticker_input", placeholder="e.g. NFLX")
-    custom_ticker = _normalize_ticker(st.session_state.custom_ticker_input)
-    ticker = custom_ticker if custom_ticker else _normalize_ticker(selected_ticker)
+
+    ticker = _normalize_ticker(selected_ticker)
     ticker_valid = _is_valid_ticker_format(ticker)
-    if custom_ticker and not ticker_valid:
-        st.warning("Custom ticker format invalid. Use letters/numbers, up to 10 chars.")
 
     # Date-fetch state
     if "available_dates" not in st.session_state:
@@ -1816,30 +2704,35 @@ with st.sidebar:
         st.session_state.available_dates_ticker = None
     if "selected_end_date" not in st.session_state:
         st.session_state.selected_end_date = None
+    if "report_dates_hint" not in st.session_state:
+        st.session_state.report_dates_hint = ""
 
-    # Refresh cached dates when ticker changes
+    # Reset date state when ticker changes (non-blocking; no network call here)
     if ticker_valid and ticker != st.session_state.available_dates_ticker:
         st.session_state.available_dates_ticker = ticker
+        st.session_state.available_dates = []
         st.session_state.selected_end_date = None
-        with st.spinner(f"Fetching available reports for {ticker}..."):
-            st.session_state.available_dates = cached_available_dates(ticker)
-            if st.session_state.available_dates:
-                st.session_state.selected_end_date = st.session_state.available_dates[0]["value"]
-            else:
-                st.session_state.selected_end_date = None
+        st.session_state.report_dates_hint = "Click 'Fetch Available Reports' to load available quarter end dates."
     elif not ticker_valid:
         st.session_state.available_dates_ticker = None
         st.session_state.available_dates = []
         st.session_state.selected_end_date = None
+        st.session_state.report_dates_hint = ""
 
-    # Initial fetch for first load
-    if ticker_valid and ticker and not st.session_state.available_dates:
-        with st.spinner(f"Fetching available reports for {ticker}..."):
-            st.session_state.available_dates = cached_available_dates(ticker)
+    if ticker_valid:
+        if st.button("Fetch Available Reports", use_container_width=True, key="fetch_available_reports"):
+            with st.spinner(f"Fetching available reports for {ticker}..."):
+                dates = cached_available_dates(ticker)
+            st.session_state.available_dates = dates if isinstance(dates, list) else []
             if st.session_state.available_dates:
                 st.session_state.selected_end_date = st.session_state.available_dates[0]["value"]
+                st.session_state.report_dates_hint = ""
             else:
                 st.session_state.selected_end_date = None
+                st.session_state.report_dates_hint = (
+                    f"No report dates returned within {AVAILABLE_DATES_TIMEOUT_SECONDS}s. "
+                    "Try again, switch ticker, or clear cache."
+                )
 
     available_dates = st.session_state.available_dates
     selected_end_date = st.session_state.selected_end_date
@@ -1849,6 +2742,8 @@ with st.sidebar:
         st.markdown(f"""
             <div class="sidebar-data-badge">Latest Data: {latest_date}</div>
         """, unsafe_allow_html=True)
+    elif ticker_valid:
+        st.caption(st.session_state.report_dates_hint or "No report dates loaded yet.")
     
     # Analysis Period selection
     st.markdown("**Analysis Period**")
@@ -1914,68 +2809,87 @@ with st.sidebar:
             st.error("API key not found. Add `GEMINI_API_KEY=your_key` to `.env` file and restart.")
         elif not ticker_valid:
             st.warning("Please enter/select a valid ticker symbol.")
-        elif not selected_end_date:
-            st.warning("Please select a valid ticker and ending report.")
         else:
-            with st.spinner(f"Loading {ticker}..."):
-                inc, bal, cf, qcf = cached_financials(ticker)
-                if not inc.empty:
-                    st.session_state.financials = {"income": inc, "balance": bal, "cashflow": cf, "quarterly_cashflow": qcf}
-                    st.session_state.ticker = ticker
-                    st.session_state.metrics = calculate_metrics(inc, bal)
-                    st.session_state.num_quarters = num_quarters
-                    st.session_state.end_date = selected_end_date
-                    reset_analysis()
-
-                    # Persist last selected ticker and add successful custom ticker to library
-                    cache = st.session_state.get("ui_cache", _default_ui_cache())
-                    cache["last_selected_ticker"] = ticker
-                    st.session_state.ui_cache = cache
-                    save_ui_cache(cache)
-                    if custom_ticker and ticker == custom_ticker:
-                        _upsert_ticker_in_library(ticker)
-                        st.session_state.pending_ticker_dropdown = ticker
-                        st.session_state.clear_custom_ticker_input = True
-
-                    # Auto-run quarterly analysis (cached) with user-selected end date
-                    analysis = cached_quarterly_analysis(ticker, num_quarters, selected_end_date)
-                    st.session_state.quarterly_analysis = analysis
-                    # Calculate comprehensive analysis (DuPont + DCF)
-                    quarterly_data = analysis.get("historical_trends", {}).get("quarterly_data", [])
-                    st.session_state.comprehensive_analysis = calculate_comprehensive_analysis(
-                        inc,
-                        bal,
-                        quarterly_data,
-                        ticker,
-                        cf,
-                        qcf
+            if not selected_end_date:
+                with st.spinner(f"Fetching available reports for {ticker}..."):
+                    dates = cached_available_dates(ticker)
+                st.session_state.available_dates = dates if isinstance(dates, list) else []
+                if st.session_state.available_dates:
+                    st.session_state.selected_end_date = st.session_state.available_dates[0]["value"]
+                    selected_end_date = st.session_state.selected_end_date
+                    st.session_state.report_dates_hint = ""
+                else:
+                    st.session_state.selected_end_date = None
+                    selected_end_date = None
+                    st.session_state.report_dates_hint = (
+                        f"No report dates returned within {AVAILABLE_DATES_TIMEOUT_SECONDS}s. "
+                        "Try again, switch ticker, or clear cache."
                     )
 
-                    # Restore cached per-context DCF / AI outputs (if available)
-                    restored = _restore_cached_results_for_context(ticker, selected_end_date, num_quarters)
-                    if restored["dcf"] or restored["ai"]:
-                        restored_parts = []
-                        if restored["dcf"]:
-                            restored_parts.append("DCF")
-                        if restored["ai"]:
-                            restored_parts.append("AI outlook")
-                        restore_message = f"Restored cached {' + '.join(restored_parts)} for {ticker} ({selected_end_date}, {num_quarters}Q)."
-                        st.session_state.cache_restore_notice = restore_message
+            if not selected_end_date:
+                st.warning("Please fetch/select a valid ending report date first.")
+            else:
+                with st.spinner(f"Loading {ticker}..."):
+                    inc, bal, cf, qcf = cached_financials(ticker)
+                    if not inc.empty:
+                        st.session_state.financials = {"income": inc, "balance": bal, "cashflow": cf, "quarterly_cashflow": qcf}
+                        st.session_state.ticker = ticker
+                        st.session_state.metrics = calculate_metrics(inc, bal)
+                        st.session_state.num_quarters = num_quarters
+                        st.session_state.end_date = selected_end_date
+                        reset_analysis()
+
+                        # Persist last selected ticker
+                        cache = st.session_state.get("ui_cache", _default_ui_cache())
+                        cache["last_selected_ticker"] = ticker
+                        st.session_state.ui_cache = cache
+                        save_ui_cache(cache)
+
+                        # Auto-run quarterly analysis (cached) with user-selected end date
+                        analysis = cached_quarterly_analysis(ticker, num_quarters, selected_end_date)
+                        st.session_state.quarterly_analysis = analysis
+                        # Calculate comprehensive analysis (DuPont + DCF)
+                        quarterly_data = analysis.get("historical_trends", {}).get("quarterly_data", [])
+                        st.session_state.comprehensive_analysis = calculate_comprehensive_analysis(
+                            inc,
+                            bal,
+                            quarterly_data,
+                            ticker,
+                            cf,
+                            qcf
+                        )
+
+                        # Restore cached per-context DCF / AI outputs (if available)
+                        restored = _restore_cached_results_for_context(ticker, selected_end_date, num_quarters)
+                        if restored["dcf"] or restored["ai"]:
+                            restored_parts = []
+                            if restored["dcf"]:
+                                restored_parts.append("DCF")
+                            if restored["ai"]:
+                                restored_parts.append("AI outlook")
+                            restore_message = f"Restored cached {' + '.join(restored_parts)} for {ticker} ({selected_end_date}, {num_quarters}Q)."
+                            st.session_state.cache_restore_notice = restore_message
+                        else:
+                            st.session_state.cache_restore_notice = ""
+                            st.session_state.last_restore_key = None
+                        
+                        # Show what was loaded
+                        most_recent = analysis.get("historical_trends", {}).get("most_recent_quarter", {})
+                        next_q = analysis.get("next_forecast_quarter", {})
+                        if most_recent.get("label"):
+                            st.success(f"Loaded {ticker} through {most_recent.get('label')}")
+                            if next_q.get("label"):
+                                st.info(f"Forecasting: {next_q.get('label')}")
+                        else:
+                            st.success(f"Loaded {ticker}")
                     else:
-                        st.session_state.cache_restore_notice = ""
-                        st.session_state.last_restore_key = None
-                    
-                    # Show what was loaded
-                    most_recent = analysis.get("historical_trends", {}).get("most_recent_quarter", {})
-                    next_q = analysis.get("next_forecast_quarter", {})
-                    if most_recent.get("label"):
-                        st.success(f"Loaded {ticker} through {most_recent.get('label')}")
-                        if next_q.get("label"):
-                            st.info(f"Forecasting: {next_q.get('label')}")
-                    else:
-                        st.success(f"Loaded {ticker}")
-                else:
-                    st.error("Failed to fetch data.")
+                        st.error("Failed to fetch data.")
+
+    st.divider()
+    st.markdown('<div class="sidebar-section-label">Help</div>', unsafe_allow_html=True)
+    if st.button("Open User Guide", use_container_width=True, key="open_user_guide_sidebar"):
+        st.session_state.show_user_guide = True
+        st.rerun()
     
     # Clear cache button
     st.divider()
@@ -1996,6 +2910,16 @@ st.markdown("""
     <div class="app-tagline">AI-powered equity research assistant</div>
 </div>
 """, unsafe_allow_html=True)
+
+_guide_spacer, _guide_col = st.columns([6, 1])
+with _guide_col:
+    if st.button("User Guide", key="open_user_guide_header", use_container_width=True):
+        st.session_state.show_user_guide = True
+        st.rerun()
+
+if st.session_state.get("show_user_guide"):
+    _show_user_guide_page()
+    st.stop()
 
 if st.session_state.quarterly_analysis:
     analysis = st.session_state.quarterly_analysis
@@ -2301,6 +3225,11 @@ if st.session_state.quarterly_analysis:
             price_gordon = assumptions.get("price_gordon_growth")
             terminal_method = assumptions.get("terminal_value_method", "gordon_growth")
             high_growth_profile = bool(assumptions.get("high_growth_company", False))
+            cashflow_regime = assumptions.get("cashflow_regime")
+            cashflow_confidence = assumptions.get("cashflow_confidence")
+            discount_rate_used = assumptions.get("discount_rate_used")
+            discount_rate_input = assumptions.get("discount_rate_input")
+            discount_rate_label = assumptions.get("discount_rate_label")
 
             upside_downside = None
             verdict_label = "Pending"
@@ -2318,6 +3247,23 @@ if st.session_state.quarterly_analysis:
             else:
                 terminal_method_context = "Default"
 
+            cashflow_regime_label = "FCFF"
+            if cashflow_regime == "approx_unlevered":
+                cashflow_regime_label = "Approx FCFF Proxy"
+            elif cashflow_regime == "levered_proxy":
+                cashflow_regime_label = "Levered Proxy"
+            confidence_label = (cashflow_confidence or "n/a").capitalize()
+            if discount_rate_used is not None:
+                if discount_rate_input is not None and abs(discount_rate_used - discount_rate_input) > 1e-9:
+                    discount_rate_text = (
+                        f"{discount_rate_label or 'Discount rate'}: {discount_rate_used*100:.1f}% "
+                        f"(input {discount_rate_input*100:.1f}%)"
+                    )
+                else:
+                    discount_rate_text = f"{discount_rate_label or 'Discount rate'}: {discount_rate_used*100:.1f}%"
+            else:
+                discount_rate_text = discount_rate_label or "Discount rate: N/A"
+
             current_price_text = f"${current_price:.2f}" if current_price else "—"
             intrinsic_text = f"${intrinsic:.2f}" if intrinsic else "—"
             upside_text = f"{upside_downside:+.1f}%" if upside_downside is not None else "—"
@@ -2326,7 +3272,10 @@ if st.session_state.quarterly_analysis:
   <div class="decision-grid">
     <div><div class="decision-tile-label">Ticker</div><div class="decision-tile-value">{ticker}</div></div>
     <div><div class="decision-tile-label">Current Price</div><div class="decision-tile-value">{current_price_text}</div></div>
-    <div><div class="decision-tile-label">Intrinsic Value</div><div class="decision-tile-value">{intrinsic_text}</div></div>
+    <div>
+      <div class="decision-tile-label">Intrinsic Value</div>
+      <div class="decision-tile-value">{intrinsic_text}</div>
+    </div>
     <div><div class="decision-tile-label">Upside/Downside</div><div class="decision-tile-value">{upside_text}</div></div>
     <div><div class="decision-tile-label">Verdict</div><span class="badge {verdict_badge}">{verdict_label}</span></div>
   </div>
@@ -2338,9 +3287,16 @@ if st.session_state.quarterly_analysis:
   <span class="confidence-pill">Data Quality: {data_quality:.0f}/100</span>
   <span class="confidence-pill">TV Dominance: {tv_dominance:.0f}%</span>
   <span class="confidence-pill">Terminal Method: {terminal_method_label} ({terminal_method_context})</span>
+  <span class="confidence-pill">Cash Flow Regime: {cashflow_regime_label} ({confidence_label})</span>
+  <span class="confidence-pill">{discount_rate_text}</span>
 </div>
             """, unsafe_allow_html=True)
             st.caption(verdict_hint)
+            if cashflow_regime in {"approx_unlevered", "levered_proxy"}:
+                st.warning(
+                    "Proxy cash-flow mode is active. Intrinsic value is still produced, but should be treated as lower-confidence "
+                    "than a clean FCFF run."
+                )
             if not dcf_ui_data.get("data_sufficient"):
                 st.warning("Insufficient data quality: interpretation confidence is reduced.")
     else:
@@ -2352,7 +3308,27 @@ if st.session_state.quarterly_analysis:
     st.markdown('<div class="section-header"><span class="step-badge">Step 02</span><span class="section-title">Valuation Drivers</span></div>', unsafe_allow_html=True)
     st.caption("Tune assumptions, rerun the model, and review core valuation outputs.")
 
-    snapshot_for_suggestions = cached_financial_snapshot(ticker, suggestion_algo_version="v3_forward_consensus")
+    snapshot_for_suggestions = None
+    suggestions_ready = (
+        st.session_state.get("assumption_suggestions_loaded", False)
+        and st.session_state.get("assumption_suggestions_ticker") == ticker
+    )
+    if suggestions_ready:
+        snapshot_for_suggestions = cached_financial_snapshot(
+            ticker,
+            suggestion_algo_version="v3_forward_consensus",
+        )
+    else:
+        st.caption("Suggested WACC/FCF inputs are optional and loaded on demand for faster first paint.")
+        if st.button(
+            "Load Suggested Assumptions",
+            key=f"load_suggested_assumptions_{ticker}",
+            use_container_width=False,
+        ):
+            st.session_state.assumption_suggestions_loaded = True
+            st.session_state.assumption_suggestions_ticker = ticker
+            st.rerun()
+
     suggested_wacc = 9.0
     suggested_fcf_growth = 8.0
     suggested_fcf_reliability = None
@@ -2383,18 +3359,37 @@ if st.session_state.quarterly_analysis:
     col_wacc, col_growth, col_terminal = st.columns(3)
     with col_wacc:
         user_wacc = st.slider(
-            "WACC (%)",
+            "WACC / Discount Rate (%)",
             min_value=5.0,
             max_value=15.0,
             value=default_wacc,
-            step=0.5,
+            step=0.1,
+            format="%.1f",
             key=f"wacc_slider_{ticker}",
-            help="Weighted Average Cost of Capital (discount rate)."
+            help=(
+                "Forward discount-rate assumption used in DCF. "
+                "View DCF Details to see full component trace (Re, Rd, weights, and sources)."
+            )
         )
         if snapshot_for_suggestions and snapshot_for_suggestions.suggested_wacc.value:
             beta_val = snapshot_for_suggestions.beta.value
             rf_source = getattr(snapshot_for_suggestions, "rf_source", "^TNX")
-            st.caption(f"Suggested: {suggested_wacc:.1f}% (CAPM β={beta_val:.2f}, Rf={rf_source})" if beta_val else f"Suggested: {suggested_wacc:.1f}%")
+            wacc_components = getattr(snapshot_for_suggestions, "wacc_components", {}) or {}
+            we = wacc_components.get("equity_weight")
+            wd = wacc_components.get("debt_weight")
+            cost_of_equity_rate = wacc_components.get("cost_of_equity")
+            rd = wacc_components.get("cost_of_debt_pre_tax")
+            tax_rate = wacc_components.get("tax_rate")
+            beta_text = f", beta {beta_val:.2f}" if beta_val else ""
+            if all(v is not None for v in [we, wd, cost_of_equity_rate, rd, tax_rate]):
+                inputs_line = (
+                    f"We {we*100:.0f}% × Re {cost_of_equity_rate*100:.1f}% + "
+                    f"Wd {wd*100:.0f}% × Rd {rd*100:.1f}% × (1-T {tax_rate*100:.1f}%) | "
+                    f"Rf {rf_source}{beta_text}"
+                )
+            else:
+                inputs_line = f"Rf {rf_source}{beta_text}"
+            st.caption(f"Suggested WACC: {suggested_wacc:.1f}% | Inputs: {inputs_line}")
 
     with col_growth:
         user_fcf_growth = st.slider(
@@ -2402,7 +3397,8 @@ if st.session_state.quarterly_analysis:
             min_value=0.0,
             max_value=25.0,
             value=default_fcf_growth,
-            step=0.5,
+            step=0.1,
+            format="%.1f",
             key=f"fcf_growth_slider_{ticker}",
             help="Annual free-cash-flow growth for projection period."
         )
@@ -2458,7 +3454,7 @@ if st.session_state.quarterly_analysis:
                     user_fcf_growth,
                     terminal_growth=user_terminal_growth,
                     terminal_scenario="current",
-                    custom_multiple=None
+                    custom_multiple=None,
                 )
                 st.session_state.dcf_ui_adapter = ui_adapter_result
                 st.session_state.dcf_engine_result = engine_result
@@ -2771,19 +3767,49 @@ if st.session_state.quarterly_analysis:
                 company_name=ticker,
                 dcf_data=dcf_data_for_forecast
             )
-            st.session_state.independent_forecast = forecast
-            st.session_state.forecast_just_generated = True
-            _persist_ai_result_for_context(
-                ticker=ticker,
-                end_date=st.session_state.get("end_date") or st.session_state.get("selected_end_date"),
-                num_quarters=st.session_state.get("num_quarters"),
-            )
+            if isinstance(forecast, dict) and forecast.get("error"):
+                st.session_state.ai_outlook_error = str(forecast.get("error"))
+                if not st.session_state.get("independent_forecast"):
+                    st.session_state.independent_forecast = forecast
+                st.session_state.forecast_just_generated = False
+            else:
+                st.session_state.ai_outlook_error = None
+                st.session_state.independent_forecast = forecast
+                st.session_state.forecast_just_generated = True
+                _persist_ai_result_for_context(
+                    ticker=ticker,
+                    end_date=st.session_state.get("end_date") or st.session_state.get("selected_end_date"),
+                    num_quarters=st.session_state.get("num_quarters"),
+                )
             st.rerun()
+
+    ai_outlook_error = st.session_state.get("ai_outlook_error")
+    if ai_outlook_error:
+        if is_quota_or_rate_limit_error(ai_outlook_error):
+            retry_text = estimate_api_retry_time(ai_outlook_error)
+            st.warning(
+                "AI Synthesis is temporarily unavailable because API request quota is exhausted.\n\n"
+                f"Estimated retry/reset time: {retry_text}"
+            )
+        else:
+            st.warning("AI Synthesis is temporarily unavailable. Please try again shortly.")
+        with st.expander("AI Synthesis Error Details", expanded=False):
+            st.code(str(ai_outlook_error))
 
     if st.session_state.independent_forecast:
         forecast = st.session_state.independent_forecast
         if forecast.get("error"):
-            st.error(forecast["error"])
+            if not ai_outlook_error:
+                if is_quota_or_rate_limit_error(forecast["error"]):
+                    retry_text = estimate_api_retry_time(forecast["error"])
+                    st.warning(
+                        "AI Synthesis is temporarily unavailable because API request quota is exhausted.\n\n"
+                        f"Estimated retry/reset time: {retry_text}"
+                    )
+                else:
+                    st.warning("AI Synthesis is temporarily unavailable. Please try again shortly.")
+                with st.expander("AI Synthesis Error Details", expanded=False):
+                    st.code(str(forecast["error"]))
         else:
             extracted = forecast.get("extracted_forecast") or {}
             full_analysis = _sanitize_ai_valuation_language(forecast.get("full_analysis", "") or "")
