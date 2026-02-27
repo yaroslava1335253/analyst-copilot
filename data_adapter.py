@@ -69,6 +69,7 @@ class NormalizedFinancialSnapshot:
         
         # Debt/Cash (for EV->Equity bridge)
         self.total_debt = DataQualityMetadata()
+        self.average_total_debt = DataQualityMetadata()
         self.cash_and_equivalents = DataQualityMetadata()
         self.minority_interest = DataQualityMetadata()
         self.preferred_stock = DataQualityMetadata()
@@ -104,9 +105,12 @@ class NormalizedFinancialSnapshot:
         # Beta and WACC components
         self.beta = DataQualityMetadata()
         self.suggested_wacc = DataQualityMetadata()
+        self.suggested_cost_of_equity = DataQualityMetadata()
+        self.suggested_cost_of_debt = DataQualityMetadata()
         self.suggested_fcf_growth = DataQualityMetadata()
         self.analyst_revenue_estimates = []  # List of {year_label, revenue, source, reliability_score}
         self.analyst_long_term_growth = DataQualityMetadata()  # Analyst long-term growth (e.g., +5Y consensus)
+        self.wacc_components = {}
 
         # Latest annual
         self.latest_annual_date = None
@@ -159,6 +163,7 @@ class NormalizedFinancialSnapshot:
             "shares_outstanding": self.shares_outstanding.to_dict(),
             "market_cap": self.market_cap.to_dict(),
             "total_debt": self.total_debt.to_dict(),
+            "average_total_debt": self.average_total_debt.to_dict(),
             "cash_and_equivalents": self.cash_and_equivalents.to_dict(),
             "ttm_revenue": self.ttm_revenue.to_dict(),
             "ttm_operating_cash_flow": self.ttm_operating_cash_flow.to_dict(),
@@ -170,9 +175,14 @@ class NormalizedFinancialSnapshot:
             "effective_tax_rate": self.effective_tax_rate.to_dict(),
             "beta": self.beta.to_dict(),
             "suggested_wacc": self.suggested_wacc.to_dict(),
+            "suggested_cost_of_equity": self.suggested_cost_of_equity.to_dict(),
+            "suggested_cost_of_debt": self.suggested_cost_of_debt.to_dict(),
             "suggested_fcf_growth": self.suggested_fcf_growth.to_dict(),
             "analyst_revenue_estimates": self.analyst_revenue_estimates,
             "analyst_long_term_growth": self.analyst_long_term_growth.to_dict(),
+            "wacc_components": self.wacc_components,
+            "risk_free_rate": getattr(self, "risk_free_rate", None),
+            "rf_source": getattr(self, "rf_source", None),
             "num_quarters_available": self.num_quarters_available,
             "overall_quality_score": self.overall_quality_score,
             "warnings": self.warnings,
@@ -326,6 +336,7 @@ class DataAdapter:
             most_recent_date = balance_sheet.columns[0]
             
             # Total Debt - PRIMARY: Use yahooquery for accurate Total Debt
+            yq_bs_sorted = None
             try:
                 yq_ticker = YQTicker(self.ticker)
                 yq_bs = yq_ticker.balance_sheet(frequency='q')
@@ -384,6 +395,68 @@ class DataAdapter:
                 else:
                     self.snapshot.total_debt.reliability_score = 30
                     self.snapshot.add_warning("LOW_DEBT_QUALITY", f"Total debt = 0 or missing")
+
+            # Average debt (prefer last up to 4 quarterly observations) for robust Rd estimation
+            avg_debt = None
+            avg_debt_source = None
+            avg_debt_reliability = 0
+
+            try:
+                if isinstance(yq_bs_sorted, pd.DataFrame) and 'TotalDebt' in yq_bs_sorted.columns:
+                    yq_debt_values = [
+                        float(v) for v in yq_bs_sorted['TotalDebt'].tolist()
+                        if pd.notna(v) and v > 0
+                    ][:4]
+                    if len(yq_debt_values) >= 2:
+                        avg_debt = sum(yq_debt_values) / len(yq_debt_values)
+                        avg_debt_source = f"mean(yahooquery TotalDebt, last {len(yq_debt_values)} quarters)"
+                        avg_debt_reliability = 88
+            except Exception:
+                pass
+
+            if avg_debt is None:
+                try:
+                    quarterly_bs = stock.quarterly_balance_sheet
+                    if isinstance(quarterly_bs, pd.DataFrame) and not quarterly_bs.empty:
+                        debt_values = []
+                        if 'Total Debt' in quarterly_bs.index:
+                            series = quarterly_bs.loc['Total Debt']
+                            debt_values = [
+                                float(v) for v in series.iloc[:4].tolist()
+                                if pd.notna(v) and v > 0
+                            ]
+                        else:
+                            debt_components = ['Long Term Debt', 'Current Portion Of Long Term Debt', 'Short Term Borrowings']
+                            for col in quarterly_bs.columns[:4]:
+                                debt_sum = 0.0
+                                found_component = False
+                                for item in debt_components:
+                                    if item in quarterly_bs.index:
+                                        val = quarterly_bs.loc[item, col]
+                                        if pd.notna(val) and val > 0:
+                                            debt_sum += float(val)
+                                            found_component = True
+                                if found_component and debt_sum > 0:
+                                    debt_values.append(debt_sum)
+
+                        if len(debt_values) >= 2:
+                            avg_debt = sum(debt_values) / len(debt_values)
+                            avg_debt_source = f"mean(quarterly balance sheet debt, last {len(debt_values)} quarters)"
+                            avg_debt_reliability = 72
+                except Exception:
+                    pass
+
+            if avg_debt is not None:
+                self.snapshot.average_total_debt = DataQualityMetadata(
+                    value=avg_debt,
+                    units="USD",
+                    period_end="TTM",
+                    period_type="quarterly_average",
+                    source_path=avg_debt_source,
+                    retrieved_at=datetime.utcnow().isoformat(),
+                    reliability_score=avg_debt_reliability,
+                    notes="Average debt basis used for cost-of-debt guardrails"
+                )
             
             # Cash and Equivalents
             cash_items = ['Cash And Cash Equivalents', 'Cash', 'CashCash Equivalents And Marketable Securities']
@@ -870,7 +943,8 @@ class DataAdapter:
         from datetime import datetime
         
         # ═══════════════════════════════════════════════════════════════
-        # SUGGESTED WACC using CAPM: WACC = Rf + Beta × (Rm - Rf)
+        # SUGGESTED WACC (REAL): WACC = We*Re + Wd*Rd*(1-T)
+        # Re from CAPM, Rd from interest/debt when available
         # ═══════════════════════════════════════════════════════════════
         # Dynamic risk-free rate from 10-year Treasury (^TNX)
         # Market risk premium from Damodaran (updated annually)
@@ -897,55 +971,268 @@ class DataAdapter:
         self.snapshot.rf_source = RF_SOURCE
         
         beta = self.snapshot.beta.value
+        market_cap = self.snapshot.market_cap.value
+        total_debt = self.snapshot.total_debt.value or 0
+        average_debt = self.snapshot.average_total_debt.value if self.snapshot.average_total_debt else None
+        ttm_interest_expense = self.snapshot.ttm_interest_expense.value if self.snapshot.ttm_interest_expense else None
+        tax_rate = self.snapshot.effective_tax_rate.value if self.snapshot.effective_tax_rate else None
+        ttm_rev = self.snapshot.ttm_revenue.value
+        sector_text = (self.snapshot.sector or "").lower()
+        industry_text = (self.snapshot.industry or "").lower()
+        is_financial_sector = any(
+            keyword in sector_text or keyword in industry_text
+            for keyword in ["financial", "bank", "insurance", "brokerage", "asset management", "capital markets"]
+        )
+
+        # Build Cost of Equity (Re) using CAPM where possible.
         if beta is not None and beta > 0:
-            # CAPM: Cost of Equity = Rf + Beta × Market Risk Premium
             cost_of_equity = RISK_FREE_RATE + beta * MARKET_RISK_PREMIUM
-            
-            # For simplicity, use cost of equity as WACC proxy
-            # (Most large-cap tech has minimal debt impact on WACC)
-            suggested_wacc = cost_of_equity
-            
-            # Adjust for company size/risk (add small premium for smaller caps)
-            ttm_rev = self.snapshot.ttm_revenue.value
-            if ttm_rev is not None:
-                if ttm_rev < 10e9:  # Small cap
-                    suggested_wacc += 0.02
-                elif ttm_rev < 50e9:  # Mid cap
-                    suggested_wacc += 0.01
-            
-            # Clamp to reasonable range
-            suggested_wacc = max(0.06, min(0.15, suggested_wacc))
-            
-            self.snapshot.suggested_wacc = DataQualityMetadata(
-                value=suggested_wacc,
-                units="rate",
-                period_type="calculated",
-                source_path="CAPM: Rf + Beta × MRP",
-                retrieved_at=datetime.utcnow().isoformat(),
-                reliability_score=80,
-                is_estimated=True,
-                notes=f"CAPM: {RISK_FREE_RATE*100:.2f}% + {beta:.2f} × {MARKET_RISK_PREMIUM*100:.1f}% = {cost_of_equity*100:.2f}%. Rf from {RF_SOURCE}, MRP from Damodaran ({DAMODARAN_DATE})"
+            coe_reliability = 85
+            coe_source = "CAPM: Rf + Beta x ERP"
+            coe_note = (
+                f"CAPM: {RISK_FREE_RATE*100:.2f}% + {beta:.2f} x {MARKET_RISK_PREMIUM*100:.1f}% "
+                f"= {cost_of_equity*100:.2f}% (Rf {RF_SOURCE}, ERP Damodaran {DAMODARAN_DATE})"
             )
         else:
-            # Fallback: size-based default
-            ttm_rev = self.snapshot.ttm_revenue.value
-            if ttm_rev is not None and ttm_rev > 50e9:
-                suggested_wacc = 0.09
-            elif ttm_rev is not None and ttm_rev > 10e9:
-                suggested_wacc = 0.10
-            else:
-                suggested_wacc = 0.11
-            
-            self.snapshot.suggested_wacc = DataQualityMetadata(
-                value=suggested_wacc,
-                units="rate",
-                period_type="default",
-                source_path="Size-based default (beta unavailable)",
-                retrieved_at=datetime.utcnow().isoformat(),
-                reliability_score=50,
-                is_estimated=True,
-                notes="Fallback: Beta unavailable, using size-based industry average"
+            # Fallback Re when beta is unavailable.
+            size_premium = (
+                0.02 if (ttm_rev is not None and ttm_rev < 10e9)
+                else 0.01 if (ttm_rev is not None and ttm_rev < 50e9)
+                else 0.0
             )
+            cost_of_equity = RISK_FREE_RATE + MARKET_RISK_PREMIUM + size_premium
+            coe_reliability = 60
+            coe_source = "Fallback Re: Rf + ERP + size premium (beta unavailable)"
+            coe_note = (
+                f"Beta unavailable; Re fallback = Rf ({RISK_FREE_RATE*100:.2f}%) + ERP "
+                f"({MARKET_RISK_PREMIUM*100:.1f}%) + size premium ({size_premium*100:.1f}%)."
+            )
+
+        cost_of_equity = max(0.05, min(0.25, cost_of_equity))
+        self.snapshot.suggested_cost_of_equity = DataQualityMetadata(
+            value=cost_of_equity,
+            units="rate",
+            period_type="calculated",
+            source_path=coe_source,
+            retrieved_at=datetime.utcnow().isoformat(),
+            reliability_score=coe_reliability,
+            is_estimated=True,
+            notes=coe_note,
+        )
+
+        # Build Cost of Debt (Rd) with guardrails and debt-basis selection.
+        debt_basis = average_debt if average_debt is not None and average_debt > 0 else total_debt
+        if average_debt is not None and average_debt > 0:
+            debt_basis_source = "average debt (last up to 4Q)"
+            debt_basis_reliability = self.snapshot.average_total_debt.reliability_score or 70
+        else:
+            debt_basis_source = "point-in-time debt"
+            debt_basis_reliability = self.snapshot.total_debt.reliability_score or 60
+
+        debt_cost_source = "No debt"
+        debt_cost_reliability = 95
+        debt_spread_used = None
+        rd_mode = "not_applicable"
+        rd_observed_raw = None
+        rd_guardrail_note = ""
+        tiny_debt_threshold = max(150e6, (market_cap * 0.005) if market_cap and market_cap > 0 else 150e6)
+
+        if total_debt > 0:
+            use_observed_rd = False
+            if ttm_interest_expense is not None and ttm_interest_expense > 0 and debt_basis and debt_basis > tiny_debt_threshold:
+                rd_observed_raw = ttm_interest_expense / debt_basis
+                if 0.005 <= rd_observed_raw <= 0.25:
+                    use_observed_rd = True
+                else:
+                    rd_guardrail_note = (
+                        f"Observed interest/debt ({rd_observed_raw*100:.2f}%) outside sanity band "
+                        "0.5%-25%; using fallback spread."
+                    )
+            elif ttm_interest_expense is not None and ttm_interest_expense > 0 and debt_basis and debt_basis <= tiny_debt_threshold:
+                rd_guardrail_note = (
+                    "Debt base is very small vs company size; observed interest/debt is unstable. "
+                    "Using fallback spread."
+                )
+            else:
+                rd_guardrail_note = "Interest expense unavailable or non-positive; using fallback spread."
+
+            if use_observed_rd:
+                unclamped_rd = rd_observed_raw
+                cost_of_debt_pre_tax = max(0.02, min(0.18, rd_observed_raw))
+                debt_cost_source = f"TTM Interest Expense / {debt_basis_source}"
+                int_rel = self.snapshot.ttm_interest_expense.reliability_score if self.snapshot.ttm_interest_expense else 60
+                debt_cost_reliability = int(round(0.55 * int_rel + 0.45 * debt_basis_reliability))
+                debt_cost_reliability = max(65, min(90, debt_cost_reliability))
+                rd_mode = "observed"
+                if abs(cost_of_debt_pre_tax - unclamped_rd) > 1e-9:
+                    rd_guardrail_note = (
+                        (rd_guardrail_note + " " if rd_guardrail_note else "")
+                        + f"Observed Rd clamped to {cost_of_debt_pre_tax*100:.2f}%."
+                    )
+            else:
+                rd_mode = "synthetic_fallback"
+                debt_to_capital_proxy = None
+                if market_cap and market_cap > 0:
+                    debt_to_capital_proxy = total_debt / (total_debt + market_cap)
+                if debt_to_capital_proxy is None:
+                    debt_spread_used = 0.03
+                elif debt_to_capital_proxy < 0.10:
+                    debt_spread_used = 0.015
+                elif debt_to_capital_proxy < 0.25:
+                    debt_spread_used = 0.02
+                elif debt_to_capital_proxy < 0.50:
+                    debt_spread_used = 0.03
+                else:
+                    debt_spread_used = 0.045
+
+                cost_of_debt_pre_tax = RISK_FREE_RATE + debt_spread_used
+                cost_of_debt_pre_tax = max(0.03, min(0.18, cost_of_debt_pre_tax))
+                debt_cost_source = "Rf + synthetic credit spread fallback"
+                debt_cost_reliability = 52
+                rd_guardrail_note = (
+                    (rd_guardrail_note + " " if rd_guardrail_note else "")
+                    + "Debt cost estimated from synthetic spread."
+                )
+        else:
+            rd_mode = "no_debt"
+            cost_of_debt_pre_tax = 0.0
+
+        normalized_tax_rate = tax_rate if tax_rate is not None else 0.25
+        normalized_tax_rate = max(0.0, min(0.50, normalized_tax_rate))
+        cost_of_debt_after_tax = cost_of_debt_pre_tax * (1 - normalized_tax_rate)
+
+        debt_note = (
+            "No debt; debt component weight is 0."
+            if total_debt <= 0
+            else (
+                f"Rd (pre-tax) from {debt_cost_source} ({debt_basis_source}): {cost_of_debt_pre_tax*100:.2f}%"
+                + (f" (spread {debt_spread_used*100:.1f}%)" if debt_spread_used is not None else "")
+                + f"; after-tax Rd = {cost_of_debt_after_tax*100:.2f}% using tax {normalized_tax_rate*100:.1f}%."
+                + (f" Guardrail: {rd_guardrail_note}" if rd_guardrail_note else "")
+            )
+        )
+        self.snapshot.suggested_cost_of_debt = DataQualityMetadata(
+            value=cost_of_debt_pre_tax,
+            units="rate",
+            period_type="calculated" if total_debt > 0 else "not_applicable",
+            source_path=debt_cost_source,
+            retrieved_at=datetime.utcnow().isoformat(),
+            reliability_score=debt_cost_reliability,
+            is_estimated=total_debt > 0,
+            notes=debt_note,
+        )
+
+        # Capital structure weights.
+        equity_value = market_cap if (market_cap is not None and market_cap > 0) else None
+        if equity_value is None and self.snapshot.price.value and self.snapshot.shares_outstanding.value:
+            equity_value = self.snapshot.price.value * self.snapshot.shares_outstanding.value
+        if equity_value is None:
+            equity_value = 0.0
+
+        total_capital = equity_value + total_debt
+        if total_capital > 0:
+            equity_weight = equity_value / total_capital
+            debt_weight = total_debt / total_capital
+            weights_source = "Market cap and total debt"
+            weight_reliability = 85 if market_cap and market_cap > 0 else 70
+        else:
+            # Last-resort fallback to keep output available.
+            equity_weight = 1.0
+            debt_weight = 0.0
+            weights_source = "Fallback: no valid capital structure data"
+            weight_reliability = 45
+
+        if is_financial_sector:
+            wacc_mode = "coe_only_proxy_financial_sector"
+            wacc_mode_label = "CoE-only proxy (financial sector guardrail)"
+            suggested_wacc = cost_of_equity
+            wacc_reliability = max(40, min(60, coe_reliability))
+            confidence_tier = "low"
+            self.snapshot.add_warning(
+                "WACC_FINANCIAL_SECTOR_PROXY",
+                "Financial-sector company detected. WACC is less standard; using CoE-only proxy and lowering confidence."
+            )
+        elif total_debt <= 0:
+            wacc_mode = "coe_only_proxy_no_debt"
+            wacc_mode_label = "CoE-only proxy (no debt)"
+            suggested_wacc = cost_of_equity
+            wacc_reliability = min(88, coe_reliability)
+            confidence_tier = "medium"
+        elif rd_mode == "observed":
+            wacc_mode = "full_wacc_observed_debt"
+            wacc_mode_label = "Component-based WACC estimate (observed debt cost)"
+            suggested_wacc = equity_weight * cost_of_equity + debt_weight * cost_of_debt_after_tax
+            wacc_reliability = int(round(
+                0.45 * coe_reliability
+                + 0.30 * debt_cost_reliability
+                + 0.20 * weight_reliability
+                + 0.05 * (self.snapshot.effective_tax_rate.reliability_score or 20)
+            ))
+            wacc_reliability = max(55, min(92, wacc_reliability))
+            confidence_tier = "high" if wacc_reliability >= 78 else "medium"
+        else:
+            wacc_mode = "estimated_wacc_debt_fallback"
+            wacc_mode_label = "Component-based WACC estimate (debt fallback)"
+            suggested_wacc = equity_weight * cost_of_equity + debt_weight * cost_of_debt_after_tax
+            wacc_reliability = int(round(
+                0.45 * coe_reliability
+                + 0.20 * debt_cost_reliability
+                + 0.20 * weight_reliability
+                + 0.15 * (self.snapshot.total_debt.reliability_score or 0)
+            ))
+            wacc_reliability = max(45, min(78, wacc_reliability))
+            confidence_tier = "medium" if wacc_reliability >= 60 else "low"
+
+        suggested_wacc = max(0.05, min(0.20, suggested_wacc))
+
+        self.snapshot.wacc_components = {
+            "risk_free_rate": RISK_FREE_RATE,
+            "rf_source": RF_SOURCE,
+            "market_risk_premium": MARKET_RISK_PREMIUM,
+            "damodaran_date": DAMODARAN_DATE,
+            "beta": beta,
+            "cost_of_equity": cost_of_equity,
+            "cost_of_equity_source": coe_source,
+            "cost_of_debt_pre_tax": cost_of_debt_pre_tax,
+            "cost_of_debt_after_tax": cost_of_debt_after_tax,
+            "rd_mode": rd_mode,
+            "rd_observed_raw": rd_observed_raw,
+            "rd_guardrail_note": rd_guardrail_note,
+            "tax_rate": normalized_tax_rate,
+            "equity_weight": equity_weight,
+            "debt_weight": debt_weight,
+            "market_cap": market_cap,
+            "equity_value_used": equity_value,
+            "total_debt": total_debt,
+            "weights_source": weights_source,
+            "debt_cost_source": debt_cost_source,
+            "debt_basis_value": debt_basis,
+            "debt_basis_source": debt_basis_source,
+            "debt_basis_reliability": debt_basis_reliability,
+            "wacc_mode": wacc_mode,
+            "wacc_mode_label": wacc_mode_label,
+            "wacc_confidence": confidence_tier,
+            "is_financial_sector_guardrail": is_financial_sector,
+        }
+
+        self.snapshot.suggested_wacc = DataQualityMetadata(
+            value=suggested_wacc,
+            units="rate",
+            period_type="calculated_estimate",
+            source_path=wacc_mode_label,
+            retrieved_at=datetime.utcnow().isoformat(),
+            reliability_score=wacc_reliability,
+            is_estimated=True,
+            notes=(
+                f"{wacc_mode_label}. "
+                f"WACC = {equity_weight*100:.1f}%*Re({cost_of_equity*100:.2f}%) + "
+                f"{debt_weight*100:.1f}%*Rd({cost_of_debt_pre_tax*100:.2f}%)*(1-{normalized_tax_rate*100:.1f}%) "
+                f"= {suggested_wacc*100:.2f}%. Re source: {coe_source}. "
+                f"Rd source: {debt_cost_source}. Debt basis: {debt_basis_source}. "
+                + (f"Rd guardrail: {rd_guardrail_note}. " if rd_guardrail_note else "")
+                + f"Weights source: {weights_source}. Confidence: {confidence_tier}."
+            )
+        )
         
         # ═══════════════════════════════════════════════════════════════
         # SUGGESTED FCF GROWTH RATE PRIORITY

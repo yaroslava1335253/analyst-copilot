@@ -82,6 +82,16 @@ class DCFAssumptions:
     growth_proxy_warning: bool = False  # True if using FCF growth as EBITDA proxy
     data_quality_score: float = None  # Overall data quality
     wacc_is_estimated: bool = True  # True if WACC was auto-calculated
+    # Cash-flow/discount-rate gating (prevents silent proxy misuse)
+    cashflow_discount_policy: str = "adaptive"  # "adaptive", "adaptive_conservative", "strict_enterprise"
+    proxy_risk_premium_pct: float = 1.0  # Additional premium applied only on proxy cash-flow paths
+    cashflow_regime: str = None  # "proper_fcff", "approx_unlevered", "levered_proxy"
+    cashflow_confidence: str = None  # "high", "medium", "low"
+    discount_rate_input: float = None  # User/base rate before gating
+    discount_rate_used: float = None  # Final rate used in valuation math
+    discount_rate_label: str = None  # Display label for final discount basis
+    discount_rate_source: str = None  # Source note (e.g., CoE proxy)
+    proxy_adjustment_applied: bool = False
     
     # ========== TEXTBOOK DCF: DRIVER-BASED PROJECTION ==========
     # Revenue drivers
@@ -488,6 +498,113 @@ class DCFEngine:
             self.warnings.append(f"Overall data quality low ({self.snapshot.overall_quality_score:.0f}/100)")
         
         return all(checks) if checks else True
+
+    def _apply_cashflow_discount_gating(self, fcff_method: str) -> None:
+        """
+        Align discounting with the cash-flow regime so proxy paths are explicit.
+        Always produces an output, but labels/adjusts risk for proxy methods.
+        """
+        base_rate = self.assumptions.wacc or 0.09
+        coe_proxy = None
+        if hasattr(self.snapshot, "suggested_cost_of_equity") and self.snapshot.suggested_cost_of_equity:
+            coe_proxy = self.snapshot.suggested_cost_of_equity.value
+        elif hasattr(self.snapshot, "suggested_wacc") and self.snapshot.suggested_wacc:
+            # Backward compatibility for snapshots created before explicit CoE field.
+            coe_proxy = self.snapshot.suggested_wacc.value
+
+        policy = (self.assumptions.cashflow_discount_policy or "adaptive").strip().lower()
+        if policy not in {"adaptive", "adaptive_conservative", "strict_enterprise"}:
+            policy = "adaptive"
+
+        try:
+            proxy_premium_pct = float(self.assumptions.proxy_risk_premium_pct or 0)
+        except Exception:
+            proxy_premium_pct = 0.0
+        proxy_premium_pct = max(0.0, min(proxy_premium_pct, 5.0))
+        proxy_premium = proxy_premium_pct / 100.0
+
+        used_rate = base_rate
+        label = "Enterprise discount rate (WACC input)"
+        source = "wacc_input"
+        confidence = "high"
+        notes = "Clean FCFF path."
+
+        if fcff_method == "approx_unlevered":
+            confidence = "medium"
+            if policy == "strict_enterprise":
+                label = "Enterprise discount rate (proxy FCFF)"
+                source = "wacc_input_strict_enterprise"
+                notes = "Approximate FCFF path kept on enterprise discounting (strict mode)."
+                self.warnings.append(
+                    "Approximate FCFF path active (CFO + after-tax interest expense - CapEx). "
+                    "Strict enterprise mode keeps WACC unchanged; treat output as moderate-confidence."
+                )
+            else:
+                uplift_multiplier = 1.0 if policy == "adaptive_conservative" else 0.5
+                uplift = proxy_premium * uplift_multiplier
+                used_rate = min(0.30, base_rate + uplift)
+                label = "Adjusted enterprise proxy rate"
+                source = "wacc_input_plus_proxy_premium"
+                notes = (
+                    f"Approximate FCFF path; added +{uplift*100:.2f}% risk premium "
+                    f"(policy={policy})."
+                )
+                self.warnings.append(
+                    f"Approximate FCFF path active. Applied +{uplift*100:.2f}% discount-rate premium "
+                    "to reflect proxy risk."
+                )
+
+        elif fcff_method == "levered_proxy":
+            confidence = "low"
+            if policy == "strict_enterprise":
+                label = "Enterprise discount rate (levered proxy mismatch)"
+                source = "wacc_input_strict_enterprise"
+                notes = "Levered CFO-CapEx proxy discounted with WACC by user policy."
+                self.warnings.append(
+                    "Levered proxy path active (CFO - CapEx) while strict enterprise mode keeps WACC. "
+                    "This is framework-mixed and should be treated as low-confidence."
+                )
+            else:
+                anchor_rate = max(base_rate, coe_proxy) if coe_proxy else base_rate
+                uplift_multiplier = 1.5 if policy == "adaptive_conservative" else 1.0
+                uplift = proxy_premium * uplift_multiplier
+                used_rate = min(0.35, anchor_rate + uplift)
+                label = "Cost of Equity proxy (levered cash-flow aligned)"
+                source = "coe_proxy_plus_proxy_premium" if coe_proxy else "wacc_anchor_plus_proxy_premium"
+                notes = (
+                    f"Levered CFO-CapEx path; aligned toward CoE proxy and added +{uplift*100:.2f}% "
+                    f"(policy={policy})."
+                )
+                self.warnings.append(
+                    "Levered proxy path active (CFO - CapEx). "
+                    f"Using {label.lower()} at {used_rate:.2%}; output remains available but low-confidence."
+                )
+
+        self.assumptions.cashflow_regime = fcff_method
+        self.assumptions.cashflow_confidence = confidence
+        self.assumptions.discount_rate_input = base_rate
+        self.assumptions.discount_rate_used = used_rate
+        self.assumptions.discount_rate_label = label
+        self.assumptions.discount_rate_source = source
+        self.assumptions.proxy_adjustment_applied = abs((used_rate or 0) - (base_rate or 0)) > 1e-9
+
+        # Use gated discount rate for all downstream discounting steps.
+        self.assumptions.wacc = used_rate
+
+        self.trace.append(CalculationTraceStep(
+            name="Cash-Flow Regime Gating",
+            formula="Map cash-flow regime to discount basis (always-on output policy)",
+            inputs={
+                "cashflow_regime": fcff_method,
+                "policy": policy,
+                "base_rate": base_rate,
+                "coe_proxy": coe_proxy,
+                "proxy_risk_premium_pct": proxy_premium_pct
+            },
+            output=used_rate,
+            output_units="rate",
+            notes=f"{label}. {notes}"
+        ))
     
     def set_assumptions_from_defaults(self):
         """Auto-fill missing assumptions from snapshot."""
@@ -535,24 +652,37 @@ class DCFEngine:
             self.assumptions.is_large_cap = False
             self.assumptions.horizon_reason = "standard"
         
-        # WACC: use size-based defaults if not provided
+        # WACC: prefer adapter component-based WACC estimate; fallback to size defaults if unavailable
         if self.assumptions.wacc is None:
-            ttm_rev = self.snapshot.ttm_revenue.value
-            if ttm_rev is None:
-                self.assumptions.wacc = 0.09
-            elif ttm_rev > 50e9:
-                self.assumptions.wacc = 0.08
-            elif ttm_rev > 10e9:
-                self.assumptions.wacc = 0.095
+            adapter_wacc = getattr(getattr(self.snapshot, "suggested_wacc", None), "value", None)
+            if adapter_wacc is not None and adapter_wacc > 0:
+                self.assumptions.wacc = adapter_wacc
+                wacc_source = "snapshot.suggested_wacc"
             else:
-                self.assumptions.wacc = 0.11
+                ttm_rev = self.snapshot.ttm_revenue.value
+                if ttm_rev is None:
+                    self.assumptions.wacc = 0.09
+                elif ttm_rev > 50e9:
+                    self.assumptions.wacc = 0.08
+                elif ttm_rev > 10e9:
+                    self.assumptions.wacc = 0.095
+                else:
+                    self.assumptions.wacc = 0.11
+                wacc_source = "size_based_fallback"
             self.trace.append(CalculationTraceStep(
                 name="WACC Auto-Assignment",
-                formula="Size-based default",
-                inputs={"ttm_revenue_b": ttm_rev / 1e9 if ttm_rev else None},
+                formula="Adapter WACC suggestion -> size-based default fallback",
+                inputs={
+                    "source": wacc_source,
+                    "ttm_revenue_b": (self.snapshot.ttm_revenue.value or 0) / 1e9 if self.snapshot.ttm_revenue else None
+                },
                 output=self.assumptions.wacc,
                 output_units="rate",
-                notes="Auto-set based on company size (no override provided)"
+                notes=(
+                    "Using adapter-calculated WACC when available."
+                    if wacc_source == "snapshot.suggested_wacc"
+                    else "Adapter WACC unavailable; auto-set based on company size."
+                )
             ))
         
         # Tax Rate
@@ -1193,6 +1323,9 @@ class DCFEngine:
         self.assumptions.fcff_reliability = fcff_reliability
         self.assumptions.fcff_method = fcff_method
         self.assumptions.fcff_ebitda_ratio = ttm_fcff / ttm_ebitda if ttm_ebitda and ttm_fcff else None
+
+        # Gate discounting based on FCFF quality/regime so proxy outputs are explicit.
+        self._apply_cashflow_discount_gating(fcff_method)
         
         # Calculate key ratios for terminal state
         if ttm_ebitda and ttm_fcff:

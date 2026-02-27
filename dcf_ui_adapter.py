@@ -314,6 +314,14 @@ class DCFUIAdapter:
             "growth_proxy_warning": assumptions.get("growth_proxy_warning", False),
             "data_quality_score": assumptions.get("data_quality_score"),
             "wacc_is_estimated": assumptions.get("wacc_is_estimated", True),
+            # Cash-flow regime gating metadata
+            "cashflow_regime": assumptions.get("cashflow_regime"),
+            "cashflow_confidence": assumptions.get("cashflow_confidence"),
+            "discount_rate_input": assumptions.get("discount_rate_input"),
+            "discount_rate_used": assumptions.get("discount_rate_used"),
+            "discount_rate_label": assumptions.get("discount_rate_label"),
+            "discount_rate_source": assumptions.get("discount_rate_source"),
+            "proxy_adjustment_applied": assumptions.get("proxy_adjustment_applied", False),
             # ── Textbook driver model fields ──
             "use_driver_model": assumptions.get("use_driver_model", True),
             "yearly_projections": assumptions.get("yearly_projections", []),
