@@ -39,6 +39,7 @@ from sources import SOURCE_CATALOG
 UI_CACHE_VERSION = 1
 UI_CACHE_PATH = Path(__file__).resolve().parent / "data" / "user_ui_cache.json"
 MAX_TICKER_LIBRARY_SIZE = 100
+MAX_REPORT_DATE_CACHE_TICKERS = 300
 TICKER_PATTERN = re.compile(r"^[A-Z0-9.\-]{1,10}$")
 MAG7_TICKERS = ["AAPL", "AMZN", "GOOGL", "META", "MSFT", "NVDA", "TSLA"]
 AVAILABLE_DATES_TIMEOUT_SECONDS = 8
@@ -74,6 +75,7 @@ def _default_ui_cache() -> dict:
         "version": UI_CACHE_VERSION,
         "ticker_library": MAG7_TICKERS.copy(),
         "last_selected_ticker": "MSFT",
+        "available_report_dates": {},
         "results": {},
     }
 
@@ -99,6 +101,42 @@ def _normalize_ticker_library(raw_tickers) -> list:
         if len(ordered) >= MAX_TICKER_LIBRARY_SIZE:
             break
     return ordered if ordered else MAG7_TICKERS.copy()
+
+
+def _normalize_report_dates(raw_dates) -> list:
+    normalized = []
+    seen_values = set()
+    if not isinstance(raw_dates, list):
+        return normalized
+    for entry in raw_dates:
+        if not isinstance(entry, dict):
+            continue
+        value = str(entry.get("value", "")).strip()
+        display = str(entry.get("display", "")).strip()
+        if not value:
+            continue
+        if value in seen_values:
+            continue
+        seen_values.add(value)
+        normalized.append({"display": display or value, "value": value})
+    return normalized
+
+
+def _normalize_available_report_dates_cache(raw_cache) -> dict:
+    normalized = {}
+    if not isinstance(raw_cache, dict):
+        return normalized
+    for raw_ticker, raw_dates in raw_cache.items():
+        ticker = _normalize_ticker(raw_ticker)
+        if not _is_valid_ticker_format(ticker):
+            continue
+        dates = _normalize_report_dates(raw_dates)
+        if not dates:
+            continue
+        normalized[ticker] = dates
+        if len(normalized) >= MAX_REPORT_DATE_CACHE_TICKERS:
+            break
+    return normalized
 
 
 def _json_safe(value):
@@ -155,6 +193,7 @@ def load_ui_cache() -> dict:
             "version": data.get("version", UI_CACHE_VERSION),
             "ticker_library": _normalize_ticker_library(data.get("ticker_library", [])),
             "last_selected_ticker": _normalize_ticker(data.get("last_selected_ticker", "MSFT")) or "MSFT",
+            "available_report_dates": _normalize_available_report_dates_cache(data.get("available_report_dates", {})),
             "results": data.get("results", {}) if isinstance(data.get("results", {}), dict) else {},
         }
         return cache
@@ -169,6 +208,7 @@ def save_ui_cache(cache_obj: dict) -> None:
             "version": UI_CACHE_VERSION,
             "ticker_library": _normalize_ticker_library(cache_obj.get("ticker_library", [])),
             "last_selected_ticker": _normalize_ticker(cache_obj.get("last_selected_ticker", "MSFT")) or "MSFT",
+            "available_report_dates": _normalize_available_report_dates_cache(cache_obj.get("available_report_dates", {})),
             "results": _json_safe(cache_obj.get("results", {})),
         }
         tmp_path = UI_CACHE_PATH.with_suffix(".tmp")
@@ -244,6 +284,67 @@ def _upsert_ticker_in_library(ticker: str) -> None:
         st.session_state.ui_cache = cache
         st.session_state.ticker_library = library
         save_ui_cache(cache)
+
+
+def _get_persisted_report_dates(ticker: str) -> list:
+    normalized_ticker = _normalize_ticker(ticker)
+    if not _is_valid_ticker_format(normalized_ticker):
+        return []
+
+    cache = st.session_state.get("ui_cache", _default_ui_cache())
+    dates_cache = _normalize_available_report_dates_cache(cache.get("available_report_dates", {}))
+    return dates_cache.get(normalized_ticker, [])
+
+
+def _persist_report_dates_for_ticker(ticker: str, dates: list) -> None:
+    normalized_ticker = _normalize_ticker(ticker)
+    if not _is_valid_ticker_format(normalized_ticker):
+        return
+
+    normalized_dates = _normalize_report_dates(dates)
+    if not normalized_dates:
+        return
+
+    cache = st.session_state.get("ui_cache", _default_ui_cache())
+    dates_cache = _normalize_available_report_dates_cache(cache.get("available_report_dates", {}))
+    if normalized_ticker in dates_cache:
+        dates_cache.pop(normalized_ticker, None)
+    dates_cache[normalized_ticker] = normalized_dates
+
+    while len(dates_cache) > MAX_REPORT_DATE_CACHE_TICKERS:
+        oldest_ticker = next(iter(dates_cache))
+        dates_cache.pop(oldest_ticker, None)
+
+    cache["available_report_dates"] = dates_cache
+    st.session_state.ui_cache = cache
+    save_ui_cache(cache)
+
+
+def _load_report_dates_for_ticker(ticker: str, force_refresh: bool = False) -> list:
+    normalized_ticker = _normalize_ticker(ticker)
+    if not _is_valid_ticker_format(normalized_ticker):
+        return []
+
+    persisted_dates = _get_persisted_report_dates(normalized_ticker)
+    if persisted_dates and not force_refresh:
+        return persisted_dates
+
+    if force_refresh:
+        fetched_dates = _call_with_timeout(
+            get_available_report_dates,
+            normalized_ticker,
+            timeout_seconds=AVAILABLE_DATES_TIMEOUT_SECONDS,
+            fallback=[],
+        )
+    else:
+        fetched_dates = cached_available_dates(normalized_ticker)
+
+    normalized_dates = _normalize_report_dates(fetched_dates)
+    if normalized_dates:
+        _persist_report_dates_for_ticker(normalized_ticker, normalized_dates)
+        return normalized_dates
+
+    return persisted_dates if persisted_dates else []
 
 
 def _restore_cached_results_for_context(ticker: str, end_date: str, num_quarters: int) -> dict:
@@ -2707,32 +2808,30 @@ with st.sidebar:
     if "report_dates_hint" not in st.session_state:
         st.session_state.report_dates_hint = ""
 
-    # Reset date state when ticker changes (non-blocking; no network call here)
+    # Load report-date state whenever ticker changes.
     if ticker_valid and ticker != st.session_state.available_dates_ticker:
         st.session_state.available_dates_ticker = ticker
-        st.session_state.available_dates = []
-        st.session_state.selected_end_date = None
-        st.session_state.report_dates_hint = "Click 'Fetch Available Reports' to load available quarter end dates."
+        persisted_dates = _get_persisted_report_dates(ticker)
+        if persisted_dates:
+            dates = persisted_dates
+        else:
+            with st.spinner(f"Loading available reports for {ticker}..."):
+                dates = _load_report_dates_for_ticker(ticker)
+        st.session_state.available_dates = dates
+        if st.session_state.available_dates:
+            st.session_state.selected_end_date = st.session_state.available_dates[0]["value"]
+            st.session_state.report_dates_hint = ""
+        else:
+            st.session_state.selected_end_date = None
+            st.session_state.report_dates_hint = (
+                f"No report dates returned within {AVAILABLE_DATES_TIMEOUT_SECONDS}s. "
+                "Use Refresh Available Dates to try again."
+            )
     elif not ticker_valid:
         st.session_state.available_dates_ticker = None
         st.session_state.available_dates = []
         st.session_state.selected_end_date = None
         st.session_state.report_dates_hint = ""
-
-    if ticker_valid:
-        if st.button("Fetch Available Reports", use_container_width=True, key="fetch_available_reports"):
-            with st.spinner(f"Fetching available reports for {ticker}..."):
-                dates = cached_available_dates(ticker)
-            st.session_state.available_dates = dates if isinstance(dates, list) else []
-            if st.session_state.available_dates:
-                st.session_state.selected_end_date = st.session_state.available_dates[0]["value"]
-                st.session_state.report_dates_hint = ""
-            else:
-                st.session_state.selected_end_date = None
-                st.session_state.report_dates_hint = (
-                    f"No report dates returned within {AVAILABLE_DATES_TIMEOUT_SECONDS}s. "
-                    "Try again, switch ticker, or clear cache."
-                )
 
     available_dates = st.session_state.available_dates
     selected_end_date = st.session_state.selected_end_date
@@ -2753,11 +2852,16 @@ with st.sidebar:
     if available_dates:
         date_options = [d["display"] for d in available_dates]
         date_values = [d["value"] for d in available_dates]
+        default_idx = 0
+        if st.session_state.selected_end_date in date_values:
+            default_idx = date_values.index(st.session_state.selected_end_date)
+        else:
+            st.session_state.selected_end_date = date_values[0]
 
         selected_display = st.selectbox(
             "Select Ending Report",
             options=date_options,
-            index=0,  # Default to most recent
+            index=default_idx,
             help=f"Select the most recent quarter to include. {len(available_dates)} reports available."
         )
 
@@ -2772,6 +2876,27 @@ with st.sidebar:
             disabled=True
         )
         selected_end_date = None
+
+    if ticker_valid:
+        if st.button(
+            "Refresh Available Dates",
+            key="refresh_available_reports",
+            help="Manually re-fetch quarter-end report dates for this ticker."
+        ):
+            with st.spinner(f"Refreshing available reports for {ticker}..."):
+                refreshed_dates = _load_report_dates_for_ticker(ticker, force_refresh=True)
+            st.session_state.available_dates_ticker = ticker
+            st.session_state.available_dates = refreshed_dates
+            if refreshed_dates:
+                st.session_state.selected_end_date = refreshed_dates[0]["value"]
+                st.session_state.report_dates_hint = ""
+            else:
+                st.session_state.selected_end_date = None
+                st.session_state.report_dates_hint = (
+                    f"No report dates returned within {AVAILABLE_DATES_TIMEOUT_SECONDS}s. "
+                    "Please try Refresh Available Dates again."
+                )
+            st.rerun()
 
     # Best-effort immediate restore for same active ticker/context
     active_ticker = _normalize_ticker(st.session_state.get("ticker", ""))
@@ -2812,7 +2937,7 @@ with st.sidebar:
         else:
             if not selected_end_date:
                 with st.spinner(f"Fetching available reports for {ticker}..."):
-                    dates = cached_available_dates(ticker)
+                    dates = _load_report_dates_for_ticker(ticker)
                 st.session_state.available_dates = dates if isinstance(dates, list) else []
                 if st.session_state.available_dates:
                     st.session_state.selected_end_date = st.session_state.available_dates[0]["value"]
@@ -2823,11 +2948,11 @@ with st.sidebar:
                     selected_end_date = None
                     st.session_state.report_dates_hint = (
                         f"No report dates returned within {AVAILABLE_DATES_TIMEOUT_SECONDS}s. "
-                        "Try again, switch ticker, or clear cache."
+                        "Use Refresh Available Dates to try again."
                     )
 
             if not selected_end_date:
-                st.warning("Please fetch/select a valid ending report date first.")
+                st.warning("Please select a valid ending report date first.")
             else:
                 with st.spinner(f"Loading {ticker}..."):
                     inc, bal, cf, qcf = cached_financials(ticker)
