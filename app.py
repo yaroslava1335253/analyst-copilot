@@ -38,7 +38,7 @@ from dcf_ui_adapter import DCFUIAdapter
 from sources import SOURCE_CATALOG
 
 UI_CACHE_VERSION = 1
-REPORT_DATES_CACHE_VERSION = "v4"
+REPORT_DATES_CACHE_VERSION = "v5"
 UI_CACHE_PATH = Path(__file__).resolve().parent / "data" / "user_ui_cache.json"
 MAX_TICKER_LIBRARY_SIZE = 100
 MAX_REPORT_DATE_CACHE_TICKERS = 300
@@ -504,7 +504,7 @@ def cached_quarterly_analysis(
     ticker: str,
     num_quarters: int = 8,
     end_date: str = None,
-    history_source_version: str = "v10",
+    history_source_version: str = "v11",
 ) -> dict:
     """Cached version of analyze_quarterly_trends to avoid API rate limits."""
     _ = history_source_version  # cache-key salt when quarterly history sourcing logic changes
@@ -529,7 +529,7 @@ def cached_quarterly_analysis(
     return result if isinstance(result, dict) else fallback
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def cached_available_dates(ticker: str, history_source_version: str = "v10") -> list:
+def cached_available_dates(ticker: str, history_source_version: str = "v11") -> list:
     """Cached wrapper for get_available_report_dates."""
     _ = history_source_version  # cache-key salt when available-date sourcing logic changes
     result = _call_with_timeout(
@@ -3790,6 +3790,12 @@ if st.session_state.quarterly_analysis:
         collision_total += sec_collisions
     if collision_total > 0:
         coverage_parts.append(f"Quarter-date collisions normalized: {collision_total}")
+    sec_error = source_diagnostics.get("sec_error")
+    if isinstance(sec_error, str) and sec_error.strip():
+        sec_error_preview = sec_error.strip()
+        if len(sec_error_preview) > 120:
+            sec_error_preview = sec_error_preview[:117] + "..."
+        coverage_parts.append(f"SEC unavailable: {sec_error_preview}")
     sec_q4_backfilled = source_diagnostics.get("sec_q4_backfilled", {})
     if isinstance(sec_q4_backfilled, dict):
         total_q4_derived = sec_q4_backfilled.get("total_q4_derived")

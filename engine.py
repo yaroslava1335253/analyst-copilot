@@ -8,6 +8,7 @@ Includes financial math logic to pre-process data for the LLM.
 
 import os
 import re
+import time
 import requests
 import yfinance as yf
 import pandas as pd
@@ -19,6 +20,17 @@ from industry_multiples import get_industry_multiple, DAMODARAN_SOURCE_URL, DAMO
 
 _genai_client: "genai.Client | None" = None
 _sec_ticker_cik_map_cache = None
+SEC_CIK_FALLBACK_MAP = {
+    "AAPL": 320193,
+    "AMZN": 1018724,
+    "GOOG": 1652044,
+    "GOOGL": 1652044,
+    "META": 1326801,
+    "MSFT": 789019,
+    "NVDA": 1045810,
+    "TSLA": 1318605,
+    "NFLX": 1065280,
+}
 MIN_YOY_PAIRS_FOR_AVG_GROWTH = 2
 MIN_REVENUE_POINTS_FOR_SEASONALITY = 8
 MIN_TRANSITIONS_PER_QUARTER_FOR_SEASONALITY = 2
@@ -691,7 +703,7 @@ def _sec_headers() -> dict:
     user_agent = (
         os.getenv("SEC_API_USER_AGENT")
         or os.getenv("SEC_USER_AGENT")
-        or "AnalystCoPilot/1.0 (research tool; contact: support@example.com)"
+        or "AnalystCoPilot/1.0 (research tool; contact: analystcopilot.app@gmail.com)"
     )
     return {
         "User-Agent": user_agent,
@@ -699,35 +711,58 @@ def _sec_headers() -> dict:
     }
 
 
+def _sec_get_json(url: str, timeout: int = 12) -> dict | list:
+    last_error = None
+    for attempt in range(3):
+        try:
+            response = requests.get(url, headers=_sec_headers(), timeout=timeout)
+            if response.status_code in {403, 429} and attempt < 2:
+                time.sleep(1.0 + attempt)
+                continue
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            last_error = e
+            if attempt < 2:
+                time.sleep(1.0 + attempt)
+                continue
+            break
+    if last_error:
+        raise last_error
+    raise RuntimeError("SEC request failed without an explicit error.")
+
+
 def _load_sec_ticker_cik_map() -> dict:
     global _sec_ticker_cik_map_cache
     if isinstance(_sec_ticker_cik_map_cache, dict) and _sec_ticker_cik_map_cache:
         return _sec_ticker_cik_map_cache
 
+    mapping = dict(SEC_CIK_FALLBACK_MAP)
     url = "https://www.sec.gov/files/company_tickers.json"
-    response = requests.get(url, headers=_sec_headers(), timeout=12)
-    response.raise_for_status()
-    payload = response.json()
+    try:
+        payload = _sec_get_json(url, timeout=12)
 
-    mapping = {}
-    if isinstance(payload, dict):
-        rows = payload.values()
-    elif isinstance(payload, list):
-        rows = payload
-    else:
-        rows = []
+        if isinstance(payload, dict):
+            rows = payload.values()
+        elif isinstance(payload, list):
+            rows = payload
+        else:
+            rows = []
 
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        ticker = str(row.get("ticker", "")).strip().upper()
-        cik_str = row.get("cik_str")
-        if not ticker or cik_str in (None, ""):
-            continue
-        try:
-            mapping[ticker] = int(cik_str)
-        except Exception:
-            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            ticker = str(row.get("ticker", "")).strip().upper()
+            cik_str = row.get("cik_str")
+            if not ticker or cik_str in (None, ""):
+                continue
+            try:
+                mapping[ticker] = int(cik_str)
+            except Exception:
+                continue
+    except Exception:
+        # Keep fallback mapping so major tickers still resolve in constrained envs.
+        pass
 
     _sec_ticker_cik_map_cache = mapping
     return mapping
@@ -942,19 +977,21 @@ def _sec_backfill_q4_from_annual(quarterly_series: dict, annual_series: dict) ->
 def _get_quarterly_income_history_sec(ticker_symbol: str, max_quarters: int = 20) -> pd.DataFrame:
     ticker = str(ticker_symbol or "").strip().upper()
     if not ticker:
-        return pd.DataFrame()
+        empty = pd.DataFrame()
+        empty.attrs["sec_error"] = "Missing ticker symbol."
+        return empty
 
     try:
         cik_map = _load_sec_ticker_cik_map()
         cik = cik_map.get(ticker)
         if cik is None:
-            return pd.DataFrame()
+            empty = pd.DataFrame()
+            empty.attrs["sec_error"] = f"Ticker-to-CIK mapping unavailable for {ticker}."
+            return empty
 
         cik_padded = f"{int(cik):010d}"
         url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik_padded}.json"
-        response = requests.get(url, headers=_sec_headers(), timeout=15)
-        response.raise_for_status()
-        company_facts = response.json()
+        company_facts = _sec_get_json(url, timeout=15)
 
         def _extract_with_relaxed_fallback(concepts: list[str], unit_kind: str = "USD", min_points: int = 4) -> dict:
             strict_series = _sec_extract_series(
@@ -1039,7 +1076,9 @@ def _get_quarterly_income_history_sec(ticker_symbol: str, max_quarters: int = 20
 
         all_dates = set(revenue_series.keys()) | set(operating_income_series.keys()) | set(basic_eps_series.keys()) | set(diluted_eps_series.keys())
         if not all_dates:
-            return pd.DataFrame()
+            empty = pd.DataFrame()
+            empty.attrs["sec_error"] = f"No structured quarterly facts returned by SEC for {ticker}."
+            return empty
 
         ordered_dates = sorted(all_dates, key=lambda d: pd.to_datetime(d), reverse=True)
         if max_quarters and len(ordered_dates) > max_quarters:
@@ -1055,7 +1094,9 @@ def _get_quarterly_income_history_sec(ticker_symbol: str, max_quarters: int = 20
 
         df = pd.DataFrame(data, index=columns).T
         if df.empty:
-            return pd.DataFrame()
+            empty = pd.DataFrame()
+            empty.attrs["sec_error"] = f"SEC facts response produced an empty frame for {ticker}."
+            return empty
 
         backfill_quarters = sorted(
             set([r.get("quarter") for r in revenue_q4_derived + operating_income_q4_derived if r.get("quarter")]),
@@ -1068,8 +1109,10 @@ def _get_quarterly_income_history_sec(ticker_symbol: str, max_quarters: int = 20
             "quarters": backfill_quarters,
         }
         return df
-    except Exception:
-        return pd.DataFrame()
+    except Exception as e:
+        empty = pd.DataFrame()
+        empty.attrs["sec_error"] = _redact_api_secrets(str(e))
+        return empty
 
 
 def _date_key_from_column(col) -> str:
@@ -1295,6 +1338,7 @@ def _merge_yahoo_sec_quarterly_income(
 
 def _get_quarterly_income_history(ticker_symbol: str, max_quarters: int = 20) -> tuple[pd.DataFrame, str, dict]:
     sec_quarterly_income = _get_quarterly_income_history_sec(ticker_symbol, max_quarters=max_quarters)
+    sec_error = sec_quarterly_income.attrs.get("sec_error") if hasattr(sec_quarterly_income, "attrs") else None
 
     yahoo_quarterly_income = pd.DataFrame()
     try:
@@ -1312,6 +1356,8 @@ def _get_quarterly_income_history(ticker_symbol: str, max_quarters: int = 20) ->
         sec_q4_backfilled = sec_quarterly_income.attrs.get("sec_q4_backfilled") if hasattr(sec_quarterly_income, "attrs") else None
         if isinstance(sec_q4_backfilled, dict) and sec_q4_backfilled.get("total_q4_derived", 0):
             diagnostics["sec_q4_backfilled"] = sec_q4_backfilled
+        if sec_error:
+            diagnostics["sec_error"] = str(sec_error)
     if not merged_df.empty:
         if not yahoo_quarterly_income.empty and not sec_quarterly_income.empty:
             source = "Yahoo + SEC (Yahoo-priority)"
@@ -1698,9 +1744,16 @@ def analyze_quarterly_trends(ticker_symbol: str, num_quarters: int = 8, end_date
                 "This is all currently available in structured XBRL for this ticker."
             )
         elif data_source.startswith("Yahoo Finance") and len(all_quarters) < requested_quarters:
+            sec_error = source_diagnostics.get("sec_error") if isinstance(source_diagnostics, dict) else None
+            sec_error_note = ""
+            if sec_error:
+                sec_error_text = str(sec_error).strip()
+                if len(sec_error_text) > 180:
+                    sec_error_text = sec_error_text[:177] + "..."
+                sec_error_note = f" SEC fetch issue: {sec_error_text}"
             result["warning"] = (
                 f"Yahoo Finance returned {len(all_quarters)} quarterly reports for {ticker_symbol}. "
-                "SEC data was unavailable for additional merge coverage."
+                f"SEC data was unavailable for additional merge coverage.{sec_error_note}"
             )
         
         # Find the most recent quarter
