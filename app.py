@@ -29,6 +29,7 @@ except Exception:
     # st.secrets is not always available locally.
     pass
 import pandas as pd
+import altair as alt
 import json
 from engine import get_financials, run_structured_prompt, calculate_metrics, run_chat, analyze_quarterly_trends, generate_independent_forecast, get_latest_date_info, get_available_report_dates, calculate_comprehensive_analysis
 from data_adapter import DataAdapter, DataQualityMetadata, NormalizedFinancialSnapshot
@@ -37,6 +38,7 @@ from dcf_ui_adapter import DCFUIAdapter
 from sources import SOURCE_CATALOG
 
 UI_CACHE_VERSION = 1
+REPORT_DATES_CACHE_VERSION = "v4"
 UI_CACHE_PATH = Path(__file__).resolve().parent / "data" / "user_ui_cache.json"
 MAX_TICKER_LIBRARY_SIZE = 100
 MAX_REPORT_DATE_CACHE_TICKERS = 300
@@ -73,6 +75,7 @@ SNAPSHOT_METADATA_FIELDS = [
 def _default_ui_cache() -> dict:
     return {
         "version": UI_CACHE_VERSION,
+        "available_report_dates_version": REPORT_DATES_CACHE_VERSION,
         "ticker_library": MAG7_TICKERS.copy(),
         "last_selected_ticker": "MSFT",
         "available_report_dates": {},
@@ -189,11 +192,18 @@ def load_ui_cache() -> dict:
             data = json.load(f)
         if not isinstance(data, dict):
             return default
+        report_dates_version = str(data.get("available_report_dates_version", "")).strip()
+        available_dates_cache = (
+            _normalize_available_report_dates_cache(data.get("available_report_dates", {}))
+            if report_dates_version == REPORT_DATES_CACHE_VERSION
+            else {}
+        )
         cache = {
             "version": data.get("version", UI_CACHE_VERSION),
+            "available_report_dates_version": REPORT_DATES_CACHE_VERSION,
             "ticker_library": _normalize_ticker_library(data.get("ticker_library", [])),
             "last_selected_ticker": _normalize_ticker(data.get("last_selected_ticker", "MSFT")) or "MSFT",
-            "available_report_dates": _normalize_available_report_dates_cache(data.get("available_report_dates", {})),
+            "available_report_dates": available_dates_cache,
             "results": data.get("results", {}) if isinstance(data.get("results", {}), dict) else {},
         }
         return cache
@@ -206,6 +216,7 @@ def save_ui_cache(cache_obj: dict) -> None:
         UI_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "version": UI_CACHE_VERSION,
+            "available_report_dates_version": REPORT_DATES_CACHE_VERSION,
             "ticker_library": _normalize_ticker_library(cache_obj.get("ticker_library", [])),
             "last_selected_ticker": _normalize_ticker(cache_obj.get("last_selected_ticker", "MSFT")) or "MSFT",
             "available_report_dates": _normalize_available_report_dates_cache(cache_obj.get("available_report_dates", {})),
@@ -489,8 +500,14 @@ def _call_with_timeout(func, *args, timeout_seconds: int, fallback=None):
 # TTL (time-to-live) of 1 hour = 3600 seconds
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def cached_quarterly_analysis(ticker: str, num_quarters: int = 8, end_date: str = None) -> dict:
+def cached_quarterly_analysis(
+    ticker: str,
+    num_quarters: int = 8,
+    end_date: str = None,
+    history_source_version: str = "v10",
+) -> dict:
     """Cached version of analyze_quarterly_trends to avoid API rate limits."""
+    _ = history_source_version  # cache-key salt when quarterly history sourcing logic changes
     fallback = {
         "ticker": ticker,
         "analysis_date": datetime.now().strftime("%Y-%m-%d"),
@@ -512,8 +529,9 @@ def cached_quarterly_analysis(ticker: str, num_quarters: int = 8, end_date: str 
     return result if isinstance(result, dict) else fallback
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def cached_available_dates(ticker: str) -> list:
+def cached_available_dates(ticker: str, history_source_version: str = "v10") -> list:
     """Cached wrapper for get_available_report_dates."""
+    _ = history_source_version  # cache-key salt when available-date sourcing logic changes
     result = _call_with_timeout(
         get_available_report_dates,
         ticker,
@@ -2617,6 +2635,10 @@ if 'ai_outlook_error' not in st.session_state:
     st.session_state.ai_outlook_error = None
 if 'ui_cache' not in st.session_state:
     st.session_state.ui_cache = load_ui_cache()
+if st.session_state.ui_cache.get("available_report_dates_version") != REPORT_DATES_CACHE_VERSION:
+    st.session_state.ui_cache["available_report_dates_version"] = REPORT_DATES_CACHE_VERSION
+    st.session_state.ui_cache["available_report_dates"] = {}
+    save_ui_cache(st.session_state.ui_cache)
 if 'ticker_library' not in st.session_state:
     st.session_state.ticker_library = _normalize_ticker_library(st.session_state.ui_cache.get("ticker_library", []))
 if 'last_restore_key' not in st.session_state:
@@ -2633,6 +2655,17 @@ if 'assumption_suggestions_loaded' not in st.session_state:
     st.session_state.assumption_suggestions_loaded = False
 if 'assumption_suggestions_ticker' not in st.session_state:
     st.session_state.assumption_suggestions_ticker = None
+if 'config_num_quarters' not in st.session_state:
+    existing_num_quarters = st.session_state.get("num_quarters", 8)
+    if not isinstance(existing_num_quarters, int):
+        existing_num_quarters = 8
+    st.session_state.config_num_quarters = min(20, max(8, existing_num_quarters))
+if 'pending_config_num_quarters' not in st.session_state:
+    st.session_state.pending_config_num_quarters = None
+if 'momentum_display_quarters' not in st.session_state:
+    st.session_state.momentum_display_quarters = 8
+if 'pending_momentum_display_quarters' not in st.session_state:
+    st.session_state.pending_momentum_display_quarters = None
 
 # --- Helper Functions ---
 def reset_analysis():
@@ -2651,6 +2684,12 @@ def reset_analysis():
     st.session_state.dcf_snapshot = None
     st.session_state.assumption_suggestions_loaded = False
     st.session_state.assumption_suggestions_ticker = None
+    configured_quarters = st.session_state.get("config_num_quarters", 8)
+    if not isinstance(configured_quarters, int):
+        configured_quarters = 8
+    st.session_state.momentum_display_quarters = min(20, max(8, configured_quarters))
+    st.session_state.pending_config_num_quarters = None
+    st.session_state.pending_momentum_display_quarters = None
 
 def display_stock_call(call: str):
     """Displays the stock call with clean styling."""
@@ -2846,7 +2885,17 @@ with st.sidebar:
     
     # Analysis Period selection
     st.markdown("**Analysis Period**")
-    num_quarters = st.slider("Historical Quarters", min_value=8, max_value=20, value=8, help="How many quarters of historical data to analyze (minimum 8 for trend visibility)")
+    pending_config_quarters = st.session_state.get("pending_config_num_quarters")
+    if isinstance(pending_config_quarters, int):
+        st.session_state.config_num_quarters = min(20, max(8, pending_config_quarters))
+    st.session_state.pending_config_num_quarters = None
+    num_quarters = st.slider(
+        "Historical Quarters",
+        min_value=8,
+        max_value=20,
+        key="config_num_quarters",
+        help="How many quarters of historical data to analyze (minimum 8 for trend visibility)"
+    )
     
     # Single selectbox for ending report date - only shows ACTUAL available dates
     if available_dates:
@@ -2975,6 +3024,10 @@ with st.sidebar:
                         st.session_state.quarterly_analysis = analysis
                         # Calculate comprehensive analysis (DuPont + DCF)
                         quarterly_data = analysis.get("historical_trends", {}).get("quarterly_data", [])
+                        st.session_state.momentum_display_quarters = min(
+                            max(1, len(quarterly_data)),
+                            max(8, num_quarters)
+                        ) if quarterly_data else max(8, num_quarters)
                         st.session_state.comprehensive_analysis = calculate_comprehensive_analysis(
                             inc,
                             bal,
@@ -3054,17 +3107,16 @@ if st.session_state.quarterly_analysis:
     data_source = analysis.get("data_source", "Unknown")
     warning = analysis.get("warning")
     hist_data = analysis.get("historical_trends", {}).get("quarterly_data", [])
+    data_coverage = analysis.get("historical_trends", {}).get("data_coverage", {})
+    source_diagnostics = analysis.get("historical_trends", {}).get("source_diagnostics", {})
     growth_summary = analysis.get("growth_rates", {}).get("summary", {})
+    seasonality_info = analysis.get("growth_rates", {}).get("seasonality", {})
     growth_detail = analysis.get("growth_rates", {}).get("detailed", [])
     comp_analysis = st.session_state.get("comprehensive_analysis", {})
     consensus = analysis.get("consensus_estimates", {})
     next_forecast_label = next_forecast.get("label", "Next Quarter")
     dcf_ui = st.session_state.get("dcf_ui_adapter")
 
-    if warning:
-        st.warning(warning)
-    if st.session_state.get("cache_restore_notice"):
-        st.info(st.session_state.cache_restore_notice)
     st.markdown("""
 <div class="disclaimer-banner">
   <div class="disclaimer-title">Disclaimer</div>
@@ -3694,42 +3746,229 @@ if st.session_state.quarterly_analysis:
     col_h1, col_h2, col_h3, col_h4 = st.columns(4)
     with col_h1:
         avg_rev = growth_summary.get("avg_revenue_yoy")
-        st.metric("Avg Revenue Growth (YoY)", f"{avg_rev:.1f}%" if avg_rev else "N/A")
+        st.metric("Avg Revenue Growth (YoY)", f"{avg_rev:.1f}%" if avg_rev is not None else "N/A")
     with col_h2:
         avg_eps = growth_summary.get("avg_eps_yoy")
-        st.metric("Avg EPS Growth (YoY)", f"{avg_eps:.1f}%" if avg_eps else "N/A")
+        st.metric("Avg EPS Growth (YoY)", f"{avg_eps:.1f}%" if avg_eps is not None else "N/A")
     with col_h3:
-        st.metric("Quarters Analyzed", growth_summary.get("samples_used", "N/A"))
+        quarters_with_revenue = growth_summary.get("quarters_with_revenue")
+        quarters_with_eps = growth_summary.get("quarters_with_eps")
+        quarters_plotted = 0
+        if isinstance(quarters_with_revenue, int):
+            quarters_plotted = max(quarters_plotted, quarters_with_revenue)
+        if isinstance(quarters_with_eps, int):
+            quarters_plotted = max(quarters_plotted, quarters_with_eps)
+        if not quarters_plotted:
+            fallback_samples = growth_summary.get("samples_used")
+            quarters_plotted = fallback_samples if isinstance(fallback_samples, int) else 0
+        st.metric("Quarters Plotted", quarters_plotted if quarters_plotted else "N/A")
     with col_h4:
-        if growth_detail and len(growth_detail) >= 4:
-            q4_revenues = [g.get("revenue_qoq") for g in growth_detail if "Q4" in g.get("quarter", "") and g.get("revenue_qoq")]
-            if q4_revenues:
-                avg_q4 = sum(q4_revenues) / len(q4_revenues)
-                seasonality = "Strong Q4" if avg_q4 > 5 else ("Weak Q4" if avg_q4 < -5 else "Stable")
-            else:
-                seasonality = "N/A"
-        else:
-            seasonality = "N/A"
+        seasonality = seasonality_info.get("pattern", "N/A")
         st.metric("Seasonality Pattern", seasonality)
 
+    total_quarters = growth_summary.get("samples_used")
+    revenue_yoy_pairs = growth_summary.get("revenue_yoy_pairs")
+    eps_yoy_pairs = growth_summary.get("eps_yoy_pairs")
+    coverage_parts = []
+    if isinstance(quarters_with_revenue, int) and isinstance(total_quarters, int):
+        coverage_parts.append(f"Revenue points: {quarters_with_revenue}/{total_quarters}")
+    if isinstance(quarters_with_eps, int) and isinstance(total_quarters, int):
+        coverage_parts.append(f"EPS points: {quarters_with_eps}/{total_quarters}")
+    if isinstance(revenue_yoy_pairs, int):
+        coverage_parts.append(f"Revenue YoY pairs: {revenue_yoy_pairs}")
+    if isinstance(eps_yoy_pairs, int):
+        coverage_parts.append(f"EPS YoY pairs: {eps_yoy_pairs}")
+    mismatch_points = source_diagnostics.get("mismatch_points")
+    if isinstance(mismatch_points, int) and mismatch_points > 0:
+        coverage_parts.append(f"Cross-source mismatches: {mismatch_points} (Yahoo-priority)")
+    yahoo_collisions = source_diagnostics.get("yahoo_date_collisions_collapsed")
+    sec_collisions = source_diagnostics.get("sec_date_collisions_collapsed")
+    collision_total = 0
+    if isinstance(yahoo_collisions, int):
+        collision_total += yahoo_collisions
+    if isinstance(sec_collisions, int):
+        collision_total += sec_collisions
+    if collision_total > 0:
+        coverage_parts.append(f"Quarter-date collisions normalized: {collision_total}")
+    sec_q4_backfilled = source_diagnostics.get("sec_q4_backfilled", {})
+    if isinstance(sec_q4_backfilled, dict):
+        total_q4_derived = sec_q4_backfilled.get("total_q4_derived")
+        if isinstance(total_q4_derived, int) and total_q4_derived > 0:
+            derived_quarters = sec_q4_backfilled.get("quarters", []) if isinstance(sec_q4_backfilled.get("quarters", []), list) else []
+            preview = ", ".join(derived_quarters[:3]) if derived_quarters else ""
+            if len(derived_quarters) > 3:
+                preview += ", ..."
+            coverage_parts.append(
+                f"SEC Q4 backfilled: {total_q4_derived}" + (f" ({preview})" if preview else "")
+            )
+    missing_revenue_quarters = data_coverage.get("missing_revenue_quarters", [])
+    missing_eps_quarters = data_coverage.get("missing_eps_quarters", [])
+    missing_report_quarters = data_coverage.get("missing_report_quarters", [])
+    if missing_report_quarters:
+        missing_report_display = ", ".join(missing_report_quarters[:3])
+        if len(missing_report_quarters) > 3:
+            missing_report_display += ", ..."
+        coverage_parts.append(f"Missing report quarters: {missing_report_display}")
+    if missing_revenue_quarters:
+        missing_rev_display = ", ".join(missing_revenue_quarters[:3])
+        if len(missing_revenue_quarters) > 3:
+            missing_rev_display += ", ..."
+        coverage_parts.append(f"Missing revenue: {missing_rev_display}")
+    if missing_eps_quarters:
+        missing_eps_display = ", ".join(missing_eps_quarters[:3])
+        if len(missing_eps_quarters) > 3:
+            missing_eps_display += ", ..."
+        coverage_parts.append(f"Missing EPS: {missing_eps_display}")
+    if coverage_parts:
+        st.caption(" | ".join(coverage_parts))
+    seasonality_reason = seasonality_info.get("reason")
+    if seasonality_reason:
+        st.caption(f"Seasonality method: {seasonality_reason}")
+
     if hist_data:
-        df_hist = pd.DataFrame(hist_data).set_index("quarter")
-        display_quarters = st.session_state.get("num_quarters", 8)
-        col_chart1, col_chart2 = st.columns(2)
-        with col_chart1:
-            st.caption("Revenue Trend")
-            chart_df = df_hist[["revenue"]].head(display_quarters).iloc[::-1]
-            chart_df.columns = ["Revenue"]
-            chart_df = chart_df.dropna(how="all")
-            if not chart_df.empty:
-                st.line_chart(chart_df, height=200, use_container_width=True)
-        with col_chart2:
-            st.caption("EPS Trend")
-            eps_df = df_hist[["eps"]].head(display_quarters).iloc[::-1]
-            eps_df.columns = ["EPS"]
-            eps_df = eps_df.dropna(how="all")
-            if not eps_df.empty:
-                st.line_chart(eps_df, height=200, use_container_width=True)
+        loaded_quarters = len(hist_data)
+        configured_quarters = st.session_state.get("num_quarters", loaded_quarters)
+        if not isinstance(configured_quarters, int):
+            configured_quarters = loaded_quarters
+        available_dates = st.session_state.get("available_dates", []) or []
+        selected_end_date = st.session_state.get("selected_end_date")
+        context_available_quarters = len(available_dates)
+        if available_dates and selected_end_date:
+            date_values = [d.get("value") for d in available_dates if isinstance(d, dict)]
+            if selected_end_date in date_values:
+                selected_idx = date_values.index(selected_end_date)
+                context_available_quarters = max(1, len(date_values) - selected_idx)
+
+        source_total_quarters = 0
+        if isinstance(source_diagnostics, dict):
+            source_total_quarters = (
+                source_diagnostics.get("merged_quarters")
+                or source_diagnostics.get("yahoo_quarters")
+                or source_diagnostics.get("sec_quarters")
+                or 0
+            )
+        if not isinstance(source_total_quarters, int):
+            source_total_quarters = 0
+
+        if source_total_quarters > 0:
+            max_context_quarters = min(context_available_quarters, source_total_quarters) if context_available_quarters else source_total_quarters
+        else:
+            max_context_quarters = context_available_quarters
+        max_available_quarters = min(20, max(loaded_quarters, max_context_quarters or loaded_quarters))
+        min_display_quarters = 4 if max_available_quarters >= 4 else 1
+
+        pending_display_quarters = st.session_state.get("pending_momentum_display_quarters")
+        if isinstance(pending_display_quarters, int):
+            clamped_pending = min(
+                max_available_quarters,
+                max(min_display_quarters, pending_display_quarters),
+            )
+            st.session_state.momentum_display_quarters = clamped_pending
+        st.session_state.pending_momentum_display_quarters = None
+
+        current_display_quarters = st.session_state.get("momentum_display_quarters", configured_quarters)
+        if not isinstance(current_display_quarters, int):
+            current_display_quarters = configured_quarters
+        current_display_quarters = min(max_available_quarters, max(min_display_quarters, current_display_quarters))
+        st.session_state.momentum_display_quarters = current_display_quarters
+
+        trend_col, rail_col = st.columns([6, 1], gap="medium")
+
+        requested_quarters = current_display_quarters
+        with rail_col:
+            st.markdown("**Quarter Rail**")
+            st.caption(f"Loaded: {loaded_quarters} | Max: {max_available_quarters}")
+            if available_dates and selected_end_date:
+                date_values = [d.get("value") for d in available_dates if isinstance(d, dict)]
+                if selected_end_date in date_values:
+                    selected_idx = date_values.index(selected_end_date)
+                    if selected_idx > 0:
+                        st.caption(f"Anchor end-date limits visible history to {context_available_quarters} quarter(s).")
+            st.slider(
+                "Display quarters",
+                min_value=min_display_quarters,
+                max_value=max_available_quarters,
+                key="momentum_display_quarters",
+                label_visibility="collapsed",
+                help="Move the rail to request more history. If you move above loaded data, additional quarters are fetched automatically.",
+            )
+            requested_quarters = int(st.session_state.get("momentum_display_quarters", current_display_quarters))
+            requested_quarters = min(max_available_quarters, max(min_display_quarters, requested_quarters))
+            if requested_quarters > loaded_quarters:
+                st.caption(f"Auto-loading +{requested_quarters - loaded_quarters} quarter(s)")
+            else:
+                st.caption("Using currently loaded history.")
+
+        if requested_quarters > loaded_quarters:
+            end_date_for_reload = st.session_state.get("end_date") or st.session_state.get("selected_end_date")
+            with st.spinner(f"Loading up to {requested_quarters} quarters for {ticker}..."):
+                expanded_analysis = cached_quarterly_analysis(ticker, requested_quarters, end_date_for_reload)
+            expanded_hist_data = expanded_analysis.get("historical_trends", {}).get("quarterly_data", [])
+            if len(expanded_hist_data) > loaded_quarters:
+                st.session_state.quarterly_analysis = expanded_analysis
+                st.session_state.num_quarters = requested_quarters
+                st.session_state.pending_config_num_quarters = requested_quarters
+                st.session_state.pending_momentum_display_quarters = min(requested_quarters, len(expanded_hist_data))
+
+                financials = st.session_state.get("financials", {}) if isinstance(st.session_state.get("financials", {}), dict) else {}
+                inc = financials.get("income", pd.DataFrame())
+                bal = financials.get("balance", pd.DataFrame())
+                cf = financials.get("cashflow", pd.DataFrame())
+                qcf = financials.get("quarterly_cashflow", pd.DataFrame())
+                st.session_state.comprehensive_analysis = calculate_comprehensive_analysis(
+                    inc,
+                    bal,
+                    expanded_hist_data,
+                    ticker,
+                    cf,
+                    qcf
+                )
+                st.rerun()
+
+            st.session_state.pending_config_num_quarters = max(8, loaded_quarters)
+            st.session_state.pending_momentum_display_quarters = loaded_quarters
+            st.info("No additional quarters were returned for this ticker and selected ending report.")
+            st.rerun()
+
+        display_quarters = min(requested_quarters, loaded_quarters)
+        hist_window = hist_data[:display_quarters]
+        df_hist = pd.DataFrame(hist_window)
+        quarter_order = list(reversed(df_hist["quarter"].tolist())) if not df_hist.empty and "quarter" in df_hist.columns else []
+        if not df_hist.empty:
+            df_hist = df_hist.iloc[::-1].reset_index(drop=True)
+
+        def render_trend_chart(chart_source: pd.DataFrame, value_col: str, y_title: str, color: str):
+            chart_data = chart_source[["quarter", value_col]].copy()
+            if chart_data.empty or not chart_data[value_col].notna().any():
+                st.caption("No data available for this trend.")
+                return
+
+            line = (
+                alt.Chart(chart_data)
+                .mark_line(point=True, strokeWidth=3, color=color)
+                .encode(
+                    x=alt.X(
+                        "quarter:N",
+                        sort=quarter_order if quarter_order else None,
+                        axis=alt.Axis(title=None, labelAngle=-45, labelOverlap=False),
+                    ),
+                    y=alt.Y(f"{value_col}:Q", title=y_title),
+                    tooltip=[
+                        alt.Tooltip("quarter:N", title="Quarter"),
+                        alt.Tooltip(f"{value_col}:Q", title=y_title, format=",.2f"),
+                    ],
+                )
+            )
+            st.altair_chart(line, use_container_width=True)
+
+        with trend_col:
+            col_chart1, col_chart2 = st.columns(2)
+            with col_chart1:
+                st.caption("Revenue Trend")
+                render_trend_chart(df_hist, "revenue", "Revenue (USD)", "#1f77b4")
+            with col_chart2:
+                st.caption("EPS Trend")
+                render_trend_chart(df_hist, "eps", "EPS", "#1f77b4")
 
     st.markdown("**Fundamental Drivers (DuPont)**")
     dupont = comp_analysis.get("dupont", {}) if comp_analysis else {}
