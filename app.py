@@ -10,6 +10,7 @@ Clean, minimalistic financial analysis tool with 3 steps:
 
 import os
 import re
+import html
 import streamlit as st
 import streamlit.components.v1 as components
 from pathlib import Path
@@ -31,6 +32,7 @@ except Exception:
 import pandas as pd
 import altair as alt
 import json
+import yfinance as yf
 from engine import get_financials, run_structured_prompt, calculate_metrics, run_chat, analyze_quarterly_trends, generate_independent_forecast, get_latest_date_info, get_available_report_dates, calculate_comprehensive_analysis
 from data_adapter import DataAdapter, DataQualityMetadata, NormalizedFinancialSnapshot
 from dcf_engine import DCFEngine, DCFAssumptions
@@ -568,6 +570,19 @@ def cached_financials(ticker: str) -> tuple:
 def cached_latest_date_info(ticker: str) -> dict:
     """Cached wrapper for get_latest_date_info from engine."""
     return get_latest_date_info(ticker)
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_company_name(ticker: str) -> str:
+    """Lightweight cached lookup of company display name."""
+    normalized_ticker = _normalize_ticker(ticker)
+    if not _is_valid_ticker_format(normalized_ticker):
+        return ""
+    try:
+        info = yf.Ticker(normalized_ticker).info or {}
+        name = str(info.get("longName") or info.get("shortName") or "").strip()
+        return name
+    except Exception:
+        return ""
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def cached_financial_snapshot(ticker: str, suggestion_algo_version: str = "v2"):
@@ -2214,7 +2229,7 @@ st.markdown("""
         font-family: 'JetBrains Mono', monospace; letter-spacing: -.02em;
     }
     .hero-ticker-source {
-        font-size: .65rem; color: var(--clr-text-muted); text-transform: uppercase; letter-spacing: .06em;
+        font-size: .70rem; color: var(--clr-text-muted); letter-spacing: .02em;
     }
 
     /* Report navigation + decision strip */
@@ -3172,6 +3187,15 @@ if st.session_state.quarterly_analysis:
     _mcap_str = f"${_mcap/1e9:.1f}B" if _mcap else "—"
     _show_pe = _pe is not None and _pe > 0
     _pe_str = f"{_pe:.1f}x" if _show_pe else None
+    _snapshot_for_name = st.session_state.get("dcf_snapshot")
+    _company_name = (
+        str(getattr(_snapshot_for_name, "company_name", "")).strip()
+        if _snapshot_for_name is not None
+        else ""
+    )
+    if not _company_name:
+        _company_name = cached_company_name(ticker)
+    _company_name_display = html.escape(_company_name) if _company_name else ticker
 
     _hero_tiles = [
         ("Price", _price_str, None),
@@ -3197,7 +3221,7 @@ if st.session_state.quarterly_analysis:
   <div class="hero-divider"></div>
   <div class="hero-ticker">
     <span class="hero-ticker-symbol">{ticker}</span>
-    <span class="hero-ticker-source">via yFinance</span>
+    <span class="hero-ticker-source">{_company_name_display}</span>
   </div>
 </div>
     """, unsafe_allow_html=True)
