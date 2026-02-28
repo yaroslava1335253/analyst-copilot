@@ -2655,6 +2655,8 @@ if 'assumption_suggestions_loaded' not in st.session_state:
     st.session_state.assumption_suggestions_loaded = False
 if 'assumption_suggestions_ticker' not in st.session_state:
     st.session_state.assumption_suggestions_ticker = None
+if 'valuation_inputs_seeded_context' not in st.session_state:
+    st.session_state.valuation_inputs_seeded_context = None
 if 'config_num_quarters' not in st.session_state:
     existing_num_quarters = st.session_state.get("num_quarters", 8)
     if not isinstance(existing_num_quarters, int):
@@ -2684,6 +2686,7 @@ def reset_analysis():
     st.session_state.dcf_snapshot = None
     st.session_state.assumption_suggestions_loaded = False
     st.session_state.assumption_suggestions_ticker = None
+    st.session_state.valuation_inputs_seeded_context = None
     configured_quarters = st.session_state.get("config_num_quarters", 8)
     if not isinstance(configured_quarters, int):
         configured_quarters = 8
@@ -3485,26 +3488,11 @@ if st.session_state.quarterly_analysis:
     st.markdown('<div class="section-header"><span class="step-badge">Step 02</span><span class="section-title">Valuation Drivers</span></div>', unsafe_allow_html=True)
     st.caption("Tune assumptions, rerun the model, and review core valuation outputs.")
 
-    snapshot_for_suggestions = None
-    suggestions_ready = (
-        st.session_state.get("assumption_suggestions_loaded", False)
-        and st.session_state.get("assumption_suggestions_ticker") == ticker
+    snapshot_for_suggestions = cached_financial_snapshot(
+        ticker,
+        suggestion_algo_version="v3_forward_consensus",
     )
-    if suggestions_ready:
-        snapshot_for_suggestions = cached_financial_snapshot(
-            ticker,
-            suggestion_algo_version="v3_forward_consensus",
-        )
-    else:
-        st.caption("Suggested WACC/FCF inputs are optional and loaded on demand for faster first paint.")
-        if st.button(
-            "Load Suggested Assumptions",
-            key=f"load_suggested_assumptions_{ticker}",
-            use_container_width=False,
-        ):
-            st.session_state.assumption_suggestions_loaded = True
-            st.session_state.assumption_suggestions_ticker = ticker
-            st.rerun()
+    st.caption("Suggested assumptions are auto-loaded for the active ticker. You can adjust them after review.")
 
     suggested_wacc = 9.0
     suggested_fcf_growth = 8.0
@@ -3518,20 +3506,27 @@ if st.session_state.quarterly_analysis:
             suggested_fcf_reliability = snapshot_for_suggestions.suggested_fcf_growth.reliability_score
             suggested_fcf_period_type = snapshot_for_suggestions.suggested_fcf_growth.period_type
 
-    stored_wacc = st.session_state.get("dcf_wacc")
-    stored_fcf_growth = st.session_state.get("dcf_fcf_growth")
-    stored_terminal_growth = st.session_state.get("dcf_terminal_growth")
-    default_wacc = stored_wacc if stored_wacc is not None else suggested_wacc
-    if stored_fcf_growth is not None:
-        default_fcf_growth = stored_fcf_growth
-    else:
-        # Keep defaults conservative if suggestion quality is low.
+    # Seed sliders from suggestions once per loaded valuation context (ticker + selected end date + quarters).
+    valuation_end_date = st.session_state.get("end_date") or st.session_state.get("selected_end_date") or "latest"
+    valuation_num_quarters = st.session_state.get("num_quarters") or st.session_state.get("config_num_quarters") or 8
+    valuation_context_key = build_context_key(ticker, valuation_end_date, int(valuation_num_quarters))
+    wacc_slider_key = f"wacc_slider_{ticker}"
+    fcf_slider_key = f"fcf_growth_slider_{ticker}"
+    terminal_growth_key = f"terminal_growth_slider_{ticker}"
+
+    if st.session_state.get("valuation_inputs_seeded_context") != valuation_context_key:
+        seeded_fcf_growth = suggested_fcf_growth
         if suggested_fcf_reliability is not None and suggested_fcf_reliability < 65:
-            default_fcf_growth = 8.0
-        else:
-            default_fcf_growth = suggested_fcf_growth
+            seeded_fcf_growth = 8.0
+        st.session_state[wacc_slider_key] = float(min(15.0, max(5.0, suggested_wacc)))
+        st.session_state[fcf_slider_key] = float(min(25.0, max(0.0, seeded_fcf_growth)))
+        st.session_state[terminal_growth_key] = 3.0
+        st.session_state.valuation_inputs_seeded_context = valuation_context_key
+
+    default_wacc = float(st.session_state.get(wacc_slider_key, suggested_wacc))
+    default_fcf_growth = float(st.session_state.get(fcf_slider_key, suggested_fcf_growth))
     default_fcf_growth = max(0.0, min(25.0, default_fcf_growth))
-    default_terminal_growth = stored_terminal_growth if stored_terminal_growth is not None else 3.0
+    default_terminal_growth = float(st.session_state.get(terminal_growth_key, 3.0))
 
     col_wacc, col_growth, col_terminal = st.columns(3)
     with col_wacc:
@@ -3542,7 +3537,7 @@ if st.session_state.quarterly_analysis:
             value=default_wacc,
             step=0.1,
             format="%.1f",
-            key=f"wacc_slider_{ticker}",
+            key=wacc_slider_key,
             help=(
                 "Forward discount-rate assumption used in DCF. "
                 "View DCF Details to see full component trace (Re, Rd, weights, and sources)."
@@ -3576,7 +3571,7 @@ if st.session_state.quarterly_analysis:
             value=default_fcf_growth,
             step=0.1,
             format="%.1f",
-            key=f"fcf_growth_slider_{ticker}",
+            key=fcf_slider_key,
             help="Annual free-cash-flow growth for projection period."
         )
         if snapshot_for_suggestions and snapshot_for_suggestions.suggested_fcf_growth.value is not None:
@@ -3592,13 +3587,12 @@ if st.session_state.quarterly_analysis:
 
             quality_text = f", quality {suggested_fcf_reliability}/100" if suggested_fcf_reliability is not None else ""
             st.caption(f"Suggested: {suggested_fcf_growth:.1f}% ({source_label}{quality_text})")
-            if stored_fcf_growth is None and suggested_fcf_reliability is not None and suggested_fcf_reliability < 65:
+            if suggested_fcf_reliability is not None and suggested_fcf_reliability < 65:
                 st.caption("Default set to 8.0% because suggestion quality is low.")
 
     with col_terminal:
         terminal_growth_min = 0.0
         terminal_growth_max = max(0.5, min(6.0, round(user_wacc - 0.5, 1)))
-        terminal_growth_key = f"terminal_growth_slider_{ticker}"
         if terminal_growth_key in st.session_state:
             st.session_state[terminal_growth_key] = min(
                 max(st.session_state[terminal_growth_key], terminal_growth_min),
