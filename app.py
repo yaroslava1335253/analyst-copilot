@@ -3002,21 +3002,32 @@ with st.sidebar:
         elif not ticker_valid:
             st.warning("Please enter/select a valid ticker symbol.")
         else:
-            if not selected_end_date:
-                with st.spinner(f"Fetching available reports for {ticker}..."):
-                    dates = _load_report_dates_for_ticker(ticker)
-                st.session_state.available_dates = dates if isinstance(dates, list) else []
-                if st.session_state.available_dates:
-                    st.session_state.selected_end_date = st.session_state.available_dates[0]["value"]
-                    selected_end_date = st.session_state.selected_end_date
-                    st.session_state.report_dates_hint = ""
+            # Always attempt a fresh report-date fetch on load so newly released quarters
+            # appear without requiring a manual "Refresh Available Dates" click.
+            previous_selected_end_date = selected_end_date
+            with st.spinner(f"Checking latest available reports for {ticker}..."):
+                refreshed_dates = _load_report_dates_for_ticker(ticker, force_refresh=True)
+            st.session_state.available_dates_ticker = ticker
+            st.session_state.available_dates = refreshed_dates if isinstance(refreshed_dates, list) else []
+            if st.session_state.available_dates:
+                refreshed_values = [
+                    d.get("value")
+                    for d in st.session_state.available_dates
+                    if isinstance(d, dict) and d.get("value")
+                ]
+                if previous_selected_end_date in refreshed_values:
+                    st.session_state.selected_end_date = previous_selected_end_date
                 else:
-                    st.session_state.selected_end_date = None
-                    selected_end_date = None
-                    st.session_state.report_dates_hint = (
-                        f"No report dates returned within {AVAILABLE_DATES_TIMEOUT_SECONDS}s. "
-                        "Use Refresh Available Dates to try again."
-                    )
+                    st.session_state.selected_end_date = refreshed_values[0]
+                selected_end_date = st.session_state.selected_end_date
+                st.session_state.report_dates_hint = ""
+            else:
+                st.session_state.selected_end_date = None
+                selected_end_date = None
+                st.session_state.report_dates_hint = (
+                    f"No report dates returned within {AVAILABLE_DATES_TIMEOUT_SECONDS}s. "
+                    "Use Refresh Available Dates to try again."
+                )
 
             if not selected_end_date:
                 st.warning("Please select a valid ending report date first.")
