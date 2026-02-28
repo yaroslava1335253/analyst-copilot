@@ -10,6 +10,7 @@ Clean, minimalistic financial analysis tool with 3 steps:
 
 import os
 import re
+import requests
 import streamlit as st
 import streamlit.components.v1 as components
 from pathlib import Path
@@ -48,6 +49,7 @@ AVAILABLE_DATES_TIMEOUT_SECONDS = 8
 FINANCIALS_TIMEOUT_SECONDS = 20
 QUARTERLY_ANALYSIS_TIMEOUT_SECONDS = 25
 SNAPSHOT_TIMEOUT_SECONDS = 12
+TICKER_SEARCH_TIMEOUT_SECONDS = 6
 SNAPSHOT_METADATA_FIELDS = [
     "price",
     "shares_outstanding",
@@ -295,6 +297,107 @@ def _upsert_ticker_in_library(ticker: str) -> None:
         st.session_state.ui_cache = cache
         st.session_state.ticker_library = library
         save_ui_cache(cache)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_ticker_search(query: str, provider_version: str = "v1") -> list:
+    """Search Yahoo symbols by partial ticker/company query."""
+    _ = provider_version  # cache-key salt for search behavior updates
+    normalized_query = str(query or "").strip()
+    if len(normalized_query) < 1:
+        return []
+
+    url = "https://query1.finance.yahoo.com/v1/finance/search"
+    params = {
+        "q": normalized_query,
+        "quotesCount": 20,
+        "newsCount": 0,
+        "enableFuzzyQuery": "true",
+    }
+    headers = {
+        "User-Agent": "AnalystCoPilot/1.0 (research tool)",
+        "Accept": "application/json",
+    }
+
+    try:
+        response = requests.get(url, params=params, headers=headers, timeout=TICKER_SEARCH_TIMEOUT_SECONDS)
+        response.raise_for_status()
+        payload = response.json() if response.content else {}
+    except Exception:
+        return []
+
+    raw_quotes = payload.get("quotes", []) if isinstance(payload, dict) else []
+    if not isinstance(raw_quotes, list):
+        return []
+
+    search_upper = _normalize_ticker(normalized_query)
+    deduped = {}
+    for quote in raw_quotes:
+        if not isinstance(quote, dict):
+            continue
+        symbol = _normalize_ticker(quote.get("symbol"))
+        if not _is_valid_ticker_format(symbol):
+            continue
+
+        quote_type = str(quote.get("quoteType", "")).upper().strip()
+        if quote_type and quote_type not in {"EQUITY", "ETF"}:
+            continue
+
+        name = str(quote.get("shortname") or quote.get("longname") or "").strip()
+        exchange = str(quote.get("exchangeDisplay") or quote.get("exchange") or "").strip()
+        if exchange and exchange.upper() == "YHD":
+            continue
+
+        label = symbol
+        if name:
+            label += f" - {name}"
+        if exchange:
+            label += f" ({exchange})"
+
+        score = 0
+        if symbol == search_upper:
+            score += 100
+        elif symbol.startswith(search_upper):
+            score += 60
+        elif search_upper and search_upper in symbol:
+            score += 30
+        if name:
+            name_upper = name.upper()
+            if search_upper and name_upper.startswith(search_upper):
+                score += 25
+            elif search_upper and search_upper in name_upper:
+                score += 10
+
+        candidate = {
+            "symbol": symbol,
+            "name": name,
+            "exchange": exchange,
+            "label": label,
+            "score": score,
+        }
+        existing = deduped.get(symbol)
+        if existing is None or candidate["score"] > existing["score"]:
+            deduped[symbol] = candidate
+
+    ranked = sorted(
+        deduped.values(),
+        key=lambda item: (-item.get("score", 0), item.get("symbol", "")),
+    )
+
+    # Always allow explicit typed ticker selection even if search returns no hit.
+    if _is_valid_ticker_format(search_upper) and search_upper not in {r["symbol"] for r in ranked}:
+        ranked.insert(
+            0,
+            {
+                "symbol": search_upper,
+                "name": "",
+                "exchange": "",
+                "label": f"{search_upper} - Use typed symbol",
+                "score": 1000,
+            },
+        )
+
+    return ranked[:20]
 
 
 def _get_persisted_report_dates(ticker: str) -> list:
@@ -2651,6 +2754,12 @@ if 'ticker_dropdown' not in st.session_state:
     st.session_state.ticker_dropdown = last_selected if last_selected in library else library[0]
 if 'pending_ticker_dropdown' not in st.session_state:
     st.session_state.pending_ticker_dropdown = None
+if 'ticker_search_results' not in st.session_state:
+    st.session_state.ticker_search_results = []
+if 'ticker_search_selected_label' not in st.session_state:
+    st.session_state.ticker_search_selected_label = None
+if 'ticker_search_status' not in st.session_state:
+    st.session_state.ticker_search_status = ""
 if 'assumption_suggestions_loaded' not in st.session_state:
     st.session_state.assumption_suggestions_loaded = False
 if 'assumption_suggestions_ticker' not in st.session_state:
@@ -2836,6 +2945,66 @@ with st.sidebar:
         st.session_state.ticker_dropdown = ticker_options[0]
 
     selected_ticker = st.selectbox("Stock Ticker", options=ticker_options, key="ticker_dropdown")
+
+    search_col_input, search_col_btn = st.columns([3, 1])
+    with search_col_input:
+        st.text_input(
+            "Search ticker/company",
+            key="ticker_search_query",
+            placeholder="MS, Morgan Stanley, etc.",
+            label_visibility="collapsed",
+        )
+    with search_col_btn:
+        trigger_ticker_search = st.button("Search", key="ticker_search_button", use_container_width=True)
+
+    if trigger_ticker_search:
+        raw_query = str(st.session_state.get("ticker_search_query", "")).strip()
+        if not raw_query:
+            st.session_state.ticker_search_results = []
+            st.session_state.ticker_search_selected_label = None
+            st.session_state.ticker_search_status = "Enter a ticker symbol or company name to search."
+        else:
+            with st.spinner(f"Searching tickers for '{raw_query}'..."):
+                results = cached_ticker_search(raw_query)
+            st.session_state.ticker_search_results = results
+            if results:
+                st.session_state.ticker_search_selected_label = results[0]["label"]
+                st.session_state.ticker_search_status = f"Found {len(results)} result(s)."
+            else:
+                st.session_state.ticker_search_selected_label = None
+                st.session_state.ticker_search_status = "No matching ticker results found."
+
+    search_status = str(st.session_state.get("ticker_search_status", "")).strip()
+    if search_status:
+        st.caption(search_status)
+
+    ticker_search_results = st.session_state.get("ticker_search_results", [])
+    if isinstance(ticker_search_results, list) and ticker_search_results:
+        result_labels = [r.get("label") for r in ticker_search_results if isinstance(r, dict) and r.get("label")]
+        if result_labels:
+            current_label = st.session_state.get("ticker_search_selected_label")
+            if current_label not in result_labels:
+                st.session_state.ticker_search_selected_label = result_labels[0]
+            st.selectbox(
+                "Ticker search results",
+                options=result_labels,
+                key="ticker_search_selected_label",
+                help="Pick a search result and click Use Ticker to set it as the active symbol.",
+            )
+            selected_result = next(
+                (
+                    r
+                    for r in ticker_search_results
+                    if isinstance(r, dict) and r.get("label") == st.session_state.get("ticker_search_selected_label")
+                ),
+                None,
+            )
+            selected_symbol = _normalize_ticker(selected_result.get("symbol")) if isinstance(selected_result, dict) else ""
+            if selected_symbol and st.button("Use Ticker", key="use_searched_ticker", use_container_width=True):
+                _upsert_ticker_in_library(selected_symbol)
+                st.session_state.pending_ticker_dropdown = selected_symbol
+                st.session_state.cache_restore_notice = ""
+                st.rerun()
 
     ticker = _normalize_ticker(selected_ticker)
     ticker_valid = _is_valid_ticker_format(ticker)
