@@ -3757,6 +3757,20 @@ if st.session_state.quarterly_analysis:
     st.markdown('<div class="section-header"><span class="step-badge">Step 03</span><span class="section-title">Business Momentum</span></div>', unsafe_allow_html=True)
     st.caption(f"Source: {data_source}")
 
+    displayed_quarters_metric = None
+    if hist_data:
+        loaded_quarters_for_metric = len(hist_data)
+        requested_quarters_for_metric = st.session_state.get(
+            "momentum_display_quarters",
+            loaded_quarters_for_metric,
+        )
+        if not isinstance(requested_quarters_for_metric, int):
+            requested_quarters_for_metric = loaded_quarters_for_metric
+        displayed_quarters_metric = min(
+            loaded_quarters_for_metric,
+            max(1, int(requested_quarters_for_metric)),
+        )
+
     col_h1, col_h2, col_h3, col_h4 = st.columns(4)
     with col_h1:
         avg_rev = growth_summary.get("avg_revenue_yoy")
@@ -3767,14 +3781,15 @@ if st.session_state.quarterly_analysis:
     with col_h3:
         quarters_with_revenue = growth_summary.get("quarters_with_revenue")
         quarters_with_eps = growth_summary.get("quarters_with_eps")
-        quarters_plotted = 0
-        if isinstance(quarters_with_revenue, int):
-            quarters_plotted = max(quarters_plotted, quarters_with_revenue)
-        if isinstance(quarters_with_eps, int):
-            quarters_plotted = max(quarters_plotted, quarters_with_eps)
+        quarters_plotted = displayed_quarters_metric if displayed_quarters_metric is not None else 0
         if not quarters_plotted:
-            fallback_samples = growth_summary.get("samples_used")
-            quarters_plotted = fallback_samples if isinstance(fallback_samples, int) else 0
+            if isinstance(quarters_with_revenue, int):
+                quarters_plotted = max(quarters_plotted, quarters_with_revenue)
+            if isinstance(quarters_with_eps, int):
+                quarters_plotted = max(quarters_plotted, quarters_with_eps)
+            if not quarters_plotted:
+                fallback_samples = growth_summary.get("samples_used")
+                quarters_plotted = fallback_samples if isinstance(fallback_samples, int) else 0
         st.metric("Quarters Plotted", quarters_plotted if quarters_plotted else "N/A")
     with col_h4:
         seasonality = seasonality_info.get("pattern", "N/A")
