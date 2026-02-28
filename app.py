@@ -2658,10 +2658,10 @@ if 'assumption_suggestions_ticker' not in st.session_state:
 if 'valuation_inputs_seeded_context' not in st.session_state:
     st.session_state.valuation_inputs_seeded_context = None
 if 'config_num_quarters' not in st.session_state:
-    existing_num_quarters = st.session_state.get("num_quarters", 8)
+    existing_num_quarters = st.session_state.get("num_quarters", 4)
     if not isinstance(existing_num_quarters, int):
-        existing_num_quarters = 8
-    st.session_state.config_num_quarters = min(20, max(8, existing_num_quarters))
+        existing_num_quarters = 4
+    st.session_state.config_num_quarters = min(20, max(4, existing_num_quarters))
 if 'pending_config_num_quarters' not in st.session_state:
     st.session_state.pending_config_num_quarters = None
 if 'momentum_display_quarters' not in st.session_state:
@@ -2687,10 +2687,10 @@ def reset_analysis():
     st.session_state.assumption_suggestions_loaded = False
     st.session_state.assumption_suggestions_ticker = None
     st.session_state.valuation_inputs_seeded_context = None
-    configured_quarters = st.session_state.get("config_num_quarters", 8)
+    configured_quarters = st.session_state.get("config_num_quarters", 4)
     if not isinstance(configured_quarters, int):
-        configured_quarters = 8
-    st.session_state.momentum_display_quarters = min(20, max(8, configured_quarters))
+        configured_quarters = 4
+    st.session_state.momentum_display_quarters = min(20, max(4, configured_quarters))
     st.session_state.pending_config_num_quarters = None
     st.session_state.pending_momentum_display_quarters = None
 
@@ -2878,6 +2878,20 @@ with st.sidebar:
     available_dates = st.session_state.available_dates
     selected_end_date = st.session_state.selected_end_date
 
+    def _derive_default_context_quarters(date_rows, end_date_value) -> int:
+        """Default to the full Yahoo window for the selected anchor quarter."""
+        if not isinstance(date_rows, list) or not date_rows:
+            return 4
+        date_values = [d.get("value") for d in date_rows if isinstance(d, dict) and d.get("value")]
+        if not date_values:
+            return 4
+        if end_date_value in date_values:
+            selected_idx = date_values.index(end_date_value)
+            remaining = len(date_values) - selected_idx
+        else:
+            remaining = len(date_values)
+        return min(20, max(4, int(remaining)))
+
     if available_dates:
         latest_date = available_dates[0]["display"]
         st.markdown(f"""
@@ -2888,17 +2902,6 @@ with st.sidebar:
     
     # Analysis Period selection
     st.markdown("**Analysis Period**")
-    pending_config_quarters = st.session_state.get("pending_config_num_quarters")
-    if isinstance(pending_config_quarters, int):
-        st.session_state.config_num_quarters = min(20, max(8, pending_config_quarters))
-    st.session_state.pending_config_num_quarters = None
-    num_quarters = st.slider(
-        "Historical Quarters",
-        min_value=8,
-        max_value=20,
-        key="config_num_quarters",
-        help="How many quarters of historical data to analyze (minimum 8 for trend visibility)"
-    )
     
     # Single selectbox for ending report date - only shows ACTUAL available dates
     if available_dates:
@@ -2929,6 +2932,19 @@ with st.sidebar:
         )
         selected_end_date = None
 
+    pending_config_quarters = st.session_state.get("pending_config_num_quarters")
+    if isinstance(pending_config_quarters, int):
+        st.session_state.config_num_quarters = min(20, max(4, int(pending_config_quarters)))
+    st.session_state.pending_config_num_quarters = None
+
+    # Sidebar quarter slider removed: default context depth is all Yahoo-visible quarters.
+    num_quarters = _derive_default_context_quarters(available_dates, selected_end_date)
+
+    active_loaded_ticker = _normalize_ticker(st.session_state.get("ticker", ""))
+    loaded_end_date = st.session_state.get("end_date")
+    if active_loaded_ticker != ticker or loaded_end_date != selected_end_date:
+        st.session_state.config_num_quarters = num_quarters
+
     if ticker_valid:
         if st.button(
             "Refresh Available Dates",
@@ -2954,7 +2970,6 @@ with st.sidebar:
     active_ticker = _normalize_ticker(st.session_state.get("ticker", ""))
     if ticker_valid and selected_end_date:
         context_key = build_context_key(ticker, selected_end_date, num_quarters)
-        loaded_end_date = st.session_state.get("end_date")
         loaded_num_quarters = st.session_state.get("num_quarters")
         same_loaded_context = (
             active_ticker == ticker
@@ -3006,12 +3021,17 @@ with st.sidebar:
             if not selected_end_date:
                 st.warning("Please select a valid ending report date first.")
             else:
+                num_quarters = _derive_default_context_quarters(
+                    st.session_state.get("available_dates", []),
+                    selected_end_date,
+                )
                 with st.spinner(f"Loading {ticker}..."):
                     inc, bal, cf, qcf = cached_financials(ticker)
                     if not inc.empty:
                         st.session_state.financials = {"income": inc, "balance": bal, "cashflow": cf, "quarterly_cashflow": qcf}
                         st.session_state.ticker = ticker
                         st.session_state.metrics = calculate_metrics(inc, bal)
+                        st.session_state.config_num_quarters = num_quarters
                         st.session_state.num_quarters = num_quarters
                         st.session_state.end_date = selected_end_date
                         reset_analysis()
@@ -3029,8 +3049,8 @@ with st.sidebar:
                         quarterly_data = analysis.get("historical_trends", {}).get("quarterly_data", [])
                         st.session_state.momentum_display_quarters = min(
                             max(1, len(quarterly_data)),
-                            max(8, num_quarters)
-                        ) if quarterly_data else max(8, num_quarters)
+                            max(4, num_quarters)
+                        ) if quarterly_data else max(4, num_quarters)
                         st.session_state.comprehensive_analysis = calculate_comprehensive_analysis(
                             inc,
                             bal,
@@ -3508,7 +3528,7 @@ if st.session_state.quarterly_analysis:
 
     # Seed sliders from suggestions once per loaded valuation context (ticker + selected end date + quarters).
     valuation_end_date = st.session_state.get("end_date") or st.session_state.get("selected_end_date") or "latest"
-    valuation_num_quarters = st.session_state.get("num_quarters") or st.session_state.get("config_num_quarters") or 8
+    valuation_num_quarters = st.session_state.get("num_quarters") or st.session_state.get("config_num_quarters") or 4
     valuation_context_key = build_context_key(ticker, valuation_end_date, int(valuation_num_quarters))
     wacc_slider_key = f"wacc_slider_{ticker}"
     fcf_slider_key = f"fcf_growth_slider_{ticker}"
@@ -3851,7 +3871,7 @@ if st.session_state.quarterly_analysis:
             source_total_quarters = 0
 
         if source_total_quarters > 0:
-            max_context_quarters = min(context_available_quarters, source_total_quarters) if context_available_quarters else source_total_quarters
+            max_context_quarters = source_total_quarters
         else:
             max_context_quarters = context_available_quarters
         max_available_quarters = min(20, max(loaded_quarters, max_context_quarters or loaded_quarters))
@@ -3883,7 +3903,10 @@ if st.session_state.quarterly_analysis:
                 if selected_end_date in date_values:
                     selected_idx = date_values.index(selected_end_date)
                     if selected_idx > 0:
-                        st.caption(f"Anchor end-date limits visible history to {context_available_quarters} quarter(s).")
+                        st.caption(
+                            f"Yahoo reports from this anchor: {context_available_quarters} quarter(s). "
+                            "SEC-adjusted history may extend further."
+                        )
             st.slider(
                 "Display quarters",
                 min_value=min_display_quarters,
@@ -3925,7 +3948,7 @@ if st.session_state.quarterly_analysis:
                 )
                 st.rerun()
 
-            st.session_state.pending_config_num_quarters = max(8, loaded_quarters)
+            st.session_state.pending_config_num_quarters = max(4, loaded_quarters)
             st.session_state.pending_momentum_display_quarters = loaded_quarters
             st.info("No additional quarters were returned for this ticker and selected ending report.")
             st.rerun()
