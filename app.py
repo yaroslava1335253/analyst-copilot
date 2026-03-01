@@ -19,7 +19,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
@@ -56,6 +56,7 @@ QUARTERLY_ANALYSIS_TIMEOUT_SECONDS = 25
 SNAPSHOT_TIMEOUT_SECONDS = 12
 CONTACT_EMAIL_TO = os.environ.get("CONTACT_EMAIL_TO", "yaroslava@uni.minerva.edu").strip()
 EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+URL_REGEX = re.compile(r"https?://[^\s<>()\[\]\"']+")
 SNAPSHOT_METADATA_FIELDS = [
     "price",
     "shares_outstanding",
@@ -248,6 +249,71 @@ def _clear_view_query_param() -> None:
         del st.query_params["view"]
     except Exception:
         pass
+
+
+def _extract_urls_from_text(text: str) -> list[str]:
+    if not isinstance(text, str) or not text.strip():
+        return []
+    raw_urls = URL_REGEX.findall(text)
+    cleaned = []
+    seen = set()
+    for raw in raw_urls:
+        candidate = raw.rstrip(".,;:!?)")
+        if not candidate:
+            continue
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        cleaned.append(candidate)
+    return cleaned
+
+
+def _source_name_from_url(url: str) -> str:
+    try:
+        host = (urlparse(url).netloc or "").lower().strip()
+        if host.startswith("www."):
+            host = host[4:]
+        return host or "external source"
+    except Exception:
+        return "external source"
+
+
+def _merge_citations_for_step6(consensus_citations: list, forecast: dict) -> list:
+    merged = []
+    seen_urls = set()
+
+    for cite in consensus_citations or []:
+        if not isinstance(cite, dict):
+            continue
+        url = str(cite.get("url", "")).strip()
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        merged.append(
+            {
+                "source_name": cite.get("source_name", "Source"),
+                "url": url,
+                "data_type": cite.get("data_type", ""),
+            }
+        )
+
+    if isinstance(forecast, dict) and not forecast.get("error"):
+        ai_text = str(forecast.get("full_analysis", "") or "")
+        extracted = forecast.get("extracted_forecast")
+        extracted_text = json.dumps(extracted, ensure_ascii=False) if extracted is not None else ""
+        for url in _extract_urls_from_text(f"{ai_text}\n{extracted_text}"):
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            merged.append(
+                {
+                    "source_name": f"AI synthesis ({_source_name_from_url(url)})",
+                    "url": url,
+                    "data_type": "External reference cited in Step 05",
+                }
+            )
+
+    return merged
 
 
 def _send_contact_email(
@@ -4698,6 +4764,8 @@ if st.session_state.quarterly_analysis:
     st.markdown("---")
     st.markdown('<div class="section-header"><span class="step-badge">Step 06</span><span class="section-title">Sources & Methodology</span></div>', unsafe_allow_html=True)
     st.caption("Reference material and citations for all report sections.")
+    forecast_for_citations = st.session_state.get("independent_forecast")
+    merged_citations = _merge_citations_for_step6(consensus_citations, forecast_for_citations)
 
     with st.expander("Methodology", expanded=False, icon="📚"):
         st.markdown("Core data sources and method notes used in this report:")
@@ -4709,10 +4777,12 @@ if st.session_state.quarterly_analysis:
                 f"*Method: {src['method']}*  \n"
                 f"[{url}]({url})"
             )
+        if isinstance(forecast_for_citations, dict) and not forecast_for_citations.get("error"):
+            st.caption("Step 05 external URLs are merged into the Citations section below.")
 
     with st.expander("Citations", expanded=False, icon="🔗"):
-        if consensus_citations:
-            for cite in consensus_citations:
+        if merged_citations:
+            for cite in merged_citations:
                 url = cite.get("url", "")
                 if url:
                     st.markdown(f"- [{cite.get('source_name', 'Source')}]({url}) — {cite.get('data_type', '')}")
