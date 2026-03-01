@@ -1729,6 +1729,7 @@ def _show_dcf_details_page():
         user_question = st.text_input(
             "Ask a clarification question",
             placeholder="Example: Why is PV(TV) 47.8% of EV? Where does Rd come from?",
+            autocomplete="off",
             key=details_chat_input_key,
             label_visibility="collapsed",
         )
