@@ -2278,13 +2278,14 @@ def fetch_consensus_estimates(
                    - "headline": The actual headline or quote
                    - "source": Publication name (e.g., "Barron's", "Seeking Alpha", "Bloomberg")
                    - "date": Approximate date if known (e.g., "Feb 2026", "Jan 2026")
+                   - "url": Clickable source URL starting with https://
                 
                 Example format:
                 {{
                     "summary": "Analysts remain bullish citing Azure revenue acceleration and Copilot adoption, though some flag elevated valuation multiples.",
                     "sources": [
-                        {{"headline": "Microsoft's AI Push Drives Cloud Growth", "source": "Bloomberg", "date": "Feb 2026"}},
-                        {{"headline": "MSFT Upgraded on Strong Enterprise Demand", "source": "Barron's", "date": "Jan 2026"}}
+                        {{"headline": "Microsoft's AI Push Drives Cloud Growth", "source": "Bloomberg", "date": "Feb 2026", "url": "https://www.bloomberg.com/..."}},
+                        {{"headline": "MSFT Upgraded on Strong Enterprise Demand", "source": "Barron's", "date": "Jan 2026", "url": "https://www.barrons.com/..."}}
                     ]
                 }}
                 
@@ -2850,7 +2851,15 @@ def generate_independent_forecast(quarterly_analysis: dict, company_name: str = 
                 "stock_conviction": "High/Medium/Low",
                 "key_conditional": "The exact 'Bullish IF X, cautious UNTIL Y' statement",
                 "evidence_gaps": ["gap1", "gap2", "gap3"],
-                "summary": "5-7 line summary integrating all horizons"
+                "summary": "5-7 line summary integrating all horizons",
+                "citations": [
+                    {{
+                        "claim": "short claim being supported",
+                        "source": "publication or institution",
+                        "date": "month/year or full date",
+                        "url": "https://..."
+                    }}
+                ]
             }}
             
             EXTRACTION RULES:
@@ -2872,8 +2881,26 @@ def generate_independent_forecast(quarterly_analysis: dict, company_name: str = 
             
             extracted = json.loads(extract_text)
             extracted = _sanitize_valuation_language(extracted)
+            extracted_citations = extracted.get("citations", []) if isinstance(extracted, dict) else []
+            if isinstance(extracted_citations, list):
+                normalized_citations = []
+                for raw_cite in extracted_citations[:12]:
+                    if not isinstance(raw_cite, dict):
+                        continue
+                    normalized_citations.append(
+                        {
+                            "claim": str(raw_cite.get("claim", "")).strip(),
+                            "source": str(raw_cite.get("source", "")).strip(),
+                            "date": str(raw_cite.get("date", "")).strip(),
+                            "url": str(raw_cite.get("url", "")).strip(),
+                        }
+                    )
+                result["external_citations"] = normalized_citations
+            else:
+                result["external_citations"] = []
             result["extracted_forecast"] = extracted
         except:
+            result["external_citations"] = []
             result["extracted_forecast"] = None
         
         return result

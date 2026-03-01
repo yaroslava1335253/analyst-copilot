@@ -56,7 +56,8 @@ QUARTERLY_ANALYSIS_TIMEOUT_SECONDS = 25
 SNAPSHOT_TIMEOUT_SECONDS = 12
 CONTACT_EMAIL_TO = os.environ.get("CONTACT_EMAIL_TO", "yaroslava@uni.minerva.edu").strip()
 EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-URL_REGEX = re.compile(r"https?://[^\s<>()\[\]\"']+")
+URL_REGEX = re.compile(r"(?:https?://|www\.)[^\s<>()\[\]\"']+")
+EMOJI_SYMBOL_REGEX = re.compile(r"[\U0001F300-\U0001FAFF\u2600-\u27BF\uFE0E\uFE0F\u200D]+")
 SNAPSHOT_METADATA_FIELDS = [
     "price",
     "shares_outstanding",
@@ -189,7 +190,142 @@ def _sanitize_ai_valuation_language(text: str) -> str:
     ]
     for pattern, replacement in replacements:
         sanitized = re.sub(pattern, replacement, sanitized)
-    return sanitized
+    # Remove emoji/symbol pictographs for a cleaner, professional report tone.
+    return _strip_visual_markers(sanitized)
+
+
+def _strip_visual_markers(text: str) -> str:
+    if not isinstance(text, str):
+        return str(text)
+    cleaned = EMOJI_SYMBOL_REGEX.sub("", text)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = cleaned.strip()
+    return cleaned
+
+
+def _pick_keyword(raw_text: str, options: list[str], default: str) -> str:
+    cleaned = _strip_visual_markers(raw_text)
+    lowered = cleaned.lower()
+    for option in options:
+        if option.lower() in lowered:
+            return option
+    return default
+
+
+def _extract_bullets_from_heading(text: str, heading_tokens: list[str], max_items: int = 6) -> list[str]:
+    if not isinstance(text, str) or not text.strip():
+        return []
+    lines = text.splitlines()
+    in_section = False
+    collected: list[str] = []
+    token_set = [t.lower() for t in heading_tokens]
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        lower = line.lower()
+        if any(token in lower for token in token_set):
+            in_section = True
+            continue
+        if not in_section:
+            continue
+        if not line:
+            if collected:
+                break
+            continue
+        if line.startswith("### ") or line.startswith("## ") or line.startswith("---"):
+            break
+        if line.startswith("**") and line.endswith("**"):
+            break
+        bullet_match = re.match(r"^[-*•]\s+(.+)$", line)
+        if not bullet_match:
+            if collected:
+                break
+            continue
+        value = _sanitize_ai_valuation_language(bullet_match.group(1))
+        if value and "null" not in value.lower():
+            collected.append(value)
+        if len(collected) >= max_items:
+            break
+    return collected
+
+
+def _build_outlook_view_model(extracted: dict | None, full_analysis: str) -> dict:
+    payload = extracted if isinstance(extracted, dict) else {}
+    analysis_text = full_analysis if isinstance(full_analysis, str) else ""
+
+    short_text = str(payload.get("short_term_stance", "") or "")
+    if not short_text and analysis_text:
+        m = re.search(r"Directional Stance:\s*([^\n]+)", analysis_text, flags=re.IGNORECASE)
+        short_text = m.group(1) if m else ""
+    short_stance = _pick_keyword(short_text, ["Bullish", "Neutral", "Bearish"], "Neutral")
+
+    fund_text = str(payload.get("fundamental_outlook", "") or "")
+    if not fund_text and analysis_text:
+        m = re.search(r"Fundamental Outlook:\s*([^\n]+)", analysis_text, flags=re.IGNORECASE)
+        fund_text = m.group(1) if m else ""
+    fund_outlook = _pick_keyword(fund_text, ["Strong", "Stable", "Weakening"], "Stable")
+
+    stock_text = str(payload.get("stock_outlook", "") or "")
+    if not stock_text and analysis_text:
+        m = re.search(r"Stock Outlook:\s*([^\n]+)", analysis_text, flags=re.IGNORECASE)
+        stock_text = m.group(1) if m else ""
+    stock_outlook = _pick_keyword(stock_text, ["Bullish", "Neutral", "Bearish"], "Neutral")
+
+    stock_horizon = str(payload.get("stock_outlook_horizon", "") or "")
+    if not stock_horizon and analysis_text:
+        m = re.search(r"Stock Outlook:.*?\bover\s+([^\n]+)", analysis_text, flags=re.IGNORECASE)
+        stock_horizon = m.group(1) if m else ""
+    stock_horizon = _pick_keyword(stock_horizon, ["Short-term", "Mid-term", "Long-term"], "Mid-term")
+
+    conviction_text = str(payload.get("stock_conviction", payload.get("fundamental_conviction", "")) or "")
+    if not conviction_text and analysis_text:
+        m = re.search(r"Conviction:\s*([^\n]+)", analysis_text, flags=re.IGNORECASE)
+        conviction_text = m.group(1) if m else ""
+    stock_conviction = _pick_keyword(conviction_text, ["High", "Medium", "Low"], "Medium")
+
+    summary = _sanitize_ai_valuation_language(str(payload.get("summary", "") or ""))
+    if (not summary or "null" in summary.lower()) and analysis_text:
+        paragraphs = [
+            _sanitize_ai_valuation_language(p.strip())
+            for p in re.split(r"\n\s*\n", analysis_text)
+            if p.strip() and not p.strip().startswith("#")
+        ]
+        paragraphs = [p for p in paragraphs if len(p) >= 40]
+        summary = paragraphs[0] if paragraphs else ""
+
+    drivers = payload.get("short_term_drivers") if isinstance(payload.get("short_term_drivers"), list) else []
+    drivers = [_sanitize_ai_valuation_language(str(d)) for d in drivers if d]
+    if not drivers:
+        drivers = _extract_bullets_from_heading(analysis_text, ["key drivers"], max_items=5)
+
+    risks = payload.get("short_term_risks") if isinstance(payload.get("short_term_risks"), list) else []
+    risks = [_sanitize_ai_valuation_language(str(r)) for r in risks if r]
+    if not risks:
+        risks = _extract_bullets_from_heading(analysis_text, ["key risks"], max_items=5)
+
+    gaps = payload.get("evidence_gaps") if isinstance(payload.get("evidence_gaps"), list) else []
+    gaps = [_sanitize_ai_valuation_language(str(g)) for g in gaps if g]
+    if not gaps:
+        gaps = _extract_bullets_from_heading(analysis_text, ["evidence gaps"], max_items=6)
+
+    key_conditional = _sanitize_ai_valuation_language(str(payload.get("key_conditional", "") or ""))
+    if (not key_conditional or "null" in key_conditional.lower()) and analysis_text:
+        m = re.search(r"Key Conditional:\s*\"?([^\n\"]+)\"?", analysis_text, flags=re.IGNORECASE)
+        key_conditional = _sanitize_ai_valuation_language(m.group(1)) if m else ""
+
+    return {
+        "short_stance": short_stance,
+        "fund_outlook": fund_outlook,
+        "stock_outlook": stock_outlook,
+        "stock_horizon": stock_horizon,
+        "stock_conviction": stock_conviction,
+        "summary": summary,
+        "drivers": [d for d in drivers if d and "null" not in d.lower()][:5],
+        "risks": [r for r in risks if r and "null" not in r.lower()][:5],
+        "evidence_gaps": [g for g in gaps if g and "null" not in g.lower()][:6],
+        "key_conditional": key_conditional if key_conditional and "null" not in key_conditional.lower() else "",
+    }
 
 
 def load_ui_cache() -> dict:
@@ -257,8 +393,9 @@ def _extract_urls_from_text(text: str) -> list[str]:
     raw_urls = URL_REGEX.findall(text)
     cleaned = []
     seen = set()
-    for raw in raw_urls:
-        candidate = raw.rstrip(".,;:!?)")
+    markdown_urls = re.findall(r"\[[^\]]+\]\(([^)]+)\)", text)
+    for raw in raw_urls + markdown_urls:
+        candidate = _normalize_url_candidate(raw)
         if not candidate:
             continue
         if candidate in seen:
@@ -266,6 +403,34 @@ def _extract_urls_from_text(text: str) -> list[str]:
         seen.add(candidate)
         cleaned.append(candidate)
     return cleaned
+
+
+def _normalize_url_candidate(raw_url: str) -> str:
+    candidate = str(raw_url or "").strip().strip("<>")
+    if not candidate:
+        return ""
+    candidate = candidate.rstrip(".,;:!?)")
+    if candidate.lower().startswith("www."):
+        candidate = f"https://{candidate}"
+    if re.match(r"^https?://", candidate, flags=re.IGNORECASE):
+        return candidate
+    if re.match(r"^[A-Za-z0-9.-]+\.[A-Za-z]{2,}(/.*)?$", candidate):
+        return f"https://{candidate}"
+    return ""
+
+
+def _qualitative_source_url(item: dict) -> str:
+    if not isinstance(item, dict):
+        return ""
+    explicit_url = _normalize_url_candidate(item.get("url", ""))
+    if explicit_url:
+        return explicit_url
+    headline = str(item.get("headline", "")).strip()
+    source_name = str(item.get("source", "")).strip()
+    query = " ".join(part for part in [headline, source_name] if part).strip()
+    if not query:
+        return ""
+    return f"https://www.google.com/search?q={quote(query)}"
 
 
 def _source_name_from_url(url: str) -> str:
@@ -278,14 +443,14 @@ def _source_name_from_url(url: str) -> str:
         return "external source"
 
 
-def _merge_citations_for_step6(consensus_citations: list, forecast: dict) -> list:
+def _merge_citations_for_step6(consensus_citations: list, forecast: dict, qualitative_sources: list | None = None) -> list:
     merged = []
     seen_urls = set()
 
     for cite in consensus_citations or []:
         if not isinstance(cite, dict):
             continue
-        url = str(cite.get("url", "")).strip()
+        url = _normalize_url_candidate(cite.get("url", ""))
         if not url or url in seen_urls:
             continue
         seen_urls.add(url)
@@ -312,6 +477,49 @@ def _merge_citations_for_step6(consensus_citations: list, forecast: dict) -> lis
                     "data_type": "External reference cited in Step 05",
                 }
             )
+        for cite in forecast.get("external_citations", []) or []:
+            if not isinstance(cite, dict):
+                continue
+            url = _normalize_url_candidate(cite.get("url", ""))
+            if not url:
+                claim = str(cite.get("claim", "")).strip()
+                source = str(cite.get("source", "")).strip()
+                query = " ".join(part for part in [claim, source] if part).strip()
+                if query:
+                    url = f"https://www.google.com/search?q={quote(query)}"
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            claim_text = str(cite.get("claim", "")).strip()
+            claim_label = f" — {claim_text}" if claim_text else ""
+            data_suffix = str(cite.get("date", "")).strip()
+            data_suffix = f", {data_suffix}" if data_suffix else ""
+            merged.append(
+                {
+                    "source_name": f"AI synthesis citation{claim_label}",
+                    "url": url,
+                    "data_type": f"External reference cited in Step 05{data_suffix}",
+                }
+            )
+
+    for item in qualitative_sources or []:
+        if not isinstance(item, dict):
+            continue
+        url = _qualitative_source_url(item)
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        headline = str(item.get("headline", "")).strip() or "Analyst commentary"
+        source_name = str(item.get("source", "")).strip() or "Publication"
+        published = str(item.get("date", "")).strip()
+        context = f"{source_name}, {published}" if published else source_name
+        merged.append(
+            {
+                "source_name": headline,
+                "url": url,
+                "data_type": f"Qualitative commentary ({context})",
+            }
+        )
 
     return merged
 
@@ -2433,6 +2641,32 @@ st.markdown("""
     .stance-card-bull { border-left-color: var(--clr-success) !important; }
     .stance-card-bear { border-left-color: var(--clr-danger) !important; }
     .stance-card-neut { border-left-color: var(--clr-text-muted) !important; }
+    .final-verdict-card {
+        background: #eef4ff;
+        border: 1px solid #bfdbfe;
+        border-left: 4px solid var(--clr-primary);
+        border-radius: var(--radius-md);
+        padding: 14px 16px;
+        margin: 8px 0 12px 0;
+    }
+    .final-verdict-title {
+        font-size: .72rem;
+        letter-spacing: .08em;
+        text-transform: uppercase;
+        color: var(--clr-primary);
+        font-weight: 700;
+        margin-bottom: 4px;
+    }
+    .final-verdict-main {
+        font-size: 1.1rem;
+        font-weight: 700;
+        color: var(--clr-text-primary);
+    }
+    .final-verdict-meta {
+        margin-top: 4px;
+        font-size: .85rem;
+        color: var(--clr-text-secondary);
+    }
 
     /* Chips */
     .input-chip {
@@ -4696,41 +4930,50 @@ if st.session_state.quarterly_analysis:
             extracted = forecast.get("extracted_forecast") or {}
             full_analysis = _sanitize_ai_valuation_language(forecast.get("full_analysis", "") or "")
             full_analysis = full_analysis.replace("$", "\\$")
-            has_extracted = extracted and (extracted.get("short_term_stance") or extracted.get("fundamental_outlook"))
             expanded_default = bool(st.session_state.get("forecast_just_generated", False))
+            view_model = _build_outlook_view_model(extracted, full_analysis)
+            summary_text = str(view_model.get("summary", "") or "").strip()
+            if summary_text:
+                st.markdown(
+                    f"""
+<div class="final-verdict-card">
+  <div class="final-verdict-title">Final Assessment Summary</div>
+  <div class="final-verdict-meta">{html.escape(summary_text)}</div>
+</div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            has_extracted = extracted and (extracted.get("short_term_stance") or extracted.get("fundamental_outlook"))
 
             if has_extracted:
+                short_stance = _pick_keyword(str(extracted.get("short_term_stance", "Neutral") or "Neutral"), ["Bullish", "Neutral", "Bearish"], "Neutral")
+                fund_outlook = _pick_keyword(str(extracted.get("fundamental_outlook", "Stable") or "Stable"), ["Strong", "Stable", "Weakening"], "Stable")
+                stock_outlook = _pick_keyword(str(extracted.get("stock_outlook", "Neutral") or "Neutral"), ["Bullish", "Neutral", "Bearish"], "Neutral")
+                stock_conviction = _pick_keyword(str(extracted.get("stock_conviction", extracted.get("fundamental_conviction", "Medium")) or "Medium"), ["High", "Medium", "Low"], "Medium")
+
                 col_s1, col_s2, col_s3 = st.columns(3)
                 with col_s1:
-                    short_stance = extracted.get("short_term_stance", "Neutral")
-                    short_emoji = {"Bullish": "📈", "Neutral": "➡️", "Bearish": "📉"}.get(short_stance, "➡️")
                     _sc1 = "stance-card-bull" if short_stance == "Bullish" else "stance-card-bear" if short_stance == "Bearish" else "stance-card-neut"
                     st.markdown(f"""
 <div class="stance-card {_sc1}">
   <div style="font-size:11px; color:var(--clr-text-muted);">SHORT-TERM (0-12m)</div>
-  <div style="font-size:18px; font-weight:600;">{short_emoji} {short_stance}</div>
+  <div style="font-size:18px; font-weight:600;">{html.escape(short_stance)}</div>
 </div>
                     """, unsafe_allow_html=True)
                 with col_s2:
-                    fund_outlook = extracted.get("fundamental_outlook", "Stable")
-                    fund_emoji = {"Strong": "💪", "Stable": "➡️", "Weakening": "⚠️"}.get(fund_outlook, "➡️")
                     _sc2 = "stance-card-bull" if fund_outlook == "Strong" else "stance-card-neut" if fund_outlook == "Stable" else "stance-card-bear"
                     st.markdown(f"""
 <div class="stance-card {_sc2}">
   <div style="font-size:11px; color:var(--clr-text-muted);">FUNDAMENTALS</div>
-  <div style="font-size:18px; font-weight:600;">{fund_emoji} {fund_outlook}</div>
+  <div style="font-size:18px; font-weight:600;">{html.escape(fund_outlook)}</div>
 </div>
                     """, unsafe_allow_html=True)
                 with col_s3:
-                    stock_outlook = extracted.get("stock_outlook", "Neutral")
-                    stock_emoji = {"Bullish": "📈", "Neutral": "➡️", "Bearish": "📉"}.get(stock_outlook, "➡️")
-                    conv_level = extracted.get("fundamental_conviction", "Medium")
-                    conv_badge = {"High": "🟢", "Medium": "🟡", "Low": "🔴"}.get(conv_level, "🟡")
                     _sc3 = "stance-card-bull" if stock_outlook == "Bullish" else "stance-card-bear" if stock_outlook == "Bearish" else "stance-card-neut"
                     st.markdown(f"""
 <div class="stance-card {_sc3}">
-  <div style="font-size:11px; color:var(--clr-text-muted);">STOCK OUTLOOK {conv_badge}</div>
-  <div style="font-size:18px; font-weight:600;">{stock_emoji} {stock_outlook}</div>
+  <div style="font-size:11px; color:var(--clr-text-muted);">STOCK OUTLOOK (CONVICTION: {html.escape(stock_conviction.upper())})</div>
+  <div style="font-size:18px; font-weight:600;">{html.escape(stock_outlook)}</div>
 </div>
                     """, unsafe_allow_html=True)
 
@@ -4748,11 +4991,12 @@ if st.session_state.quarterly_analysis:
                     if gaps_text:
                         st.caption(f"Evidence gaps: {gaps_text}")
 
-                with st.expander("Full Analysis & Final Assessment", expanded=expanded_default, icon="📄"):
-                    st.markdown(full_analysis.strip())
+                if full_analysis:
+                    with st.expander("Full Analysis & Final Assessment", expanded=expanded_default):
+                        st.markdown(full_analysis.strip())
             else:
                 if full_analysis:
-                    with st.expander("Full Analysis & Final Assessment", expanded=expanded_default, icon="📄"):
+                    with st.expander("Full Analysis & Final Assessment", expanded=expanded_default):
                         st.markdown(full_analysis.strip())
                 else:
                     st.warning("No analysis generated. Please try again.")
@@ -4766,7 +5010,7 @@ if st.session_state.quarterly_analysis:
     st.markdown('<div class="section-header"><span class="step-badge">Step 06</span><span class="section-title">Sources & Methodology</span></div>', unsafe_allow_html=True)
     st.caption("Reference material and citations for all report sections.")
     forecast_for_citations = st.session_state.get("independent_forecast")
-    merged_citations = _merge_citations_for_step6(consensus_citations, forecast_for_citations)
+    merged_citations = _merge_citations_for_step6(consensus_citations, forecast_for_citations, qual_sources)
 
     with st.expander("Methodology", expanded=False, icon="📚"):
         st.markdown("Core data sources and method notes used in this report:")
@@ -4784,16 +5028,13 @@ if st.session_state.quarterly_analysis:
     with st.expander("Citations", expanded=False, icon="🔗"):
         if merged_citations:
             for cite in merged_citations:
-                url = cite.get("url", "")
+                url = _normalize_url_candidate(cite.get("url", ""))
                 if url:
-                    st.markdown(f"- [{cite.get('source_name', 'Source')}]({url}) — {cite.get('data_type', '')}")
+                    source_name = str(cite.get("source_name", "Source") or "Source")
+                    data_type = str(cite.get("data_type", "") or "")
+                    st.markdown(f"- [{source_name}]({url}) — {data_type}")
         else:
             st.markdown(f"- [Yahoo Finance](https://finance.yahoo.com/quote/{ticker}/analysis) — EPS & Revenue estimates, analyst ratings")
-
-        if qual_sources:
-            st.markdown("**Analyst Commentary**")
-            for source in qual_sources[:5]:
-                st.markdown(f"- _{source.get('headline', '')}_ ({source.get('source', '')}, {source.get('date', '')})")
 
 else:
     st.info("Enter a ticker and click 'Load Data' to begin analysis.")
