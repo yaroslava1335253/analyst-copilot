@@ -1769,10 +1769,22 @@ def _show_user_guide_page():
         st.markdown(
             """
 <div class="guide-card">
-  <div class="guide-card-title">Data Quality and Common Mistakes</div>
+  <div class="guide-card-title">Data Quality Scorecard (How to Read 82/100)</div>
+  <p class="guide-step-desc"><strong>What the score is:</strong> a 0-100 confidence score built from core input reliability metadata.</p>
   <ul class="guide-list">
-    <li>Treat <code>Data Quality</code> as a confidence lens, not pass/fail.</li>
-    <li>Lower reliability can materially shift valuation conclusions.</li>
+    <li><strong>Score formula:</strong> average of 5 components, each weighted equally (20% each): <code>Price</code>, <code>Shares Outstanding</code>, <code>TTM Revenue</code>, <code>TTM FCF</code>, <code>TTM Operating Income</code>.</li>
+    <li><strong>How reliability is assigned:</strong> direct current/TTM values score highest; annual proxies, calculated fallbacks, and missing fields score lower.</li>
+    <li><strong>Example (82/100):</strong> generally reliable base case, but at least one key component likely used a fallback/proxy or lower-quality source.</li>
+  </ul>
+  <p class="guide-step-desc"><strong>Practical interpretation:</strong></p>
+  <ul class="guide-list">
+    <li><strong>90-100 (High confidence):</strong> use as primary case; normal sensitivity ranges are usually sufficient.</li>
+    <li><strong>75-89 (Good confidence):</strong> usable for base case; validate discount rate and terminal assumptions before final call.</li>
+    <li><strong>60-74 (Moderate confidence):</strong> directional only; widen bull/base/bear bands and avoid over-precision.</li>
+    <li><strong>Below 60 (Low confidence):</strong> data-limited run; treat conclusions as tentative and refresh/verify inputs first.</li>
+  </ul>
+  <p class="guide-step-desc"><strong>How to audit your score:</strong> open <code>View DCF Details</code> and review each input’s <code>Reliability</code> plus any fallback notes (for example annual proxy, synthetic estimate, or missing variable handling).</p>
+  <ul class="guide-list">
     <li>Avoid setting terminal growth too close to or above WACC.</li>
     <li>Do not compare outputs across dates without reloading context.</li>
   </ul>
