@@ -4,6 +4,7 @@
 .env
 .env.local
 .env.*.local
+.env.save
 
 # Python
 __pycache__/
@@ -39,6 +40,7 @@ env/
 *.swp
 *.swo
 *~
+.claude/
 
 # macOS
 .DS_Store
@@ -51,3 +53,7 @@ chroma_db/
 
 # SEC filings (large files)
 sec_filings/
+
+# Runtime/local app artifacts
+data/user_ui_cache.json
+.pytest_cache/
