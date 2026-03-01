@@ -136,15 +136,30 @@ class NormalizedFinancialSnapshot:
         })
     
     def recalculate_overall_quality(self):
-        """Average reliability scores of key inputs."""
+        """Average reliability scores of core valuation inputs."""
         key_fields = [
-            self.price.reliability_score,
-            self.shares_outstanding.reliability_score,
-            self.ttm_revenue.reliability_score,
-            self.ttm_fcf.reliability_score,
-            self.ttm_operating_income.reliability_score
+            self.price,
+            self.shares_outstanding,
+            self.ttm_revenue,
+            self.ttm_fcf,
+            self.ttm_operating_income,
+            self.total_debt,
+            self.cash_and_equivalents,
+            self.effective_tax_rate,
+            self.suggested_wacc,
         ]
-        valid_scores = [s for s in key_fields if s is not None]
+        valid_scores = []
+        for field in key_fields:
+            score = getattr(field, "reliability_score", None)
+            value = getattr(field, "value", None)
+            has_value = value is not None and not pd.isna(value)
+
+            # Guard against untouched defaults (score=100 with no value/source).
+            if not has_value and score == 100:
+                score = 0
+
+            if score is not None:
+                valid_scores.append(max(0, min(100, float(score))))
         if valid_scores:
             self.overall_quality_score = sum(valid_scores) / len(valid_scores)
         else:
@@ -759,6 +774,9 @@ class DataAdapter:
                     retrieved_at=datetime.utcnow().isoformat(),
                     reliability_score=90 if oi_period == "quarterly_ttm" else 75
                 )
+            else:
+                self.snapshot.ttm_operating_income.reliability_score = 0
+                self.snapshot.add_warning("NO_OPERATING_INCOME", "Operating income data unavailable")
             
             # TTM Net Income
             ttm_ni, ni_source, ni_period = fetch_line_item('Net Income')

@@ -11,11 +11,15 @@ Clean, minimalistic financial analysis tool with 3 steps:
 import os
 import re
 import html
+import smtplib
+import ssl
 import streamlit as st
 import streamlit.components.v1 as components
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
@@ -50,6 +54,8 @@ AVAILABLE_DATES_TIMEOUT_SECONDS = 8
 FINANCIALS_TIMEOUT_SECONDS = 20
 QUARTERLY_ANALYSIS_TIMEOUT_SECONDS = 25
 SNAPSHOT_TIMEOUT_SECONDS = 12
+CONTACT_EMAIL_TO = os.environ.get("CONTACT_EMAIL_TO", "yaroslava@uni.minerva.edu").strip()
+EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 SNAPSHOT_METADATA_FIELDS = [
     "price",
     "shares_outstanding",
@@ -235,6 +241,70 @@ def save_ui_cache(cache_obj: dict) -> None:
 
 def build_context_key(ticker: str, end_date: str, num_quarters: int) -> str:
     return f"{_normalize_ticker(ticker)}|{end_date}|{int(num_quarters)}"
+
+
+def _clear_view_query_param() -> None:
+    try:
+        del st.query_params["view"]
+    except Exception:
+        pass
+
+
+def _send_contact_email(
+    *,
+    first_name: str,
+    last_name: str,
+    sender_email: str,
+    message: str,
+) -> tuple[bool, str]:
+    smtp_host = str(os.environ.get("SMTP_HOST", "")).strip()
+    smtp_user = str(os.environ.get("SMTP_USER", "")).strip()
+    smtp_password = str(os.environ.get("SMTP_PASSWORD", "")).strip()
+    smtp_from = str(os.environ.get("SMTP_FROM", smtp_user)).strip()
+    smtp_port_raw = str(os.environ.get("SMTP_PORT", "587")).strip()
+    smtp_starttls = str(os.environ.get("SMTP_STARTTLS", "1")).strip().lower() in {"1", "true", "yes"}
+
+    if not smtp_host or not smtp_user or not smtp_password or not smtp_from:
+        return (
+            False,
+            "Email sending is not configured. Add SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, and optionally SMTP_FROM in environment settings.",
+        )
+
+    try:
+        smtp_port = int(smtp_port_raw)
+    except Exception:
+        smtp_port = 587
+
+    full_name = f"{first_name.strip()} {last_name.strip()}".strip()
+    msg = EmailMessage()
+    msg["Subject"] = f"Analyst Co-Pilot Contact Form - {full_name or sender_email}"
+    msg["From"] = smtp_from
+    msg["To"] = CONTACT_EMAIL_TO
+    msg["Reply-To"] = sender_email
+    msg.set_content(
+        "New contact form submission\n\n"
+        f"Name: {full_name or 'N/A'}\n"
+        f"Email: {sender_email}\n\n"
+        "Message:\n"
+        f"{message.strip()}\n"
+    )
+
+    try:
+        if smtp_port == 465:
+            with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=20, context=ssl.create_default_context()) as server:
+                server.login(smtp_user, smtp_password)
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as server:
+                server.ehlo()
+                if smtp_starttls:
+                    server.starttls(context=ssl.create_default_context())
+                    server.ehlo()
+                server.login(smtp_user, smtp_password)
+                server.send_message(msg)
+        return True, "Message sent successfully."
+    except Exception as exc:
+        return False, f"Failed to send message: {exc}"
 
 
 def _metadata_from_dict(raw: dict) -> DataQualityMetadata:
@@ -1679,53 +1749,96 @@ def _show_user_guide_page():
 
     if st.button("<- Back to Analysis", key="back_from_user_guide_top"):
         st.session_state.show_user_guide = False
+        _clear_view_query_param()
         st.rerun()
 
     st.markdown(
         """
-<div class="guide-shell">
-  <div class="guide-hero">
-    <div>
-      <div class="guide-kicker">Instruction Manual</div>
-      <div class="guide-hero-title">How to Use Analyst Co-Pilot</div>
-      <div class="guide-hero-sub">Use this workflow to go from raw financials to assumption-based valuation decisions with full traceability.</div>
-    </div>
-    <div class="guide-hero-chip">Research Workflow</div>
+<div class="guide-card">
+  <div class="guide-card-title">What This Tool Is</div>
+  <p class="guide-step-desc">Analyst Co-Pilot is a traceable DCF workflow with market context and AI synthesis.</p>
+  <p class="guide-step-desc"><strong>Not:</strong> a one-click price target tool.</p>
+</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        """
+<div class="guide-card guide-card-priority">
+  <div class="guide-card-title">How to Use It</div>
+  <div class="guide-onboarding-grid">
+    <div class="guide-onboarding-step"><span class="guide-onboarding-num">1</span><div><div class="guide-step-name">Select ticker and load data</div><div class="guide-step-desc">Choose symbol, ending report, then click <code>Load Data</code>.</div></div></div>
+    <div class="guide-onboarding-step"><span class="guide-onboarding-num">2</span><div><div class="guide-step-name">Set assumptions and run DCF</div><div class="guide-step-desc">In Step 02, adjust inputs and run <code>Run DCF Analysis</code>.</div></div></div>
+    <div class="guide-onboarding-step"><span class="guide-onboarding-num">3</span><div><div class="guide-step-name">Review valuation and diagnostics</div><div class="guide-step-desc">Check verdict, data quality, TV dominance, and method consistency.</div></div></div>
+    <div class="guide-onboarding-step"><span class="guide-onboarding-num">4</span><div><div class="guide-step-name">Generate AI synthesis last</div><div class="guide-step-desc">Use Step 05 only after DCF and diagnostics are complete.</div></div></div>
   </div>
 </div>
         """,
         unsafe_allow_html=True,
     )
 
-    col_qs, col_pw = st.columns(2)
-    with col_qs:
+    st.markdown(
+        """
+<div class="guide-card">
+  <div class="guide-card-title">How to Read the Result</div>
+  <ul class="guide-list">
+    <li><strong>Intrinsic value:</strong> model-implied under assumptions, not objective truth.</li>
+    <li><strong>TV dominance:</strong> a sensitivity warning when terminal value drives most of EV.</li>
+    <li><strong>Data quality:</strong> confidence in input reliability and fallback usage.</li>
+    <li><strong>Method divergence:</strong> larger Gordon vs Exit differences imply higher terminal uncertainty.</li>
+  </ul>
+</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        """
+<div class="guide-card">
+  <div class="guide-card-title">What Each App Step Means</div>
+  <ul class="guide-list">
+    <li><strong>Step 01:</strong> verdict from current assumptions.</li>
+    <li><strong>Step 02:</strong> controls and core valuation outputs.</li>
+    <li><strong>Step 03:</strong> historical operating context.</li>
+    <li><strong>Step 04:</strong> analyst expectations.</li>
+    <li><strong>Step 05:</strong> AI interpretation.</li>
+    <li><strong>Step 06:</strong> sources and method notes.</li>
+  </ul>
+</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    col_workflow, col_warnings = st.columns(2)
+    with col_workflow:
         st.markdown(
             """
 <div class="guide-card">
-  <div class="guide-card-title">Quick Start</div>
-  <ol class="guide-list guide-list-numbered">
-    <li>Open the sidebar and choose a ticker.</li>
-    <li>Select ending report date and historical quarter count.</li>
-    <li>Click <code>Load Data</code>.</li>
-    <li>In <code>Step 02</code>, set assumptions and run <code>Run DCF Analysis</code>.</li>
-    <li>Review <code>Step 01</code> through <code>Step 06</code> in order.</li>
-    <li>Generate <code>Step 05</code> AI Synthesis after DCF is complete.</li>
-  </ol>
+  <div class="guide-card-title">Recommended Workflow for Real Use</div>
+  <ul class="guide-list">
+    <li>Start with suggested assumptions.</li>
+    <li>Change one variable at a time.</li>
+    <li>Run bull/base/bear scenarios.</li>
+    <li>Check whether the conclusion survives sensitivity.</li>
+    <li>Audit the trace before trusting the output.</li>
+  </ul>
 </div>
             """,
             unsafe_allow_html=True,
         )
-    with col_pw:
+    with col_warnings:
         st.markdown(
             """
 <div class="guide-card">
-  <div class="guide-card-title">Practical Workflow</div>
-  <ol class="guide-list guide-list-numbered">
-    <li>Start from suggested assumptions for a base case.</li>
-    <li>Create bull/base/bear scenarios by changing one input at a time.</li>
-    <li>Check whether the conclusion survives realistic ranges.</li>
-    <li>Use <code>View DCF Details</code> to audit formulas and lineage.</li>
-  </ol>
+  <div class="guide-card-title">Common Mistakes and Warnings</div>
+  <ul class="guide-list">
+    <li>Do not treat intrinsic value as a floor.</li>
+    <li>Do not rely on one point estimate alone.</li>
+    <li>Do not ignore TV dominance warnings.</li>
+    <li>Do not compare runs across dates without reloading context.</li>
+    <li>Do not set terminal growth near WACC.</li>
+  </ul>
 </div>
             """,
             unsafe_allow_html=True,
@@ -1734,70 +1847,90 @@ def _show_user_guide_page():
     st.markdown(
         """
 <div class="guide-card">
-  <div class="guide-card-title">Step Map</div>
-  <div class="guide-step-grid">
-    <div class="guide-step-row"><span class="guide-step-pill">Step 01</span><div><div class="guide-step-name">Investment Verdict</div><div class="guide-step-desc">Primary valuation call from current assumptions.</div></div></div>
-    <div class="guide-step-row"><span class="guide-step-pill">Step 02</span><div><div class="guide-step-name">Valuation Drivers</div><div class="guide-step-desc">Input controls, model reruns, and core valuation outputs.</div></div></div>
-    <div class="guide-step-row"><span class="guide-step-pill">Step 03</span><div><div class="guide-step-name">Business Momentum</div><div class="guide-step-desc">Historical trend context for operating performance.</div></div></div>
-    <div class="guide-step-row"><span class="guide-step-pill">Step 04</span><div><div class="guide-step-name">Street Context</div><div class="guide-step-desc">Analyst expectations and target distribution context.</div></div></div>
-    <div class="guide-step-row"><span class="guide-step-pill">Step 05</span><div><div class="guide-step-name">AI Synthesis</div><div class="guide-step-desc">Narrative interpretation grounded in model + market inputs.</div></div></div>
-    <div class="guide-step-row"><span class="guide-step-pill">Step 06</span><div><div class="guide-step-name">Sources & Methodology</div><div class="guide-step-desc">Reference links and method notes for verification.</div></div></div>
+  <div class="guide-card-title">Data Quality and Methodology</div>
+  <p class="guide-step-desc"><strong>What the score means:</strong> confidence in how complete and direct the valuation inputs are versus estimated or fallback handling.</p>
+  <div class="guide-score-table-wrap">
+    <table class="guide-score-table">
+      <thead>
+        <tr>
+          <th>Score</th>
+          <th>Confidence Label</th>
+          <th>Why It Usually Scores Here</th>
+          <th>How to Use It</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>90-100</td>
+          <td>High confidence</td>
+          <td>Most core inputs are direct current/TTM values with little or no fallback usage.</td>
+          <td>Use as primary case, then run normal sensitivity checks.</td>
+        </tr>
+        <tr>
+          <td>75-89</td>
+          <td>Good confidence</td>
+          <td>One or two inputs may rely on annual proxies or light estimation.</td>
+          <td>Usable for base case; validate discount rate and terminal assumptions.</td>
+        </tr>
+        <tr>
+          <td>60-74</td>
+          <td>Moderate confidence</td>
+          <td>Multiple fields use fallback logic or partial data coverage.</td>
+          <td>Use directionally; widen bull/base/bear ranges.</td>
+        </tr>
+        <tr>
+          <td>40-59</td>
+          <td>Low confidence</td>
+          <td>Key metrics are missing or heavily estimated (for example synthetic fallback paths).</td>
+          <td>Avoid strong single-point conclusions; prioritize data verification.</td>
+        </tr>
+        <tr>
+          <td>0-39</td>
+          <td>Very low confidence</td>
+          <td>Major data gaps across core valuation inputs.</td>
+          <td>Treat output as exploratory only until data quality improves.</td>
+        </tr>
+      </tbody>
+    </table>
   </div>
+  <p class="guide-step-desc"><strong>Single metric vs calculated metric reliability:</strong></p>
+  <div class="guide-score-table-wrap">
+    <table class="guide-score-table">
+      <thead>
+        <tr>
+          <th>Metric Type</th>
+          <th>What Is Being Scored</th>
+          <th>Scoring Logic</th>
+          <th>Examples</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Single metric</td>
+          <td>One directly observed field from a source feed or statement.</td>
+          <td>Higher when current/TTM is direct; lower when missing, stale, annual-only, or fallback-derived.</td>
+          <td>Price, Shares, TTM Revenue, Total Debt, Cash, Tax Rate input.</td>
+        </tr>
+        <tr>
+          <td>Calculated metric</td>
+          <td>A model output built from several upstream inputs and assumptions.</td>
+          <td>Inherited from component quality plus penalties for proxy paths and estimation layers.</td>
+          <td>Suggested WACC, FCFF projection chain.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="guide-step-desc"><strong>Audit path:</strong> open <span class="guide-inline-label">View DCF Details</span> and review each input's Reliability plus fallback notes.</p>
 </div>
         """,
         unsafe_allow_html=True,
     )
-
-    col_rules, col_dq = st.columns(2)
-    with col_rules:
-        st.markdown(
-            """
-<div class="guide-card">
-  <div class="guide-card-title">DCF Interpretation Rules</div>
-  <ul class="guide-list">
-    <li>Intrinsic value is model-implied under assumptions, not a guaranteed level.</li>
-    <li>Terminal assumptions can dominate EV, so monitor <code>TV Dominance</code>.</li>
-    <li>Gordon Growth is usually default for mature steady-state cases.</li>
-    <li>Exit Multiple can be used adaptively for high-growth or punitive Gordon outcomes.</li>
-    <li>Interpret results through sensitivity, not a single point estimate.</li>
-  </ul>
-</div>
-            """,
-            unsafe_allow_html=True,
-        )
-    with col_dq:
-        st.markdown(
-            """
-<div class="guide-card">
-  <div class="guide-card-title">Data Quality Scorecard (How to Read 82/100)</div>
-  <p class="guide-step-desc"><strong>What the score is:</strong> a 0-100 confidence score built from core input reliability metadata.</p>
-  <ul class="guide-list">
-    <li><strong>Score formula:</strong> average of 5 components, each weighted equally (20% each): <code>Price</code>, <code>Shares Outstanding</code>, <code>TTM Revenue</code>, <code>TTM FCF</code>, <code>TTM Operating Income</code>.</li>
-    <li><strong>How reliability is assigned:</strong> direct current/TTM values score highest; annual proxies, calculated fallbacks, and missing fields score lower.</li>
-    <li><strong>Example (82/100):</strong> generally reliable base case, but at least one key component likely used a fallback/proxy or lower-quality source.</li>
-  </ul>
-  <p class="guide-step-desc"><strong>Practical interpretation:</strong></p>
-  <ul class="guide-list">
-    <li><strong>90-100 (High confidence):</strong> use as primary case; normal sensitivity ranges are usually sufficient.</li>
-    <li><strong>75-89 (Good confidence):</strong> usable for base case; validate discount rate and terminal assumptions before final call.</li>
-    <li><strong>60-74 (Moderate confidence):</strong> directional only; widen bull/base/bear bands and avoid over-precision.</li>
-    <li><strong>Below 60 (Low confidence):</strong> data-limited run; treat conclusions as tentative and refresh/verify inputs first.</li>
-  </ul>
-  <p class="guide-step-desc"><strong>How to audit your score:</strong> open <code>View DCF Details</code> and review each input’s <code>Reliability</code> plus any fallback notes (for example annual proxy, synthetic estimate, or missing variable handling).</p>
-  <ul class="guide-list">
-    <li>Avoid setting terminal growth too close to or above WACC.</li>
-    <li>Do not compare outputs across dates without reloading context.</li>
-  </ul>
-</div>
-            """,
-            unsafe_allow_html=True,
-        )
 
     st.markdown(
         """
 <div class="guide-disclaimer-card">
-  <div class="guide-disclaimer-title">Important Disclaimer</div>
-  <div class="guide-disclaimer-text">This tool supports research workflows only. Outputs may contain mistakes and are highly assumption-dependent. It is not investment advice.</div>
+  <div class="guide-disclaimer-title">Disclaimer</div>
+  <div class="guide-disclaimer-text">This tool supports research workflows only. Outputs may contain mistakes and are assumption-sensitive. It is not investment advice.</div>
 </div>
         """,
         unsafe_allow_html=True,
@@ -1805,7 +1938,71 @@ def _show_user_guide_page():
 
     if st.button("<- Back to Analysis", key="back_from_user_guide_bottom"):
         st.session_state.show_user_guide = False
+        _clear_view_query_param()
         st.rerun()
+
+
+def _show_contact_page():
+    """Render inline contact form on the main page."""
+    _contact_title_col, _contact_close_col = st.columns([10, 1])
+    with _contact_title_col:
+        st.markdown(
+            '<div class="section-header"><span class="step-badge">Contact</span><span class="section-title">Share an Idea</span></div>',
+            unsafe_allow_html=True,
+        )
+    with _contact_close_col:
+        if st.button("Close", key="close_contact_panel_top", type="tertiary"):
+            st.session_state.show_contact_panel = False
+            st.rerun()
+    st.caption("If you have ideas or proposals, fill out the form below.")
+
+    st.markdown("### Share Your Idea or Proposal")
+
+    with st.form("contact_feedback_form", clear_on_submit=True):
+        col_first, col_last, col_email = st.columns(3)
+        with col_first:
+            first_name = st.text_input("First name*", placeholder="First name")
+        with col_last:
+            last_name = st.text_input("Last name*", placeholder="Last name")
+        with col_email:
+            sender_email = st.text_input("Email*", placeholder="you@example.com")
+
+        message = st.text_area(
+            "Your idea or proposal*",
+            placeholder="Describe your idea, proposal, or feedback.",
+            height=180,
+        )
+        submitted = st.form_submit_button("Submit")
+
+    if submitted:
+        first_name_clean = first_name.strip()
+        last_name_clean = last_name.strip()
+        sender_email_clean = sender_email.strip()
+        message_clean = message.strip()
+
+        if not first_name_clean or not last_name_clean or not sender_email_clean or not message_clean:
+            st.error("Please fill out all required fields.")
+        elif not EMAIL_REGEX.match(sender_email_clean):
+            st.error("Please enter a valid email address.")
+        else:
+            ok, status_message = _send_contact_email(
+                first_name=first_name_clean,
+                last_name=last_name_clean,
+                sender_email=sender_email_clean,
+                message=message_clean,
+            )
+            if ok:
+                st.success("Thanks. Your message was sent.")
+            else:
+                st.error(status_message)
+                mailto_subject = quote(f"Analyst Co-Pilot Feedback - {first_name_clean} {last_name_clean}".strip())
+                mailto_body = quote(
+                    f"From: {first_name_clean} {last_name_clean} ({sender_email_clean})\n\n"
+                    f"{message_clean}"
+                )
+                st.markdown(
+                    f"If sending fails, email directly: [Compose Email](mailto:{CONTACT_EMAIL_TO}?subject={mailto_subject}&body={mailto_body})"
+                )
 # --- App Configuration ---
 st.set_page_config(
     page_title="Analyst Co-Pilot",
@@ -2204,8 +2401,15 @@ st.markdown("""
 
     /* App top bar */
     .app-topbar {
-        display: flex; align-items: center; justify-content: space-between;
-        padding: 12px 0; border-bottom: 2px solid var(--clr-border); margin-bottom: 1.5rem;
+        display: flex; align-items: flex-start; justify-content: space-between;
+        padding: 6px 0 12px 0; border-bottom: 2px solid var(--clr-border); margin-bottom: 1.5rem;
+    }
+    .app-topbar-right {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-end;
+        gap: 2px;
+        margin-top: -4px;
     }
     .app-wordmark {
         font-size: 1.1rem; font-weight: 700; color: var(--clr-text-primary); letter-spacing: -.01em;
@@ -2216,6 +2420,37 @@ st.markdown("""
         padding: 2px 6px; border-radius: 3px; margin-left: 8px; vertical-align: middle;
     }
     .app-tagline { font-size: .78rem; color: var(--clr-text-muted); }
+    .app-top-links {
+        display: flex;
+        gap: 18px;
+        margin-bottom: 1px;
+    }
+    .app-top-links a {
+        font-size: .86rem;
+        color: #64748b;
+        text-decoration: none;
+        transition: color .15s ease;
+    }
+    .app-top-links a:hover {
+        color: var(--clr-accent);
+        text-decoration: underline;
+    }
+    .stButton > button[kind="tertiary"] {
+        background: transparent !important;
+        border: none !important;
+        padding: 0 !important;
+        min-height: 0 !important;
+        height: auto !important;
+        color: #64748b !important;
+        font-size: .86rem !important;
+        text-decoration: none !important;
+        box-shadow: none !important;
+    }
+    .stButton > button[kind="tertiary"]:hover {
+        background: transparent !important;
+        color: var(--clr-accent);
+        text-decoration: underline !important;
+    }
 
     /* Hero KPI strip */
     .hero-strip {
@@ -2457,6 +2692,11 @@ st.markdown("""
         padding: 14px 16px;
         box-shadow: var(--shadow-sm);
     }
+    .guide-card-priority {
+        border-color: #bfdbfe;
+        box-shadow: 0 0 0 1px #dbeafe;
+        background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
+    }
     .guide-card-title {
         font-size: .72rem;
         font-weight: 700;
@@ -2464,6 +2704,35 @@ st.markdown("""
         text-transform: uppercase;
         letter-spacing: .08em;
         margin-bottom: 10px;
+    }
+    .guide-onboarding-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 10px;
+    }
+    .guide-onboarding-step {
+        display: grid;
+        grid-template-columns: auto 1fr;
+        align-items: start;
+        gap: 10px;
+        border: 1px solid #dbeafe;
+        background: #f8fbff;
+        border-radius: var(--radius-sm);
+        padding: 10px;
+    }
+    .guide-onboarding-num {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 20px;
+        height: 20px;
+        border-radius: 999px;
+        background: var(--clr-accent);
+        color: #ffffff;
+        font-size: .66rem;
+        font-weight: 700;
+        line-height: 1;
+        margin-top: 2px;
     }
     .guide-list {
         margin: 0;
@@ -2474,6 +2743,46 @@ st.markdown("""
     }
     .guide-list li {
         margin-bottom: 6px;
+    }
+    .guide-score-table-wrap {
+        margin-top: 8px;
+        overflow-x: auto;
+    }
+    .guide-score-table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: .79rem;
+        color: var(--clr-text-secondary);
+    }
+    .guide-score-table th {
+        text-align: left;
+        font-size: .62rem;
+        font-weight: 700;
+        letter-spacing: .06em;
+        text-transform: uppercase;
+        color: var(--clr-text-muted);
+        background: #f8fafc;
+        border: 1px solid var(--clr-border);
+        padding: 8px 9px;
+    }
+    .guide-score-table td {
+        border: 1px solid var(--clr-border);
+        padding: 8px 9px;
+        vertical-align: top;
+        line-height: 1.35;
+    }
+    .guide-score-table tbody tr:nth-child(even) {
+        background: #fcfdff;
+    }
+    .guide-inline-label {
+        display: inline-block;
+        border: 1px solid #bfdbfe;
+        background: #eff6ff;
+        color: #1e40af;
+        border-radius: 999px;
+        padding: 1px 8px;
+        font-size: .74rem;
+        font-weight: 600;
     }
     .guide-list-numbered li::marker {
         color: var(--clr-accent);
@@ -2518,10 +2827,31 @@ st.markdown("""
         color: var(--clr-text-secondary);
         line-height: 1.35;
     }
+    .guide-card code,
+    .guide-step-desc code,
+    .guide-disclaimer-card code,
+    .stMarkdown code {
+        display: inline-block;
+        font-family: 'JetBrains Mono', monospace !important;
+        font-size: .74rem;
+        color: #334155 !important;
+        background: #edf2f7 !important;
+        border: 1px solid #d7dfea !important;
+        border-radius: 6px;
+        padding: 1px 6px;
+        line-height: 1.25;
+    }
+    .stMarkdown pre code,
+    [data-testid="stCodeBlock"] code {
+        color: inherit !important;
+        background: transparent !important;
+        border: none !important;
+        padding: 0 !important;
+        display: block;
+    }
     .guide-disclaimer-card {
-        background: #fff7ed;
-        border: 1px solid #fdba74;
-        border-left: 4px solid #f97316;
+        background: #f8fafc;
+        border: 1px solid var(--clr-border);
         border-radius: var(--radius-md);
         padding: 12px 14px;
     }
@@ -2530,12 +2860,12 @@ st.markdown("""
         font-weight: 700;
         letter-spacing: .08em;
         text-transform: uppercase;
-        color: #9a3412;
+        color: var(--clr-text-muted);
         margin-bottom: 4px;
     }
     .guide-disclaimer-text {
         font-size: .82rem;
-        color: #7c2d12;
+        color: var(--clr-text-secondary);
         line-height: 1.35;
     }
 
@@ -2562,6 +2892,18 @@ st.markdown("""
         .guide-hero { flex-direction: column; }
         .guide-hero-chip { align-self: flex-start; }
         .guide-step-row { grid-template-columns: 1fr; gap: 6px; }
+        .guide-onboarding-grid { grid-template-columns: 1fr; }
+        .guide-onboarding-step { grid-template-columns: auto 1fr; }
+        .app-topbar {
+            align-items: flex-start;
+        }
+        .app-topbar-right {
+            align-items: flex-end;
+            gap: 2px;
+        }
+        .app-top-links {
+            gap: 12px;
+        }
     }
 
     /* Step progress indicator */
@@ -2656,6 +2998,8 @@ if 'show_dcf_details' not in st.session_state:
     st.session_state.show_dcf_details = False
 if 'show_user_guide' not in st.session_state:
     st.session_state.show_user_guide = False
+if 'show_contact_panel' not in st.session_state:
+    st.session_state.show_contact_panel = False
 if 'forecast_just_generated' not in st.session_state:
     st.session_state.forecast_just_generated = False
 if 'ai_outlook_error' not in st.session_state:
@@ -3039,6 +3383,10 @@ with st.sidebar:
         st.session_state.last_restore_key = None
     
     if st.button("Load Data", type="primary", use_container_width=True):
+        # Loading a new analysis context should return to the main analysis view.
+        st.session_state.show_contact_panel = False
+        st.session_state.show_user_guide = False
+        _clear_view_query_param()
         if not st.session_state.api_key_set:
             st.error("API key not found. Add `GEMINI_API_KEY=your_key` to `.env` file and restart.")
         elif not ticker_valid:
@@ -3132,6 +3480,7 @@ with st.sidebar:
     st.markdown('<div class="sidebar-section-label">Help</div>', unsafe_allow_html=True)
     if st.button("Open User Guide", use_container_width=True, key="open_user_guide_sidebar"):
         st.session_state.show_user_guide = True
+        st.session_state.show_contact_panel = False
         st.rerun()
     
     # Clear cache button
@@ -3144,25 +3493,38 @@ with st.sidebar:
 
 
 # --- Main Interface ---
+_nav_spacer, _nav_guide_col, _nav_contact_col = st.columns([8, 1, 1])
+with _nav_guide_col:
+    if st.button("User Guide", key="open_user_guide_top_text", type="tertiary", use_container_width=True):
+        st.session_state.show_user_guide = True
+        st.session_state.show_contact_panel = False
+        _clear_view_query_param()
+        st.rerun()
+with _nav_contact_col:
+    if st.button("Contact", key="open_contact_top_text", type="tertiary", use_container_width=True):
+        st.session_state.show_user_guide = False
+        st.session_state.show_contact_panel = True
+        _clear_view_query_param()
+        st.rerun()
+
 st.markdown("""
 <div class="app-topbar">
     <div>
         <span class="app-wordmark">Analyst Co-Pilot</span>
         <span class="app-version">Beta</span>
     </div>
-    <div class="app-tagline">AI-powered equity research assistant</div>
+    <div class="app-topbar-right">
+        <div class="app-tagline">AI-powered equity research assistant</div>
+    </div>
 </div>
 """, unsafe_allow_html=True)
 
-_guide_spacer, _guide_col = st.columns([6, 1])
-with _guide_col:
-    if st.button("User Guide", key="open_user_guide_header", use_container_width=True):
-        st.session_state.show_user_guide = True
-        st.rerun()
-
+if st.session_state.get("show_contact_panel"):
+    st.session_state.show_user_guide = False
 if st.session_state.get("show_user_guide"):
     _show_user_guide_page()
-    st.stop()
+if st.session_state.get("show_contact_panel"):
+    _show_contact_page()
 
 if st.session_state.quarterly_analysis:
     analysis = st.session_state.quarterly_analysis
