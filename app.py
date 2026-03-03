@@ -61,6 +61,7 @@ COMPANY_NAME_TIMEOUT_SECONDS = 3
 WACC_SLIDER_MIN_PCT = 0.5
 WACC_SLIDER_MAX_PCT = 20.0
 SNAPSHOT_SUGGESTION_VERSION = "v4_wacc_source_sync"
+DEFAULT_INITIAL_QUARTERS = 7
 CONTACT_EMAIL_TO = os.environ.get("CONTACT_EMAIL_TO", "yaroslava@uni.minerva.edu").strip()
 EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 URL_REGEX = re.compile(r"(?:https?://|www\.)[^\s<>()\[\]\"']+")
@@ -865,7 +866,7 @@ def _call_with_timeout(func, *args, timeout_seconds: int, fallback=None):
 @st.cache_data(ttl=3600, show_spinner=False)
 def cached_quarterly_analysis(
     ticker: str,
-    num_quarters: int = 8,
+    num_quarters: int = DEFAULT_INITIAL_QUARTERS,
     end_date: str = None,
     history_source_version: str = HISTORY_SOURCE_VERSION,
 ) -> dict:
@@ -3363,14 +3364,14 @@ if 'assumption_suggestions_ticker' not in st.session_state:
 if 'valuation_inputs_seeded_context' not in st.session_state:
     st.session_state.valuation_inputs_seeded_context = None
 if 'config_num_quarters' not in st.session_state:
-    existing_num_quarters = st.session_state.get("num_quarters", 4)
+    existing_num_quarters = st.session_state.get("num_quarters", DEFAULT_INITIAL_QUARTERS)
     if not isinstance(existing_num_quarters, int):
-        existing_num_quarters = 4
+        existing_num_quarters = DEFAULT_INITIAL_QUARTERS
     st.session_state.config_num_quarters = min(20, max(4, existing_num_quarters))
 if 'pending_config_num_quarters' not in st.session_state:
     st.session_state.pending_config_num_quarters = None
 if 'momentum_display_quarters' not in st.session_state:
-    st.session_state.momentum_display_quarters = 8
+    st.session_state.momentum_display_quarters = DEFAULT_INITIAL_QUARTERS
 if 'pending_momentum_display_quarters' not in st.session_state:
     st.session_state.pending_momentum_display_quarters = None
 
@@ -3392,9 +3393,9 @@ def reset_analysis():
     st.session_state.assumption_suggestions_loaded = False
     st.session_state.assumption_suggestions_ticker = None
     st.session_state.valuation_inputs_seeded_context = None
-    configured_quarters = st.session_state.get("config_num_quarters", 4)
+    configured_quarters = st.session_state.get("config_num_quarters", DEFAULT_INITIAL_QUARTERS)
     if not isinstance(configured_quarters, int):
-        configured_quarters = 4
+        configured_quarters = DEFAULT_INITIAL_QUARTERS
     st.session_state.momentum_display_quarters = min(20, max(4, configured_quarters))
     st.session_state.pending_config_num_quarters = None
     st.session_state.pending_momentum_display_quarters = None
@@ -3599,18 +3600,19 @@ with st.sidebar:
     selected_end_date = st.session_state.selected_end_date
 
     def _derive_default_context_quarters(date_rows, end_date_value) -> int:
-        """Default to the full Yahoo window for the selected anchor quarter."""
+        """Default to a focused 7-quarter window; users can expand with Quarter Rail."""
         if not isinstance(date_rows, list) or not date_rows:
-            return 4
+            return DEFAULT_INITIAL_QUARTERS
         date_values = [d.get("value") for d in date_rows if isinstance(d, dict) and d.get("value")]
         if not date_values:
-            return 4
+            return DEFAULT_INITIAL_QUARTERS
         if end_date_value in date_values:
             selected_idx = date_values.index(end_date_value)
             remaining = len(date_values) - selected_idx
         else:
             remaining = len(date_values)
-        return min(20, max(4, int(remaining)))
+        preferred = min(int(remaining), DEFAULT_INITIAL_QUARTERS)
+        return min(20, max(4, preferred))
 
     if available_dates:
         latest_date = available_dates[0]["display"]
@@ -3657,7 +3659,7 @@ with st.sidebar:
         st.session_state.config_num_quarters = min(20, max(4, int(pending_config_quarters)))
     st.session_state.pending_config_num_quarters = None
 
-    # Sidebar quarter slider removed: default context depth is all Yahoo-visible quarters.
+    # Sidebar quarter slider removed: default context depth is 7 quarters (expand via Quarter Rail).
     num_quarters = _derive_default_context_quarters(available_dates, selected_end_date)
 
     active_loaded_ticker = _normalize_ticker(st.session_state.get("ticker", ""))
@@ -4337,7 +4339,11 @@ if st.session_state.quarterly_analysis:
 
     # Seed sliders from suggestions once per loaded valuation context (ticker + selected end date + quarters).
     valuation_end_date = st.session_state.get("end_date") or st.session_state.get("selected_end_date") or "latest"
-    valuation_num_quarters = st.session_state.get("num_quarters") or st.session_state.get("config_num_quarters") or 4
+    valuation_num_quarters = (
+        st.session_state.get("num_quarters")
+        or st.session_state.get("config_num_quarters")
+        or DEFAULT_INITIAL_QUARTERS
+    )
     valuation_context_key = build_context_key(ticker, valuation_end_date, int(valuation_num_quarters))
     wacc_slider_key = f"wacc_slider_{ticker}"
     fcf_slider_key = f"fcf_growth_slider_{ticker}"
