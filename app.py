@@ -11,6 +11,7 @@ Clean, minimalistic financial analysis tool with 3 steps:
 import os
 import re
 import html
+import math
 import smtplib
 import ssl
 import streamlit as st
@@ -43,13 +44,15 @@ from dcf_engine import DCFEngine, DCFAssumptions
 from dcf_ui_adapter import DCFUIAdapter
 from sources import SOURCE_CATALOG
 
-UI_CACHE_VERSION = 1
+UI_CACHE_VERSION = 2
 REPORT_DATES_CACHE_VERSION = "v5"
 UI_CACHE_PATH = Path(__file__).resolve().parent / "data" / "user_ui_cache.json"
 MAX_TICKER_LIBRARY_SIZE = 100
 MAX_REPORT_DATE_CACHE_TICKERS = 300
 TICKER_PATTERN = re.compile(r"^[A-Z0-9.\-]{1,10}$")
 MAG7_TICKERS = ["AAPL", "AMZN", "GOOGL", "META", "MSFT", "NVDA", "TSLA"]
+DEFAULT_TICKER = MAG7_TICKERS[0]
+HISTORY_SOURCE_VERSION = "v12"
 AVAILABLE_DATES_TIMEOUT_SECONDS = 8
 FINANCIALS_TIMEOUT_SECONDS = 20
 QUARTERLY_ANALYSIS_TIMEOUT_SECONDS = 25
@@ -88,7 +91,7 @@ def _default_ui_cache() -> dict:
         "version": UI_CACHE_VERSION,
         "available_report_dates_version": REPORT_DATES_CACHE_VERSION,
         "ticker_library": MAG7_TICKERS.copy(),
-        "last_selected_ticker": "MSFT",
+        "last_selected_ticker": DEFAULT_TICKER,
         "available_report_dates": {},
         "results": {},
     }
@@ -338,6 +341,16 @@ def load_ui_cache() -> dict:
             data = json.load(f)
         if not isinstance(data, dict):
             return default
+        stored_version = data.get("version", 0)
+        if stored_version != UI_CACHE_VERSION:
+            return {
+                "version": UI_CACHE_VERSION,
+                "available_report_dates_version": REPORT_DATES_CACHE_VERSION,
+                "ticker_library": _normalize_ticker_library(data.get("ticker_library", [])),
+                "last_selected_ticker": _normalize_ticker(data.get("last_selected_ticker", DEFAULT_TICKER)) or DEFAULT_TICKER,
+                "available_report_dates": {},
+                "results": {},
+            }
         report_dates_version = str(data.get("available_report_dates_version", "")).strip()
         available_dates_cache = (
             _normalize_available_report_dates_cache(data.get("available_report_dates", {}))
@@ -348,7 +361,7 @@ def load_ui_cache() -> dict:
             "version": data.get("version", UI_CACHE_VERSION),
             "available_report_dates_version": REPORT_DATES_CACHE_VERSION,
             "ticker_library": _normalize_ticker_library(data.get("ticker_library", [])),
-            "last_selected_ticker": _normalize_ticker(data.get("last_selected_ticker", "MSFT")) or "MSFT",
+            "last_selected_ticker": _normalize_ticker(data.get("last_selected_ticker", DEFAULT_TICKER)) or DEFAULT_TICKER,
             "available_report_dates": available_dates_cache,
             "results": data.get("results", {}) if isinstance(data.get("results", {}), dict) else {},
         }
@@ -364,7 +377,7 @@ def save_ui_cache(cache_obj: dict) -> None:
             "version": UI_CACHE_VERSION,
             "available_report_dates_version": REPORT_DATES_CACHE_VERSION,
             "ticker_library": _normalize_ticker_library(cache_obj.get("ticker_library", [])),
-            "last_selected_ticker": _normalize_ticker(cache_obj.get("last_selected_ticker", "MSFT")) or "MSFT",
+            "last_selected_ticker": _normalize_ticker(cache_obj.get("last_selected_ticker", DEFAULT_TICKER)) or DEFAULT_TICKER,
             "available_report_dates": _normalize_available_report_dates_cache(cache_obj.get("available_report_dates", {})),
             "results": _json_safe(cache_obj.get("results", {})),
         }
@@ -851,7 +864,7 @@ def cached_quarterly_analysis(
     ticker: str,
     num_quarters: int = 8,
     end_date: str = None,
-    history_source_version: str = "v11",
+    history_source_version: str = HISTORY_SOURCE_VERSION,
 ) -> dict:
     """Cached version of analyze_quarterly_trends to avoid API rate limits."""
     _ = history_source_version  # cache-key salt when quarterly history sourcing logic changes
@@ -876,7 +889,7 @@ def cached_quarterly_analysis(
     return result if isinstance(result, dict) else fallback
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def cached_available_dates(ticker: str, history_source_version: str = "v11") -> list:
+def cached_available_dates(ticker: str, history_source_version: str = HISTORY_SOURCE_VERSION) -> list:
     """Cached wrapper for get_available_report_dates."""
     _ = history_source_version  # cache-key salt when available-date sourcing logic changes
     result = _call_with_timeout(
@@ -3335,7 +3348,7 @@ if 'last_restore_key' not in st.session_state:
 if 'cache_restore_notice' not in st.session_state:
     st.session_state.cache_restore_notice = ""
 if 'ticker_dropdown' not in st.session_state:
-    last_selected = _normalize_ticker(st.session_state.ui_cache.get("last_selected_ticker", "MSFT"))
+    last_selected = _normalize_ticker(st.session_state.ui_cache.get("last_selected_ticker", DEFAULT_TICKER))
     library = st.session_state.ticker_library
     st.session_state.ticker_dropdown = last_selected if last_selected in library else library[0]
 if 'pending_ticker_dropdown' not in st.session_state:
@@ -3871,19 +3884,61 @@ if st.session_state.quarterly_analysis:
 
     # Top context strip
     _market_data = analysis.get("market_data", {})
-    _price = _market_data.get("current_price")
-    _mcap = _market_data.get("market_cap")
-    _pe = _market_data.get("pe_ratio")
+    if not isinstance(_market_data, dict):
+        _market_data = {}
+
+    def _positive_float(value):
+        try:
+            if value is None:
+                return None
+            num = float(value)
+            if not math.isfinite(num) or num <= 0:
+                return None
+            return num
+        except Exception:
+            return None
+
+    _price = _positive_float(_market_data.get("current_price"))
+    _mcap = _positive_float(_market_data.get("market_cap"))
+    _pe = _positive_float(_market_data.get("pe_ratio"))
     _as_of = most_recent.get("label", "—")
-    _price_str = f"${_price:,.2f}" if _price else "—"
-    _mcap_str = f"${_mcap/1e9:.1f}B" if _mcap else "—"
-    _show_pe = _pe is not None and _pe > 0
-    _pe_str = f"{_pe:.1f}x" if _show_pe else None
+
     _snapshot_for_name = st.session_state.get("dcf_snapshot")
     _company_name_raw = getattr(_snapshot_for_name, "company_name", None) if _snapshot_for_name is not None else None
     _company_name = _company_name_raw.strip() if isinstance(_company_name_raw, str) else ""
+
+    # Fallback hierarchy for missing market strip values:
+    # quarterly analysis -> restored DCF snapshot -> fresh snapshot lookup.
+    _snapshot_for_strip = _snapshot_for_name
+    if (_price is None or _mcap is None or not _company_name) and _snapshot_for_strip is None:
+        _snapshot_for_strip = cached_financial_snapshot(
+            ticker,
+            suggestion_algo_version="v3_forward_consensus",
+        )
+
+    if _snapshot_for_strip is not None:
+        _snap_price = _positive_float(getattr(getattr(_snapshot_for_strip, "price", None), "value", None))
+        _snap_mcap = _positive_float(getattr(getattr(_snapshot_for_strip, "market_cap", None), "value", None))
+        _snap_shares = _positive_float(getattr(getattr(_snapshot_for_strip, "shares_outstanding", None), "value", None))
+
+        if _price is None:
+            _price = _snap_price
+        if _mcap is None:
+            _mcap = _snap_mcap
+            if _mcap is None and _price is not None and _snap_shares is not None:
+                _mcap = _price * _snap_shares
+        if not _company_name:
+            _snap_company_name = getattr(_snapshot_for_strip, "company_name", None)
+            if isinstance(_snap_company_name, str):
+                _company_name = _snap_company_name.strip()
+
     if not _company_name:
         _company_name = cached_company_name(ticker)
+
+    _price_str = f"${_price:,.2f}" if _price is not None else "—"
+    _mcap_str = f"${_mcap/1e9:.1f}B" if _mcap is not None else "—"
+    _show_pe = _pe is not None and _pe > 0
+    _pe_str = f"{_pe:.1f}x" if _show_pe else None
     _company_name_display = html.escape(_company_name) if _company_name else ticker
 
     _hero_tiles = [
