@@ -190,6 +190,7 @@ def _sanitize_ai_valuation_language(text: str) -> str:
     if not isinstance(text, str):
         return text
     sanitized = text
+    sanitized = _remove_inline_urls_from_ai_text(sanitized)
     replacements = [
         (r"(?i)\bfundamental floor\b", "model-implied value under current assumptions"),
         (r"(?i)\bvaluation floor\b", "model-implied value under current assumptions"),
@@ -200,6 +201,37 @@ def _sanitize_ai_valuation_language(text: str) -> str:
         sanitized = re.sub(pattern, replacement, sanitized)
     # Remove emoji/symbol pictographs for a cleaner, professional report tone.
     return _strip_visual_markers(sanitized)
+
+
+def _remove_inline_urls_from_ai_text(text: str) -> str:
+    """
+    Keep narrative citations readable as source/date text while removing clickable URLs.
+    URLs are preserved in Step 06 Citations dropdown only.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+
+    cleaned = text
+
+    # Convert markdown links to link text only.
+    cleaned = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1", cleaned)
+
+    # Remove valid URL tokens from narrative text.
+    for raw in URL_REGEX.findall(cleaned):
+        normalized = _normalize_url_candidate(raw)
+        if not normalized:
+            continue
+        cleaned = cleaned.replace(raw, "")
+
+    # Cleanup punctuation artifacts after URL removal.
+    cleaned = re.sub(r"\(\s*,", "(", cleaned)
+    cleaned = re.sub(r",\s*,", ", ", cleaned)
+    cleaned = re.sub(r"\s+,", ",", cleaned)
+    cleaned = re.sub(r",\s*\)", ")", cleaned)
+    cleaned = re.sub(r"\(\s*\)", "", cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
 
 
 def _strip_visual_markers(text: str) -> str:
@@ -440,15 +472,7 @@ def _normalize_url_candidate(raw_url: str) -> str:
 def _qualitative_source_url(item: dict) -> str:
     if not isinstance(item, dict):
         return ""
-    explicit_url = _normalize_url_candidate(item.get("url", ""))
-    if explicit_url:
-        return explicit_url
-    headline = str(item.get("headline", "")).strip()
-    source_name = str(item.get("source", "")).strip()
-    query = " ".join(part for part in [headline, source_name] if part).strip()
-    if not query:
-        return ""
-    return f"https://www.google.com/search?q={quote(query)}"
+    return _normalize_url_candidate(item.get("url", ""))
 
 
 def _source_name_from_url(url: str) -> str:
@@ -459,6 +483,24 @@ def _source_name_from_url(url: str) -> str:
         return host or "external source"
     except Exception:
         return "external source"
+
+
+def _clean_citation_field(value) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if text.lower() in {"none", "n/a", "na", "null", "unknown", "nan"}:
+        return ""
+    return text
+
+
+def _short_claim_text(claim: str, max_chars: int = 180) -> str:
+    text = _clean_citation_field(claim)
+    if not text:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars - 1].rstrip()}…"
 
 
 def _merge_citations_for_step6(consensus_citations: list, forecast: dict, qualitative_sources: list | None = None) -> list:
@@ -499,6 +541,9 @@ def _merge_citations_for_step6(consensus_citations: list, forecast: dict, qualit
         for cite in forecast.get("external_citations", []) or []:
             if not isinstance(cite, dict):
                 continue
+            claim_text = _clean_citation_field(cite.get("claim", ""))
+            source_text = _clean_citation_field(cite.get("source", ""))
+            date_text = _clean_citation_field(cite.get("date", ""))
             url = _normalize_url_candidate(cite.get("url", ""))
             if not url:
                 fallback_urls = _extract_urls_from_text(
@@ -506,17 +551,16 @@ def _merge_citations_for_step6(consensus_citations: list, forecast: dict, qualit
                 )
                 if fallback_urls:
                     url = fallback_urls[0]
-            if not url:
-                claim = str(cite.get("claim", "")).strip()
-                source = str(cite.get("source", "")).strip()
-            claim_text = str(cite.get("claim", "")).strip()
-            claim_label = f" — {claim_text}" if claim_text else ""
-            data_suffix = str(cite.get("date", "")).strip()
-            data_suffix = f", {data_suffix}" if data_suffix else ""
-            source_text = str(cite.get("source", "")).strip()
-            data_type_text = f"External reference cited in Step 05{data_suffix}"
-            if source_text:
-                data_type_text = f"{data_type_text}, {source_text}"
+            claim_label = _short_claim_text(claim_text)
+            source_label = source_text or (f"AI synthesis ({_source_name_from_url(url)})" if url else "AI synthesis citation")
+            context_parts = []
+            if date_text:
+                context_parts.append(f"Date: {date_text}")
+            if claim_label:
+                context_parts.append(f"Claim: {claim_label}")
+            data_type_text = "External reference cited in Step 05"
+            if context_parts:
+                data_type_text = f"{data_type_text} | {' | '.join(context_parts)}"
 
             if url:
                 if url in seen_urls:
@@ -524,7 +568,7 @@ def _merge_citations_for_step6(consensus_citations: list, forecast: dict, qualit
                 seen_urls.add(url)
                 merged.append(
                     {
-                        "source_name": f"AI synthesis citation{claim_label}",
+                        "source_name": source_label,
                         "url": url,
                         "data_type": data_type_text,
                     }
@@ -532,34 +576,55 @@ def _merge_citations_for_step6(consensus_citations: list, forecast: dict, qualit
                 continue
 
             # Keep citation visible as plain text when no valid URL is present.
-            text_ref_key = f"{claim_text}|{source_text}|{data_suffix}"
+            text_ref_key = f"{claim_text}|{source_text}|{date_text}"
             if text_ref_key in seen_text_refs:
                 continue
             seen_text_refs.add(text_ref_key)
             merged.append(
                 {
-                    "source_name": f"AI synthesis citation{claim_label}",
+                    "source_name": source_label,
                     "url": "",
                     "data_type": f"{data_type_text} (no URL provided)",
                 }
             )
 
-    for item in qualitative_sources or []:
+    qualitative_pool = []
+    if isinstance(qualitative_sources, list):
+        qualitative_pool.extend(qualitative_sources)
+    if isinstance(forecast, dict):
+        forecast_qualitative = forecast.get("qualitative_sources_used", [])
+        if isinstance(forecast_qualitative, list):
+            qualitative_pool.extend(forecast_qualitative)
+
+    for item in qualitative_pool:
         if not isinstance(item, dict):
             continue
         url = _qualitative_source_url(item)
-        if not url or url in seen_urls:
+        if url and url in seen_urls:
+            continue
+        headline = _clean_citation_field(item.get("headline", "")) or "Analyst commentary"
+        source_name = _clean_citation_field(item.get("source", "")) or "Publication"
+        published = _clean_citation_field(item.get("date", ""))
+        context = f"{headline}{f' ({published})' if published else ''}"
+        if not url:
+            text_ref_key = f"qual|{source_name}|{context}"
+            if text_ref_key in seen_text_refs:
+                continue
+            seen_text_refs.add(text_ref_key)
+            merged.append(
+                {
+                    "source_name": source_name,
+                    "url": "",
+                    "data_type": f"Qualitative market/company context | {context} (no URL provided)",
+                }
+            )
             continue
         seen_urls.add(url)
-        headline = str(item.get("headline", "")).strip() or "Analyst commentary"
-        source_name = str(item.get("source", "")).strip() or "Publication"
-        published = str(item.get("date", "")).strip()
-        context = f"{source_name}, {published}" if published else source_name
         merged.append(
             {
-                "source_name": headline,
+                "source_name": source_name,
                 "url": url,
-                "data_type": f"Qualitative commentary ({context})",
+                "data_type": f"Qualitative market/company context | {context}",
             }
         )
 

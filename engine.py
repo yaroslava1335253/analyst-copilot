@@ -2302,30 +2302,41 @@ def fetch_consensus_estimates(
                 industry = info.get('industry', 'technology')
                 
                 qual_prompt = f"""
-                Search for recent analyst commentary on {company_name} ({ticker_symbol}) stock.
-                
+                Search for recent qualitative context on {company_name} ({ticker_symbol}).
+
+                Cover BOTH:
+                1) Market backdrop relevant to this stock (rates, AI demand cycle, semis/tech spending, regulation, supply chain)
+                2) Company-specific developments (guidance, product cycle, execution, margins, competition)
+
                 Current data:
                 - {buy_ratings} buy ratings, {hold_ratings} hold, {sell_ratings} sell
                 - Average price target: ${target_mean:.0f} ({((target_mean - info.get('currentPrice', target_mean)) / info.get('currentPrice', 1) * 100):+.0f}% from current)
                 - Industry: {industry}
-                
+
                 Return a JSON object with:
-                1. "summary": One sentence explaining the key bull/bear thesis (under 40 words)
-                2. "sources": Array of 2-3 recent sources backing this up, each with:
-                   - "headline": The actual headline or quote
-                   - "source": Publication name (e.g., "Barron's", "Seeking Alpha", "Bloomberg")
-                   - "date": Approximate date if known (e.g., "Feb 2026", "Jan 2026")
-                   - "url": Clickable source URL starting with https://
-                
+                1. "summary": One sentence (max 55 words) integrating market + company context
+                2. "sources": Array of 4-6 recent sources, each with:
+                   - "headline": Actual headline or short quote
+                   - "source": Publication or institution name
+                   - "date": Approximate date if known (e.g., "Feb 2026")
+                   - "url": Direct clickable URL starting with https://
+                   - "focus": "market" or "company"
+                   - "note": <=18 words on why this source matters
+
+                Rules:
+                - Include at least 2 "market" and 2 "company" sources when available.
+                - Use real URLs only. If URL unavailable, set it to empty string.
+                - Prefer Reuters, Bloomberg, WSJ, Financial Times, company IR/SEC, Fed/Treasury, and top broker notes.
+
                 Example format:
                 {{
-                    "summary": "Analysts remain bullish citing Azure revenue acceleration and Copilot adoption, though some flag elevated valuation multiples.",
+                    "summary": "Analysts remain constructive as AI infrastructure demand stays strong, while valuation sensitivity rises if macro demand cools.",
                     "sources": [
-                        {{"headline": "Microsoft's AI Push Drives Cloud Growth", "source": "Bloomberg", "date": "Feb 2026", "url": "https://www.bloomberg.com/..."}},
-                        {{"headline": "MSFT Upgraded on Strong Enterprise Demand", "source": "Barron's", "date": "Jan 2026", "url": "https://www.barrons.com/..."}}
+                        {{"headline": "US Treasury Yield Curve Update", "source": "U.S. Treasury", "date": "Mar 2026", "url": "https://home.treasury.gov/...", "focus": "market", "note": "Rate backdrop influences discount rates and multiples"}},
+                        {{"headline": "NVIDIA Reports Data Center Momentum", "source": "NVIDIA IR", "date": "Feb 2026", "url": "https://investor.nvidia.com/...", "focus": "company", "note": "Direct signal on demand and execution"}}
                     ]
                 }}
-                
+
                 Return ONLY valid JSON, no markdown.
                 """
                 
@@ -2519,6 +2530,29 @@ def generate_independent_forecast(quarterly_analysis: dict, company_name: str = 
     full_year = consensus.get("full_year", {})
     coverage = consensus.get("analyst_coverage", {})
     price_targets = consensus.get("price_targets", {})
+    qualitative_summary = str(consensus.get("qualitative_summary", "") or "").strip()
+    qualitative_sources = (
+        consensus.get("qualitative_sources", [])
+        if isinstance(consensus.get("qualitative_sources", []), list)
+        else []
+    )
+    # Enrich qualitative context for Step 05 when initial analysis skipped it.
+    if config_genai() and (not qualitative_summary or len(qualitative_sources) < 2):
+        try:
+            enriched_consensus = fetch_consensus_estimates(
+                ticker,
+                forecast_quarter_label,
+                include_qualitative=True,
+            )
+            if isinstance(enriched_consensus, dict) and not enriched_consensus.get("error"):
+                enriched_summary = str(enriched_consensus.get("qualitative_summary", "") or "").strip()
+                enriched_sources = enriched_consensus.get("qualitative_sources", [])
+                if isinstance(enriched_sources, list) and len(enriched_sources) > len(qualitative_sources):
+                    qualitative_sources = enriched_sources
+                if not qualitative_summary and enriched_summary:
+                    qualitative_summary = enriched_summary
+        except Exception:
+            pass
     
     consensus_text = f"""
     NEXT QUARTER CONSENSUS ({next_q.get('quarter_label', 'Upcoming')}):
@@ -2537,6 +2571,27 @@ def generate_independent_forecast(quarterly_analysis: dict, company_name: str = 
     - Average: {price_targets.get('average', 'N/A')}
     - Low: {price_targets.get('low', 'N/A')} | High: {price_targets.get('high', 'N/A')}
     """
+
+    qualitative_lines = []
+    for src in qualitative_sources[:8]:
+        if not isinstance(src, dict):
+            continue
+        headline = str(src.get("headline", "") or "").strip()
+        source_name = str(src.get("source", "") or "").strip()
+        date_value = str(src.get("date", "") or "").strip()
+        if not (headline or source_name):
+            continue
+        context_bits = [part for part in [source_name, date_value] if part]
+        context = ", ".join(context_bits)
+        if context:
+            qualitative_lines.append(f"- {headline or source_name} ({context})")
+        else:
+            qualitative_lines.append(f"- {headline or source_name}")
+    qualitative_context_text = (
+        "\n".join(qualitative_lines)
+        if qualitative_lines
+        else "No qualitative market/company source packets available for this run."
+    )
     
     # Historical projection (our calculated estimate)
     hist_proj = projections.get("next_quarter_estimate", {})
@@ -2701,9 +2756,11 @@ def generate_independent_forecast(quarterly_analysis: dict, company_name: str = 
            
         5. CITATION REQUIREMENT: Any claim based on outside information (news, macro, analyst reports, segment outlook, rates) MUST include:
            - Specific date
-           - Clickable URL
+           - Source name
+           - URL in the citation list JSON (NOT inline in narrative body)
            - NO CITATION = DO NOT STATE IT AS FACT
-           - Example: "Fed held rates at 5.25% (Jan 2026, https://federalreserve.gov/...)"
+           - Example (body): "Fed held rates at 5.25% (Federal Reserve, Jan 2026)"
+           - Example (citation JSON): {{"claim":"Fed held rates at 5.25%","source":"Federal Reserve","date":"Jan 2026","url":"https://federalreserve.gov/..."}}
         
         6. NO SEGMENT CLAIMS: Do NOT mention segment drivers (Azure, AWS, Office, etc.) unless:
            - They appear in the provided inputs, OR
@@ -2714,6 +2771,11 @@ def generate_independent_forecast(quarterly_analysis: dict, company_name: str = 
         8. DO NOT describe DCF intrinsic value as a "floor", "hard floor", or "guaranteed downside level".
            Treat it as one model output under one assumption set.
            Preferred wording: "model-implied intrinsic value under current assumptions."
+
+        9. QUALITATIVE COVERAGE REQUIREMENT:
+           - Use SECTION 2B when available to discuss market backdrop and company-specific narrative.
+           - Include at least 2 qualitative bullets when source packets are provided.
+           - If SECTION 2B is unavailable, explicitly state qualitative source coverage is limited.
         
         ═══════════════════════════════════════════════════════════════
         DATA PACKET FOR {ticker}
@@ -2725,6 +2787,11 @@ def generate_independent_forecast(quarterly_analysis: dict, company_name: str = 
         
         SECTION 2: WALL STREET CONSENSUS
         {consensus_text}
+
+        SECTION 2B: QUALITATIVE MARKET & COMPANY CONTEXT
+        Summary: {qualitative_summary if qualitative_summary else "N/A"}
+        Source Packets:
+        {qualitative_context_text}
         
         SECTION 3: CASH FLOW TRAJECTORY (FROM FINANCIALS)
         {cash_flow_context if cash_flow_context else "Cash flow data not available."}
@@ -2829,7 +2896,8 @@ def generate_independent_forecast(quarterly_analysis: dict, company_name: str = 
         ═══════════════════════════════════════════════════════════════
         CITATION FORMAT (MANDATORY FOR ALL EXTERNAL CLAIMS):
         ═══════════════════════════════════════════════════════════════
-        Format: "[claim] ([source], [date], [URL])"
+        Narrative body format: "[claim] ([source], [date])" (NO URL in body)
+        Citation list JSON format: include full URL for every external claim.
         
         Required for:
         - Analyst ratings/price targets
@@ -2841,7 +2909,8 @@ def generate_independent_forecast(quarterly_analysis: dict, company_name: str = 
         
         Preferred sources: SEC EDGAR, Company IR, Fed/Treasury, Damodaran, Reuters, Bloomberg, Yahoo Finance
         
-        Example: "Analysts have a mean price target of 220 USD (Yahoo Finance, Feb 2026, https://finance.yahoo.com/quote/AMZN)"
+        Example (body): "Analysts have a mean price target of 220 USD (Yahoo Finance, Feb 2026)"
+        Example (citation JSON): {{"claim": "Analysts have a mean price target of 220 USD", "source": "Yahoo Finance", "date": "Feb 2026", "url": "https://finance.yahoo.com/quote/AMZN"}}
         
         NO CITATION = DO NOT STATE AS FACT. Say "Hypothesis" or omit the claim entirely.
         
@@ -2857,6 +2926,8 @@ def generate_independent_forecast(quarterly_analysis: dict, company_name: str = 
             "company_name": company,
             "forecast_date": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "full_analysis": response_text,
+            "qualitative_summary_used": qualitative_summary,
+            "qualitative_sources_used": qualitative_sources[:8] if isinstance(qualitative_sources, list) else [],
             "input_data_summary": {
                 "quarters_analyzed": len(quarterly_data),
                 "consensus_revenue": next_q.get('revenue_estimate'),
