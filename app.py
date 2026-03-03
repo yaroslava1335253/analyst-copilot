@@ -895,6 +895,34 @@ def _smtp_config() -> tuple[dict, list]:
     smtp_from = _env_or_secret("SMTP_FROM", smtp_user, aliases=("from", "from_email", "sender"), section_name="smtp") or smtp_user
     smtp_port_raw = _env_or_secret("SMTP_PORT", "587", aliases=("port",), section_name="smtp")
     smtp_starttls = _env_or_secret("SMTP_STARTTLS", "1", aliases=("starttls", "tls", "use_starttls"), section_name="smtp").lower() in {"1", "true", "yes"}
+
+    # Compatibility path for common Streamlit secret shape:
+    # [email]
+    # gmail = "your@gmail.com"
+    # password = "app_password"
+    email_section = _secret_section("email")
+    email_user = str(
+        email_section.get("gmail", "")
+        or email_section.get("user", "")
+        or email_section.get("username", "")
+    ).strip()
+    email_password = str(
+        email_section.get("password", "")
+        or email_section.get("app_password", "")
+    ).strip()
+    if not smtp_user and email_user:
+        smtp_user = email_user
+    if not smtp_password and email_password:
+        smtp_password = email_password
+    if not smtp_from and smtp_user:
+        smtp_from = smtp_user
+    if not smtp_host and smtp_user and "@gmail.com" in smtp_user.lower():
+        smtp_host = "smtp.gmail.com"
+    if (not smtp_port_raw or not str(smtp_port_raw).strip()) and smtp_host == "smtp.gmail.com":
+        smtp_port_raw = "587"
+    if smtp_host == "smtp.gmail.com":
+        smtp_starttls = True
+
     missing = []
     if not smtp_host:
         missing.append("SMTP_HOST")
@@ -2749,6 +2777,8 @@ def _show_contact_page():
             "SMTP is not configured and FormSubmit fallback target is missing. "
             "Set `FORMSUBMIT_TO` or configure SMTP secrets."
         )
+    else:
+        st.caption(f"SMTP configured. Messages are sent to: {CONTACT_EMAIL_TO}")
 
     with st.form("contact_feedback_form", clear_on_submit=True):
         col_first, col_last, col_email = st.columns(3)
