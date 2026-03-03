@@ -58,6 +58,8 @@ FINANCIALS_TIMEOUT_SECONDS = 20
 QUARTERLY_ANALYSIS_TIMEOUT_SECONDS = 25
 SNAPSHOT_TIMEOUT_SECONDS = 12
 COMPANY_NAME_TIMEOUT_SECONDS = 3
+WACC_SLIDER_MIN_PCT = 0.5
+WACC_SLIDER_MAX_PCT = 20.0
 CONTACT_EMAIL_TO = os.environ.get("CONTACT_EMAIL_TO", "yaroslava@uni.minerva.edu").strip()
 EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 URL_REGEX = re.compile(r"(?:https?://|www\.)[^\s<>()\[\]\"']+")
@@ -4301,9 +4303,21 @@ if st.session_state.quarterly_analysis:
     suggested_fcf_growth = 8.0
     suggested_fcf_reliability = None
     suggested_fcf_period_type = None
+    raw_suggested_wacc = None
+    wacc_was_bounded = False
+    wacc_bound_reason = ""
     if snapshot_for_suggestions:
         if snapshot_for_suggestions.suggested_wacc.value:
             suggested_wacc = round(snapshot_for_suggestions.suggested_wacc.value * 100, 1)
+            wacc_components = getattr(snapshot_for_suggestions, "wacc_components", {}) or {}
+            raw_val = wacc_components.get("raw_suggested_wacc")
+            if raw_val is not None:
+                try:
+                    raw_suggested_wacc = float(raw_val) * 100.0
+                except Exception:
+                    raw_suggested_wacc = None
+            wacc_was_bounded = bool(wacc_components.get("wacc_was_bounded", False))
+            wacc_bound_reason = str(wacc_components.get("wacc_bound_reason", "") or "")
         if snapshot_for_suggestions.suggested_fcf_growth.value is not None:
             suggested_fcf_growth = round(snapshot_for_suggestions.suggested_fcf_growth.value * 100, 1)
             suggested_fcf_reliability = snapshot_for_suggestions.suggested_fcf_growth.reliability_score
@@ -4321,12 +4335,13 @@ if st.session_state.quarterly_analysis:
         seeded_fcf_growth = suggested_fcf_growth
         if suggested_fcf_reliability is not None and suggested_fcf_reliability < 65:
             seeded_fcf_growth = 8.0
-        st.session_state[wacc_slider_key] = float(min(15.0, max(5.0, suggested_wacc)))
+        st.session_state[wacc_slider_key] = float(min(WACC_SLIDER_MAX_PCT, max(WACC_SLIDER_MIN_PCT, suggested_wacc)))
         st.session_state[fcf_slider_key] = float(min(25.0, max(0.0, seeded_fcf_growth)))
         st.session_state[terminal_growth_key] = 3.0
         st.session_state.valuation_inputs_seeded_context = valuation_context_key
 
     default_wacc = float(st.session_state.get(wacc_slider_key, suggested_wacc))
+    default_wacc = max(WACC_SLIDER_MIN_PCT, min(WACC_SLIDER_MAX_PCT, default_wacc))
     default_fcf_growth = float(st.session_state.get(fcf_slider_key, suggested_fcf_growth))
     default_fcf_growth = max(0.0, min(25.0, default_fcf_growth))
     default_terminal_growth = float(st.session_state.get(terminal_growth_key, 3.0))
@@ -4335,8 +4350,8 @@ if st.session_state.quarterly_analysis:
     with col_wacc:
         user_wacc = st.slider(
             "WACC / Discount Rate (%)",
-            min_value=5.0,
-            max_value=15.0,
+            min_value=WACC_SLIDER_MIN_PCT,
+            max_value=WACC_SLIDER_MAX_PCT,
             value=default_wacc,
             step=0.1,
             format="%.1f",
@@ -4364,7 +4379,14 @@ if st.session_state.quarterly_analysis:
                 )
             else:
                 inputs_line = f"Rf {rf_source}{beta_text}"
-            st.caption(f"Suggested WACC: {suggested_wacc:.1f}% | Inputs: {inputs_line}")
+            suggested_text = f"Suggested WACC: {suggested_wacc:.1f}%"
+            if raw_suggested_wacc is not None:
+                suggested_text = f"Suggested WACC: {raw_suggested_wacc:.1f}% (raw), {suggested_wacc:.1f}% (used)"
+            st.caption(f"{suggested_text} | Inputs: {inputs_line}")
+            if wacc_was_bounded and wacc_bound_reason:
+                st.caption(f"Guardrail applied: {wacc_bound_reason}")
+            if we is not None and wd is not None and we <= 0.01 and wd >= 0.99:
+                st.caption("Capital structure signal: equity weight is near 0% (often means market cap/equity data is missing for this run).")
 
     with col_growth:
         user_fcf_growth = st.slider(

@@ -1271,7 +1271,17 @@ class DataAdapter:
             wacc_reliability = max(45, min(78, wacc_reliability))
             confidence_tier = "medium" if wacc_reliability >= 60 else "low"
 
-        suggested_wacc = max(0.05, min(0.20, suggested_wacc))
+        raw_suggested_wacc = suggested_wacc
+        bounded_suggested_wacc = max(0.01, min(0.25, raw_suggested_wacc))
+        wacc_was_bounded = abs(bounded_suggested_wacc - raw_suggested_wacc) > 1e-9
+        if wacc_was_bounded:
+            if raw_suggested_wacc < 0.01:
+                wacc_bound_reason = "WACC floored to 1.0% stability guardrail"
+            else:
+                wacc_bound_reason = "WACC capped at 25.0% stability guardrail"
+        else:
+            wacc_bound_reason = ""
+        suggested_wacc = bounded_suggested_wacc
 
         self.snapshot.wacc_components = {
             "risk_free_rate": RISK_FREE_RATE,
@@ -1301,6 +1311,10 @@ class DataAdapter:
             "wacc_mode_label": wacc_mode_label,
             "wacc_confidence": confidence_tier,
             "is_financial_sector_guardrail": is_financial_sector,
+            "raw_suggested_wacc": raw_suggested_wacc,
+            "bounded_suggested_wacc": bounded_suggested_wacc,
+            "wacc_was_bounded": wacc_was_bounded,
+            "wacc_bound_reason": wacc_bound_reason,
         }
 
         self.snapshot.suggested_wacc = DataQualityMetadata(
@@ -1318,6 +1332,10 @@ class DataAdapter:
                 f"= {suggested_wacc*100:.2f}%. Re source: {coe_source}. "
                 f"Rd source: {debt_cost_source}. Debt basis: {debt_basis_source}. "
                 + (f"Rd guardrail: {rd_guardrail_note}. " if rd_guardrail_note else "")
+                + (
+                    f"WACC raw={raw_suggested_wacc*100:.2f}%, bounded={bounded_suggested_wacc*100:.2f}% ({wacc_bound_reason}). "
+                    if wacc_was_bounded else ""
+                )
                 + f"Weights source: {weights_source}. Confidence: {confidence_tier}."
             )
         )
