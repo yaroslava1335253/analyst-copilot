@@ -20,7 +20,9 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
-from urllib.parse import quote, urlparse
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlencode, urlparse
+from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
@@ -821,58 +823,54 @@ def _format_numbered_citations_markdown(numbered_citations: list) -> str:
     return "\n".join(lines)
 
 
-def _send_contact_email(
-    *,
-    first_name: str,
-    last_name: str,
-    sender_email: str,
-    message: str,
-) -> tuple[bool, str]:
-    def _secret_section(section_name: str) -> dict:
+def _secret_section(section_name: str) -> dict:
+    try:
+        section = st.secrets.get(section_name, {})
+        return section if isinstance(section, dict) else {}
+    except Exception:
+        return {}
+
+
+def _env_or_secret(name: str, default: str = "", aliases: tuple[str, ...] = (), section_name: str = "") -> str:
+    env_keys = (name, name.lower(), *aliases)
+    for env_key in env_keys:
+        env_value = str(os.environ.get(env_key, "")).strip()
+        if env_value:
+            return env_value
+
+    candidate_secret_keys = (
+        name,
+        name.lower(),
+        name.replace("SMTP_", "").replace("FORMSUBMIT_", "").lower(),
+        *aliases,
+    )
+    for key in candidate_secret_keys:
         try:
-            section = st.secrets.get(section_name, {})
-            return section if isinstance(section, dict) else {}
+            value = st.secrets.get(key, "")
         except Exception:
-            return {}
+            value = ""
+        text = str(value or "").strip()
+        if text:
+            return text
 
-    def _env_or_secret(name: str, default: str = "", aliases: tuple[str, ...] = ()) -> str:
-        env_keys = (name, name.lower(), *aliases)
-        for env_key in env_keys:
-            env_value = str(os.environ.get(env_key, "")).strip()
-            if env_value:
-                return env_value
-
-        candidate_secret_keys = (
-            name,
-            name.lower(),
-            name.replace("SMTP_", "").lower(),
-            *aliases,
-        )
+    if section_name:
+        section = _secret_section(section_name)
         for key in candidate_secret_keys:
-            try:
-                value = st.secrets.get(key, "")
-            except Exception:
-                value = ""
+            value = section.get(key, "")
             text = str(value or "").strip()
             if text:
                 return text
 
-        smtp_section = _secret_section("smtp")
-        for key in candidate_secret_keys:
-            value = smtp_section.get(key, "")
-            text = str(value or "").strip()
-            if text:
-                return text
+    return str(default or "").strip()
 
-        return str(default or "").strip()
 
-    smtp_host = _env_or_secret("SMTP_HOST", aliases=("host",))
-    smtp_user = _env_or_secret("SMTP_USER", aliases=("user", "username"))
-    smtp_password = _env_or_secret("SMTP_PASSWORD", aliases=("password", "pass"))
-    smtp_from = _env_or_secret("SMTP_FROM", smtp_user, aliases=("from", "from_email", "sender"))
-    smtp_port_raw = _env_or_secret("SMTP_PORT", "587", aliases=("port",))
-    smtp_starttls = _env_or_secret("SMTP_STARTTLS", "1", aliases=("starttls", "tls", "use_starttls")).lower() in {"1", "true", "yes"}
-
+def _smtp_config() -> tuple[dict, list]:
+    smtp_host = _env_or_secret("SMTP_HOST", aliases=("host",), section_name="smtp")
+    smtp_user = _env_or_secret("SMTP_USER", aliases=("user", "username"), section_name="smtp")
+    smtp_password = _env_or_secret("SMTP_PASSWORD", aliases=("password", "pass"), section_name="smtp")
+    smtp_from = _env_or_secret("SMTP_FROM", smtp_user, aliases=("from", "from_email", "sender"), section_name="smtp") or smtp_user
+    smtp_port_raw = _env_or_secret("SMTP_PORT", "587", aliases=("port",), section_name="smtp")
+    smtp_starttls = _env_or_secret("SMTP_STARTTLS", "1", aliases=("starttls", "tls", "use_starttls"), section_name="smtp").lower() in {"1", "true", "yes"}
     missing = []
     if not smtp_host:
         missing.append("SMTP_HOST")
@@ -882,7 +880,96 @@ def _send_contact_email(
         missing.append("SMTP_PASSWORD")
     if not smtp_from:
         missing.append("SMTP_FROM")
+    return (
+        {
+            "host": smtp_host,
+            "user": smtp_user,
+            "password": smtp_password,
+            "from": smtp_from,
+            "port_raw": smtp_port_raw,
+            "starttls": smtp_starttls,
+        },
+        missing,
+    )
 
+
+def _formsubmit_target_email() -> str:
+    candidate = _env_or_secret(
+        "FORMSUBMIT_TO",
+        CONTACT_EMAIL_TO,
+        aliases=("to", "email", "recipient"),
+        section_name="formsubmit",
+    )
+    return candidate if EMAIL_REGEX.match(candidate) else ""
+
+
+def _send_contact_via_formsubmit(
+    *,
+    first_name: str,
+    last_name: str,
+    sender_email: str,
+    message: str,
+) -> tuple[bool, str]:
+    target_email = _formsubmit_target_email()
+    if not target_email:
+        return False, "FormSubmit fallback is not configured (missing valid target email)."
+
+    full_name = f"{first_name.strip()} {last_name.strip()}".strip()
+    payload = {
+        "name": full_name or sender_email.strip(),
+        "email": sender_email.strip(),
+        "message": message.strip(),
+        "_subject": f"Analyst Co-Pilot Contact Form - {full_name or sender_email.strip()}",
+        "_captcha": "false",
+        "_template": "table",
+    }
+    encoded = urlencode(payload).encode("utf-8")
+    endpoint = f"https://formsubmit.co/ajax/{quote(target_email)}"
+    req = Request(
+        endpoint,
+        data=encoded,
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        method="POST",
+    )
+
+    try:
+        with urlopen(req, timeout=20) as response:
+            body = response.read().decode("utf-8", errors="ignore")
+            if 200 <= getattr(response, "status", 0) < 300:
+                if body:
+                    try:
+                        parsed = json.loads(body)
+                        if str(parsed.get("success", "")).lower() in {"true", "1"}:
+                            return True, "Message sent successfully via contact fallback."
+                        if parsed.get("message"):
+                            return False, f"FormSubmit: {parsed.get('message')}"
+                    except Exception:
+                        pass
+                return True, "Message sent successfully via contact fallback."
+            return False, f"FormSubmit request failed with status {getattr(response, 'status', 'unknown')}."
+    except HTTPError as exc:
+        try:
+            detail = exc.read().decode("utf-8", errors="ignore")
+        except Exception:
+            detail = str(exc)
+        return False, f"FormSubmit HTTP error {exc.code}: {detail[:250]}"
+    except URLError as exc:
+        return False, f"FormSubmit connection error: {exc}"
+    except Exception as exc:
+        return False, f"FormSubmit error: {exc}"
+
+
+def _send_contact_email(
+    *,
+    first_name: str,
+    last_name: str,
+    sender_email: str,
+    message: str,
+) -> tuple[bool, str]:
+    smtp, missing = _smtp_config()
     if missing:
         return (
             False,
@@ -892,14 +979,14 @@ def _send_contact_email(
         )
 
     try:
-        smtp_port = int(smtp_port_raw)
+        smtp_port = int(smtp.get("port_raw") or "587")
     except Exception:
         smtp_port = 587
 
     full_name = f"{first_name.strip()} {last_name.strip()}".strip()
     msg = EmailMessage()
     msg["Subject"] = f"Analyst Co-Pilot Contact Form - {full_name or sender_email}"
-    msg["From"] = smtp_from
+    msg["From"] = smtp["from"]
     msg["To"] = CONTACT_EMAIL_TO
     msg["Reply-To"] = sender_email
     msg.set_content(
@@ -912,16 +999,16 @@ def _send_contact_email(
 
     try:
         if smtp_port == 465:
-            with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=20, context=ssl.create_default_context()) as server:
-                server.login(smtp_user, smtp_password)
+            with smtplib.SMTP_SSL(smtp["host"], smtp_port, timeout=20, context=ssl.create_default_context()) as server:
+                server.login(smtp["user"], smtp["password"])
                 server.send_message(msg)
         else:
-            with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as server:
+            with smtplib.SMTP(smtp["host"], smtp_port, timeout=20) as server:
                 server.ehlo()
-                if smtp_starttls:
+                if smtp["starttls"]:
                     server.starttls(context=ssl.create_default_context())
                     server.ehlo()
-                server.login(smtp_user, smtp_password)
+                server.login(smtp["user"], smtp["password"])
                 server.send_message(msg)
         return True, "Message sent successfully."
     except Exception as exc:
@@ -2595,6 +2682,9 @@ def _show_contact_page():
     st.caption("If you have ideas or proposals, fill out the form below.")
 
     st.markdown("### Share Your Idea or Proposal")
+    _smtp_missing = _smtp_config()[1]
+    if _smtp_missing:
+        st.caption("SMTP is not configured for this deployment. Submissions will use the FormSubmit fallback service.")
 
     with st.form("contact_feedback_form", clear_on_submit=True):
         col_first, col_last, col_email = st.columns(3)
@@ -2629,6 +2719,17 @@ def _show_contact_page():
                 sender_email=sender_email_clean,
                 message=message_clean,
             )
+            if (not ok) and status_message.startswith("Email sending is not configured. Missing:"):
+                ok, status_message = _send_contact_via_formsubmit(
+                    first_name=first_name_clean,
+                    last_name=last_name_clean,
+                    sender_email=sender_email_clean,
+                    message=message_clean,
+                )
+                if ok:
+                    st.success("Thanks. Your message was sent via contact fallback.")
+                    st.caption("If this is the first time using FormSubmit for this recipient, activate the recipient email once.")
+                    return
             if ok:
                 st.success("Thanks. Your message was sent.")
             else:
