@@ -5409,12 +5409,10 @@ if st.session_state.quarterly_analysis:
         for src in SOURCE_CATALOG.values():
             url = src["url"].replace("{ticker}", ticker_for_url)
             st.markdown(
-                f"**{src['label']}** — {src['description']}  \n"
+                f"**[{src['id']}] {src['label']}** — {src['description']}  \n"
                 f"*Method: {src['method']}*  \n"
                 f"[{url}]({url})"
             )
-        if isinstance(forecast_for_citations, dict) and not forecast_for_citations.get("error"):
-            st.caption("Step 05 external URLs are merged into the Citations section below.")
 
     with st.expander("Citations", expanded=False, icon="🔗"):
         if numbered_citations:
