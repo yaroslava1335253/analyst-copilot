@@ -252,78 +252,143 @@ class DataAdapter:
     def _fetch_price_and_shares(self, stock):
         """Fetch current price, market cap, shares outstanding, and company classification."""
         try:
-            info = stock.info
-            fast_info = stock.fast_info
-            
+            info = {}
+            fast_info = {}
+            info_error = None
+            fast_info_error = None
+
+            try:
+                raw_info = stock.info
+                if isinstance(raw_info, dict):
+                    info = raw_info
+            except Exception as exc:
+                info_error = exc
+
+            try:
+                raw_fast_info = stock.fast_info
+                if raw_fast_info:
+                    # yfinance may return a mapping-like object; convert safely.
+                    fast_info = dict(raw_fast_info)
+            except Exception as exc:
+                fast_info_error = exc
+
             # Store info for later use (e.g., analyst estimates)
-            self._ticker_info = info
-            
+            self._ticker_info = info if isinstance(info, dict) else {}
+
             # Company classification (sector, industry, name)
             self.snapshot.company_name = info.get('longName') or info.get('shortName')
             self.snapshot.sector = info.get('sector')
             self.snapshot.industry = info.get('industry')
-            
+
+            def _positive_number(*values):
+                for value in values:
+                    try:
+                        if value is None or pd.isna(value):
+                            continue
+                        num = float(value)
+                        if num > 0:
+                            return num
+                    except Exception:
+                        continue
+                return None
+
             # Price
-            price = info.get('currentPrice') or fast_info.get('lastPrice')
+            price = _positive_number(
+                info.get('currentPrice'),
+                info.get('regularMarketPrice'),
+                fast_info.get('lastPrice'),
+                fast_info.get('regularMarketPrice'),
+                fast_info.get('previousClose'),
+            )
             if price:
                 self.snapshot.price = DataQualityMetadata(
                     value=price,
                     units="USD",
                     period_end=datetime.utcnow().isoformat(),
                     period_type="current",
-                    source_path="yf.Ticker.info['currentPrice'] or fast_info['lastPrice']",
+                    source_path="yf.Ticker.info['currentPrice|regularMarketPrice'] or fast_info['lastPrice|regularMarketPrice|previousClose']",
                     retrieved_at=datetime.utcnow().isoformat(),
-                    reliability_score=95
+                    reliability_score=95 if info.get('currentPrice') or info.get('regularMarketPrice') else 85
                 )
             else:
                 self.snapshot.price.reliability_score = 0
                 self.snapshot.add_warning("NO_CURRENT_PRICE", f"No current price available for {self.ticker}")
-            
+
+            # Shares Outstanding
+            shares = _positive_number(
+                info.get('sharesOutstanding'),
+                info.get('impliedSharesOutstanding'),
+                fast_info.get('shares'),
+                fast_info.get('sharesOutstanding'),
+            )
+
             # Market Cap
-            market_cap = info.get('marketCap') or fast_info.get('marketCap')
+            market_cap = _positive_number(
+                info.get('marketCap'),
+                fast_info.get('marketCap'),
+            )
+
+            # Derived fallbacks
+            if market_cap is None and price and shares:
+                market_cap = price * shares
+                market_cap_source = "derived(price*shares)"
+                market_cap_reliability = 80
+            else:
+                market_cap_source = "yf.Ticker.info['marketCap'] or fast_info['marketCap']"
+                market_cap_reliability = 95 if info.get('marketCap') else 85
+
+            if shares is None and market_cap and price:
+                shares = market_cap / price
+                shares_source = "derived(marketCap/price)"
+                shares_reliability = 75
+            else:
+                shares_source = "yf.Ticker.info['sharesOutstanding|impliedSharesOutstanding'] or fast_info['shares|sharesOutstanding']"
+                shares_reliability = 90 if info.get('sharesOutstanding') or info.get('impliedSharesOutstanding') else 80
+
             if market_cap:
                 self.snapshot.market_cap = DataQualityMetadata(
                     value=market_cap,
                     units="USD",
                     period_end=datetime.utcnow().isoformat(),
                     period_type="current",
-                    source_path="yf.Ticker.info['marketCap']",
+                    source_path=market_cap_source,
                     retrieved_at=datetime.utcnow().isoformat(),
-                    reliability_score=95
+                    reliability_score=market_cap_reliability
                 )
             else:
                 self.snapshot.market_cap.reliability_score = 50
                 self.snapshot.add_warning("NO_MARKET_CAP", f"Market cap missing; will compute from price × shares")
-            
-            # Shares Outstanding
-            shares = info.get('sharesOutstanding') or fast_info.get('shares')
+
             if shares:
                 self.snapshot.shares_outstanding = DataQualityMetadata(
                     value=shares,
                     units="shares",
                     period_end=datetime.utcnow().isoformat(),
                     period_type="current",
-                    source_path="yf.Ticker.info['sharesOutstanding']",
+                    source_path=shares_source,
                     retrieved_at=datetime.utcnow().isoformat(),
-                    reliability_score=90
+                    reliability_score=shares_reliability
                 )
             else:
                 self.snapshot.shares_outstanding.reliability_score = 0
                 self.snapshot.add_warning("NO_SHARES_OUTSTANDING", "Shares outstanding unavailable—cannot compute per-share values")
-            
+
             # Diluted shares (for equity value calculations)
-            diluted_shares = info.get('sharesFullyDiluted')
+            diluted_shares = _positive_number(
+                info.get('sharesFullyDiluted'),
+                info.get('impliedSharesOutstanding'),
+            )
             if diluted_shares:
                 self.snapshot.latest_annual_diluted_shares = DataQualityMetadata(
                     value=diluted_shares,
                     units="shares",
                     period_type="current",
-                    source_path="yf.Ticker.info['sharesFullyDiluted']",
+                    source_path="yf.Ticker.info['sharesFullyDiluted|impliedSharesOutstanding']",
                     reliability_score=85
                 )
-            
+
             # Beta (for WACC calculation)
-            beta = info.get('beta')
+            beta = _positive_number(info.get('beta'))
             if beta:
                 self.snapshot.beta = DataQualityMetadata(
                     value=beta,
@@ -334,6 +399,11 @@ class DataAdapter:
                     reliability_score=85,
                     notes="5-year monthly beta vs S&P 500 (Yahoo Finance)"
                 )
+
+            if info_error and not info:
+                self.snapshot.add_warning("PRICE_INFO_FALLBACK", f"info endpoint unavailable, used fallbacks: {str(info_error)}")
+            if fast_info_error and not fast_info:
+                self.snapshot.add_warning("PRICE_FASTINFO_UNAVAILABLE", f"fast_info endpoint unavailable: {str(fast_info_error)}")
         
         except Exception as e:
             self.snapshot.add_warning("PRICE_FETCH_ERROR", f"Error fetching price/shares: {str(e)}")

@@ -54,6 +54,7 @@ AVAILABLE_DATES_TIMEOUT_SECONDS = 8
 FINANCIALS_TIMEOUT_SECONDS = 20
 QUARTERLY_ANALYSIS_TIMEOUT_SECONDS = 25
 SNAPSHOT_TIMEOUT_SECONDS = 12
+COMPANY_NAME_TIMEOUT_SECONDS = 3
 CONTACT_EMAIL_TO = os.environ.get("CONTACT_EMAIL_TO", "yaroslava@uni.minerva.edu").strip()
 EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 URL_REGEX = re.compile(r"(?:https?://|www\.)[^\s<>()\[\]\"']+")
@@ -922,7 +923,14 @@ def cached_company_name(ticker: str) -> str:
     if not _is_valid_ticker_format(normalized_ticker):
         return ""
     try:
-        info = yf.Ticker(normalized_ticker).info or {}
+        def _fetch_info() -> dict:
+            return yf.Ticker(normalized_ticker).info or {}
+
+        info = _call_with_timeout(
+            _fetch_info,
+            timeout_seconds=COMPANY_NAME_TIMEOUT_SECONDS,
+            fallback={},
+        ) or {}
         name = str(info.get("longName") or info.get("shortName") or "").strip()
         return name
     except Exception:
@@ -949,7 +957,16 @@ def run_dcf_analysis(ticker: str, wacc: float = None, fcf_growth: float = None,
     """Run DCF analysis with user-adjustable assumptions. Returns (ui_adapter, engine_result, snapshot)."""
     try:
         adapter = DataAdapter(ticker)
-        snapshot = adapter.fetch()
+        snapshot = _call_with_timeout(
+            adapter.fetch,
+            timeout_seconds=SNAPSHOT_TIMEOUT_SECONDS,
+            fallback=None,
+        )
+        if snapshot is None:
+            raise TimeoutError(
+                f"Snapshot fetch timed out after {SNAPSHOT_TIMEOUT_SECONDS}s. "
+                "Data provider may be temporarily unavailable; please retry."
+            )
         
         # Create assumptions with user overrides
         assumptions = DCFAssumptions()
@@ -3863,11 +3880,8 @@ if st.session_state.quarterly_analysis:
     _show_pe = _pe is not None and _pe > 0
     _pe_str = f"{_pe:.1f}x" if _show_pe else None
     _snapshot_for_name = st.session_state.get("dcf_snapshot")
-    _company_name = (
-        str(getattr(_snapshot_for_name, "company_name", "")).strip()
-        if _snapshot_for_name is not None
-        else ""
-    )
+    _company_name_raw = getattr(_snapshot_for_name, "company_name", None) if _snapshot_for_name is not None else None
+    _company_name = _company_name_raw.strip() if isinstance(_company_name_raw, str) else ""
     if not _company_name:
         _company_name = cached_company_name(ticker)
     _company_name_display = html.escape(_company_name) if _company_name else ticker

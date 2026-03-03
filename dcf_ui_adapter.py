@@ -126,9 +126,23 @@ class DCFUIAdapter:
     def _transform(self):
         """Perform all transformations and validations."""
         if not self.engine_result.get("success"):
+            raw_errors = self.engine_result.get("errors", [])
+            if isinstance(raw_errors, (str, bytes)):
+                errors = [str(raw_errors)]
+            elif isinstance(raw_errors, list):
+                errors = [str(err) for err in raw_errors if err]
+            else:
+                errors = []
+
+            if not errors:
+                fallback_error = self.engine_result.get("error")
+                if fallback_error:
+                    errors = [str(fallback_error)]
+
             self.ui_data = {
                 "success": False,
-                "error": self.engine_result.get("errors", ["Unknown error"]),
+                "error": errors[0] if errors else "Unknown error",
+                "errors": errors,
                 "warnings": self.engine_result.get("warnings", [])
             }
             return

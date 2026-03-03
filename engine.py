@@ -1670,22 +1670,58 @@ def analyze_quarterly_trends(ticker_symbol: str, num_quarters: int = 8, end_date
         shares_outstanding = None
         current_market_cap = None
         pe_ratio = None
+        company_name = ticker_symbol
         try:
-            stock_info = yf.Ticker(ticker_symbol).info
-            current_price = stock_info.get('currentPrice') or stock_info.get('regularMarketPrice')
-            shares_outstanding = stock_info.get('sharesOutstanding')
-            current_market_cap = stock_info.get('marketCap')
+            stock = yf.Ticker(ticker_symbol)
+            stock_info = {}
+            fast_info = {}
+
+            try:
+                maybe_info = stock.info
+                if isinstance(maybe_info, dict):
+                    stock_info = maybe_info
+            except Exception:
+                stock_info = {}
+
+            try:
+                maybe_fast_info = stock.fast_info
+                if maybe_fast_info:
+                    fast_info = dict(maybe_fast_info)
+            except Exception:
+                fast_info = {}
+
+            current_price = (
+                stock_info.get('currentPrice')
+                or stock_info.get('regularMarketPrice')
+                or fast_info.get('lastPrice')
+                or fast_info.get('regularMarketPrice')
+                or fast_info.get('previousClose')
+            )
+            shares_outstanding = (
+                stock_info.get('sharesOutstanding')
+                or stock_info.get('impliedSharesOutstanding')
+                or fast_info.get('shares')
+                or fast_info.get('sharesOutstanding')
+            )
+            current_market_cap = stock_info.get('marketCap') or fast_info.get('marketCap')
             pe_ratio = (
                 stock_info.get('trailingPE')
                 or stock_info.get('forwardPE')
                 or stock_info.get('priceToEarnings')
             )
+            company_name = stock_info.get('longName') or stock_info.get('shortName') or ticker_symbol
         except Exception:
             pass
         
         if shares_outstanding is None and current_market_cap and current_price:
             try:
                 shares_outstanding = current_market_cap / current_price
+            except Exception:
+                pass
+
+        if current_market_cap is None and shares_outstanding and current_price:
+            try:
+                current_market_cap = shares_outstanding * current_price
             except Exception:
                 pass
         
@@ -1695,6 +1731,7 @@ def analyze_quarterly_trends(ticker_symbol: str, num_quarters: int = 8, end_date
             "market_cap": current_market_cap,
             "pe_ratio": pe_ratio
         }
+        result["company_name"] = company_name
         
         # --- PART 1: Historical Quarterly Data ---
         requested_quarters = max(4, int(num_quarters))
