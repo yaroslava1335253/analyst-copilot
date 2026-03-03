@@ -62,7 +62,6 @@ WACC_SLIDER_MIN_PCT = 0.5
 WACC_SLIDER_MAX_PCT = 20.0
 SNAPSHOT_SUGGESTION_VERSION = "v4_wacc_source_sync"
 DEFAULT_INITIAL_QUARTERS = 7
-CONTACT_EMAIL_TO = os.environ.get("CONTACT_EMAIL_TO", "yaroslava@uni.minerva.edu").strip()
 EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 URL_REGEX = re.compile(r"(?:https?://|www\.)[^\s<>()\[\]\"']+")
 EMOJI_SYMBOL_REGEX = re.compile(r"[\U0001F300-\U0001FAFF\u2600-\u27BF\uFE0E\uFE0F\u200D]+")
@@ -88,6 +87,33 @@ SNAPSHOT_METADATA_FIELDS = [
     "suggested_fcf_growth",
     "analyst_long_term_growth",
 ]
+
+
+def _initial_contact_email() -> str:
+    env_value = str(
+        os.environ.get("CONTACT_EMAIL_TO", "") or os.environ.get("FORMSUBMIT_TO", "")
+    ).strip()
+    if env_value:
+        return env_value
+    try:
+        top_level = str(
+            st.secrets.get("CONTACT_EMAIL_TO", "") or st.secrets.get("FORMSUBMIT_TO", "")
+        ).strip()
+        if top_level:
+            return top_level
+        section = st.secrets.get("formsubmit", {})
+        if isinstance(section, dict):
+            section_value = str(
+                section.get("to", "") or section.get("email", "") or section.get("recipient", "")
+            ).strip()
+            if section_value:
+                return section_value
+    except Exception:
+        pass
+    return "yaroslava@uni.minerva.edu"
+
+
+CONTACT_EMAIL_TO = _initial_contact_email()
 
 
 def _default_ui_cache() -> dict:
@@ -2716,6 +2742,7 @@ def _show_contact_page():
         fallback_target = _formsubmit_target_email()
         if fallback_target:
             st.caption("SMTP is not configured. Using browser-direct FormSubmit fallback.")
+            st.caption(f"Current fallback recipient: {fallback_target}")
             _render_formsubmit_fallback_form(fallback_target)
             return
         st.warning(
