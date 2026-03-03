@@ -60,6 +60,7 @@ SNAPSHOT_TIMEOUT_SECONDS = 12
 COMPANY_NAME_TIMEOUT_SECONDS = 3
 WACC_SLIDER_MIN_PCT = 0.5
 WACC_SLIDER_MAX_PCT = 20.0
+SNAPSHOT_SUGGESTION_VERSION = "v4_wacc_source_sync"
 CONTACT_EMAIL_TO = os.environ.get("CONTACT_EMAIL_TO", "yaroslava@uni.minerva.edu").strip()
 EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 URL_REGEX = re.compile(r"(?:https?://|www\.)[^\s<>()\[\]\"']+")
@@ -3915,7 +3916,7 @@ if st.session_state.quarterly_analysis:
     if (_price is None or _mcap is None or not _company_name) and _snapshot_for_strip is None:
         _snapshot_for_strip = cached_financial_snapshot(
             ticker,
-            suggestion_algo_version="v3_forward_consensus",
+            suggestion_algo_version=SNAPSHOT_SUGGESTION_VERSION,
         )
 
     if _snapshot_for_strip is not None:
@@ -4293,11 +4294,22 @@ if st.session_state.quarterly_analysis:
     st.markdown('<div class="section-header"><span class="step-badge">Step 02</span><span class="section-title">Valuation Drivers</span></div>', unsafe_allow_html=True)
     st.caption("Tune assumptions, rerun the model, and review core valuation outputs.")
 
-    snapshot_for_suggestions = cached_financial_snapshot(
-        ticker,
-        suggestion_algo_version="v3_forward_consensus",
+    snapshot_for_suggestions = None
+    suggestions_source_label = "cached snapshot"
+    _active_dcf_snapshot = st.session_state.get("dcf_snapshot")
+    _active_dcf_ticker = _normalize_ticker(getattr(_active_dcf_snapshot, "ticker", "")) if _active_dcf_snapshot is not None else ""
+    if _active_dcf_snapshot is not None and _active_dcf_ticker == ticker:
+        snapshot_for_suggestions = _active_dcf_snapshot
+        suggestions_source_label = "current DCF run snapshot"
+    else:
+        snapshot_for_suggestions = cached_financial_snapshot(
+            ticker,
+            suggestion_algo_version=SNAPSHOT_SUGGESTION_VERSION,
+        )
+    st.caption(
+        "Suggested assumptions are auto-loaded for the active ticker. "
+        f"Source: {suggestions_source_label}."
     )
-    st.caption("Suggested assumptions are auto-loaded for the active ticker. You can adjust them after review.")
 
     suggested_wacc = 9.0
     suggested_fcf_growth = 8.0
@@ -4382,7 +4394,7 @@ if st.session_state.quarterly_analysis:
             suggested_text = f"Suggested WACC: {suggested_wacc:.1f}%"
             if raw_suggested_wacc is not None:
                 suggested_text = f"Suggested WACC: {raw_suggested_wacc:.1f}% (raw), {suggested_wacc:.1f}% (used)"
-            st.caption(f"{suggested_text} | Inputs: {inputs_line}")
+            st.caption(f"{suggested_text} | Inputs: {inputs_line} | Source: {suggestions_source_label}")
             if wacc_was_bounded and wacc_bound_reason:
                 st.caption(f"Guardrail applied: {wacc_bound_reason}")
             if we is not None and wd is not None and we <= 0.01 and wd >= 0.99:
