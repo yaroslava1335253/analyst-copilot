@@ -20,9 +20,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
-from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode, urlparse
-from urllib.request import Request, urlopen
+from urllib.parse import quote, urlparse
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
@@ -903,63 +901,94 @@ def _formsubmit_target_email() -> str:
     return candidate if EMAIL_REGEX.match(candidate) else ""
 
 
-def _send_contact_via_formsubmit(
-    *,
-    first_name: str,
-    last_name: str,
-    sender_email: str,
-    message: str,
-) -> tuple[bool, str]:
-    target_email = _formsubmit_target_email()
-    if not target_email:
-        return False, "FormSubmit fallback is not configured (missing valid target email)."
-
-    full_name = f"{first_name.strip()} {last_name.strip()}".strip()
-    payload = {
-        "name": full_name or sender_email.strip(),
-        "email": sender_email.strip(),
-        "message": message.strip(),
-        "_subject": f"Analyst Co-Pilot Contact Form - {full_name or sender_email.strip()}",
-        "_captcha": "false",
-        "_template": "table",
-    }
-    encoded = urlencode(payload).encode("utf-8")
-    endpoint = f"https://formsubmit.co/ajax/{quote(target_email)}"
-    req = Request(
-        endpoint,
-        data=encoded,
-        headers={
-            "Accept": "application/json",
-            "Content-Type": "application/x-www-form-urlencoded",
-        },
-        method="POST",
-    )
-
-    try:
-        with urlopen(req, timeout=20) as response:
-            body = response.read().decode("utf-8", errors="ignore")
-            if 200 <= getattr(response, "status", 0) < 300:
-                if body:
-                    try:
-                        parsed = json.loads(body)
-                        if str(parsed.get("success", "")).lower() in {"true", "1"}:
-                            return True, "Message sent successfully via contact fallback."
-                        if parsed.get("message"):
-                            return False, f"FormSubmit: {parsed.get('message')}"
-                    except Exception:
-                        pass
-                return True, "Message sent successfully via contact fallback."
-            return False, f"FormSubmit request failed with status {getattr(response, 'status', 'unknown')}."
-    except HTTPError as exc:
-        try:
-            detail = exc.read().decode("utf-8", errors="ignore")
-        except Exception:
-            detail = str(exc)
-        return False, f"FormSubmit HTTP error {exc.code}: {detail[:250]}"
-    except URLError as exc:
-        return False, f"FormSubmit connection error: {exc}"
-    except Exception as exc:
-        return False, f"FormSubmit error: {exc}"
+def _render_formsubmit_fallback_form(target_email: str) -> None:
+    action = f"https://formsubmit.co/{quote(target_email)}"
+    html_form = f"""
+    <style>
+      .fs-wrap {{
+        border: 1px solid #e5e7eb;
+        border-radius: 12px;
+        padding: 16px;
+        background: #ffffff;
+        font-family: Inter, sans-serif;
+      }}
+      .fs-grid {{
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 12px;
+      }}
+      .fs-group {{
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }}
+      .fs-group label {{
+        font-size: 0.95rem;
+        font-weight: 600;
+        color: #111827;
+      }}
+      .fs-group input, .fs-group textarea {{
+        border: 1px solid #d1d5db;
+        border-radius: 8px;
+        padding: 10px 12px;
+        font-size: 0.95rem;
+        width: 100%;
+        box-sizing: border-box;
+      }}
+      .fs-full {{
+        margin-top: 12px;
+      }}
+      .fs-btn {{
+        margin-top: 14px;
+        background: #2563eb;
+        color: #ffffff;
+        border: none;
+        border-radius: 8px;
+        padding: 10px 18px;
+        font-size: 0.95rem;
+        font-weight: 600;
+        cursor: pointer;
+      }}
+      .fs-note {{
+        margin-top: 10px;
+        color: #6b7280;
+        font-size: 0.85rem;
+      }}
+      @media (max-width: 760px) {{
+        .fs-grid {{
+          grid-template-columns: 1fr;
+        }}
+      }}
+    </style>
+    <div class="fs-wrap">
+      <form action="{action}" method="POST" target="_blank">
+        <input type="hidden" name="_subject" value="Analyst Co-Pilot Contact Form">
+        <input type="hidden" name="_captcha" value="false">
+        <input type="hidden" name="_template" value="table">
+        <div class="fs-grid">
+          <div class="fs-group">
+            <label for="fs_first">First name*</label>
+            <input id="fs_first" name="first_name" type="text" required placeholder="First name">
+          </div>
+          <div class="fs-group">
+            <label for="fs_last">Last name*</label>
+            <input id="fs_last" name="last_name" type="text" required placeholder="Last name">
+          </div>
+          <div class="fs-group">
+            <label for="fs_email">Email*</label>
+            <input id="fs_email" name="email" type="email" required placeholder="you@example.com">
+          </div>
+        </div>
+        <div class="fs-group fs-full">
+          <label for="fs_message">Your idea or proposal*</label>
+          <textarea id="fs_message" name="message" rows="7" required placeholder="Describe your idea, proposal, or feedback."></textarea>
+        </div>
+        <button class="fs-btn" type="submit">Submit</button>
+      </form>
+      <div class="fs-note">Opens FormSubmit in a new tab. If first use, activate recipient email once.</div>
+    </div>
+    """
+    components.html(html_form, height=520, scrolling=False)
 
 
 def _send_contact_email(
@@ -2684,7 +2713,15 @@ def _show_contact_page():
     st.markdown("### Share Your Idea or Proposal")
     _smtp_missing = _smtp_config()[1]
     if _smtp_missing:
-        st.caption("SMTP is not configured for this deployment. Submissions will use the FormSubmit fallback service.")
+        fallback_target = _formsubmit_target_email()
+        if fallback_target:
+            st.caption("SMTP is not configured. Using browser-direct FormSubmit fallback.")
+            _render_formsubmit_fallback_form(fallback_target)
+            return
+        st.warning(
+            "SMTP is not configured and FormSubmit fallback target is missing. "
+            "Set `FORMSUBMIT_TO` or configure SMTP secrets."
+        )
 
     with st.form("contact_feedback_form", clear_on_submit=True):
         col_first, col_last, col_email = st.columns(3)
@@ -2719,17 +2756,6 @@ def _show_contact_page():
                 sender_email=sender_email_clean,
                 message=message_clean,
             )
-            if (not ok) and status_message.startswith("Email sending is not configured. Missing:"):
-                ok, status_message = _send_contact_via_formsubmit(
-                    first_name=first_name_clean,
-                    last_name=last_name_clean,
-                    sender_email=sender_email_clean,
-                    message=message_clean,
-                )
-                if ok:
-                    st.success("Thanks. Your message was sent via contact fallback.")
-                    st.caption("If this is the first time using FormSubmit for this recipient, activate the recipient email once.")
-                    return
             if ok:
                 st.success("Thanks. Your message was sent.")
             else:
