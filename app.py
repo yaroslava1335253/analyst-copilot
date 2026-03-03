@@ -464,6 +464,7 @@ def _source_name_from_url(url: str) -> str:
 def _merge_citations_for_step6(consensus_citations: list, forecast: dict, qualitative_sources: list | None = None) -> list:
     merged = []
     seen_urls = set()
+    seen_text_refs = set()
 
     for cite in consensus_citations or []:
         if not isinstance(cite, dict):
@@ -500,23 +501,46 @@ def _merge_citations_for_step6(consensus_citations: list, forecast: dict, qualit
                 continue
             url = _normalize_url_candidate(cite.get("url", ""))
             if not url:
+                fallback_urls = _extract_urls_from_text(
+                    f"{cite.get('claim', '')}\n{cite.get('source', '')}\n{cite.get('date', '')}"
+                )
+                if fallback_urls:
+                    url = fallback_urls[0]
+            if not url:
                 claim = str(cite.get("claim", "")).strip()
                 source = str(cite.get("source", "")).strip()
-                query = " ".join(part for part in [claim, source] if part).strip()
-                if query:
-                    url = f"https://www.google.com/search?q={quote(query)}"
-            if not url or url in seen_urls:
-                continue
-            seen_urls.add(url)
             claim_text = str(cite.get("claim", "")).strip()
             claim_label = f" — {claim_text}" if claim_text else ""
             data_suffix = str(cite.get("date", "")).strip()
             data_suffix = f", {data_suffix}" if data_suffix else ""
+            source_text = str(cite.get("source", "")).strip()
+            data_type_text = f"External reference cited in Step 05{data_suffix}"
+            if source_text:
+                data_type_text = f"{data_type_text}, {source_text}"
+
+            if url:
+                if url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                merged.append(
+                    {
+                        "source_name": f"AI synthesis citation{claim_label}",
+                        "url": url,
+                        "data_type": data_type_text,
+                    }
+                )
+                continue
+
+            # Keep citation visible as plain text when no valid URL is present.
+            text_ref_key = f"{claim_text}|{source_text}|{data_suffix}"
+            if text_ref_key in seen_text_refs:
+                continue
+            seen_text_refs.add(text_ref_key)
             merged.append(
                 {
                     "source_name": f"AI synthesis citation{claim_label}",
-                    "url": url,
-                    "data_type": f"External reference cited in Step 05{data_suffix}",
+                    "url": "",
+                    "data_type": f"{data_type_text} (no URL provided)",
                 }
             )
 
@@ -5138,10 +5162,12 @@ if st.session_state.quarterly_analysis:
         if merged_citations:
             for cite in merged_citations:
                 url = _normalize_url_candidate(cite.get("url", ""))
+                source_name = str(cite.get("source_name", "Source") or "Source")
+                data_type = str(cite.get("data_type", "") or "")
                 if url:
-                    source_name = str(cite.get("source_name", "Source") or "Source")
-                    data_type = str(cite.get("data_type", "") or "")
                     st.markdown(f"- [{source_name}]({url}) — {data_type}")
+                else:
+                    st.markdown(f"- {source_name} — {data_type}")
         else:
             st.markdown(f"- [Yahoo Finance](https://finance.yahoo.com/quote/{ticker}/analysis) — EPS & Revenue estimates, analyst ratings")
 
