@@ -511,15 +511,21 @@ def _merge_citations_for_step6(consensus_citations: list, forecast: dict, qualit
     for cite in consensus_citations or []:
         if not isinstance(cite, dict):
             continue
+        source_text = _clean_citation_field(cite.get("source_name", "")) or "Source"
+        data_type_text = _clean_citation_field(cite.get("data_type", ""))
+        date_text = _clean_citation_field(cite.get("access_date", ""))
         url = _normalize_url_candidate(cite.get("url", ""))
         if not url or url in seen_urls:
             continue
         seen_urls.add(url)
         merged.append(
             {
-                "source_name": cite.get("source_name", "Source"),
+                "source_name": source_text,
+                "source": source_text,
+                "date": date_text,
+                "claim": "",
                 "url": url,
-                "data_type": cite.get("data_type", ""),
+                "data_type": data_type_text,
             }
         )
 
@@ -534,6 +540,9 @@ def _merge_citations_for_step6(consensus_citations: list, forecast: dict, qualit
             merged.append(
                 {
                     "source_name": f"AI synthesis ({_source_name_from_url(url)})",
+                    "source": _source_name_from_url(url),
+                    "date": "",
+                    "claim": "",
                     "url": url,
                     "data_type": "External reference cited in Step 05",
                 }
@@ -569,6 +578,9 @@ def _merge_citations_for_step6(consensus_citations: list, forecast: dict, qualit
                 merged.append(
                     {
                         "source_name": source_label,
+                        "source": source_text,
+                        "date": date_text,
+                        "claim": claim_text,
                         "url": url,
                         "data_type": data_type_text,
                     }
@@ -583,6 +595,9 @@ def _merge_citations_for_step6(consensus_citations: list, forecast: dict, qualit
             merged.append(
                 {
                     "source_name": source_label,
+                    "source": source_text,
+                    "date": date_text,
+                    "claim": claim_text,
                     "url": "",
                     "data_type": f"{data_type_text} (no URL provided)",
                 }
@@ -614,6 +629,9 @@ def _merge_citations_for_step6(consensus_citations: list, forecast: dict, qualit
             merged.append(
                 {
                     "source_name": source_name,
+                    "source": source_name,
+                    "date": published,
+                    "claim": headline,
                     "url": "",
                     "data_type": f"Qualitative market/company context | {context} (no URL provided)",
                 }
@@ -623,12 +641,127 @@ def _merge_citations_for_step6(consensus_citations: list, forecast: dict, qualit
         merged.append(
             {
                 "source_name": source_name,
+                "source": source_name,
+                "date": published,
+                "claim": headline,
                 "url": url,
                 "data_type": f"Qualitative market/company context | {context}",
             }
         )
 
     return merged
+
+
+def _citation_date_value(cite: dict) -> str:
+    if not isinstance(cite, dict):
+        return ""
+    date_text = _clean_citation_field(cite.get("date", ""))
+    if date_text:
+        return date_text
+    data_type = _clean_citation_field(cite.get("data_type", ""))
+    if not data_type:
+        return ""
+    match = re.search(r"Date:\s*([^|]+)", data_type, flags=re.IGNORECASE)
+    if not match:
+        return ""
+    return _clean_citation_field(match.group(1))
+
+
+def _number_citations(citations: list) -> list:
+    numbered = []
+    for idx, cite in enumerate(citations or [], start=1):
+        if not isinstance(cite, dict):
+            continue
+        entry = dict(cite)
+        entry["number"] = idx
+        numbered.append(entry)
+    return numbered
+
+
+def _apply_inline_numeric_citations(text: str, numbered_citations: list) -> str:
+    if not isinstance(text, str) or not text.strip() or not numbered_citations:
+        return text
+    rendered = text
+    for cite in numbered_citations:
+        marker = f"[{cite.get('number')}]"
+        source_name = _clean_citation_field(cite.get("source_name", ""))
+        date_value = _citation_date_value(cite)
+        claim_text = _clean_citation_field(cite.get("claim", ""))
+        replaced = False
+
+        if claim_text and len(claim_text) >= 28:
+            snippet = claim_text[:100].rstrip(" .,;:")
+            if len(snippet) >= 24:
+                rendered, count = re.subn(
+                    re.escape(snippet),
+                    lambda m: f"{m.group(0)} {marker}",
+                    rendered,
+                    count=1,
+                    flags=re.IGNORECASE,
+                )
+                replaced = count > 0
+
+        if not replaced and source_name:
+            pattern = rf"\([^)]*{re.escape(source_name)}"
+            if date_value:
+                pattern += rf"[^)]*{re.escape(date_value)}"
+            pattern += r"[^)]*\)"
+            rendered, count = re.subn(pattern, marker, rendered, count=1, flags=re.IGNORECASE)
+            replaced = count > 0
+
+        if not replaced and source_name:
+            rendered, count = re.subn(
+                rf"\b{re.escape(source_name)}\b",
+                lambda m: f"{m.group(0)} {marker}",
+                rendered,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+            replaced = count > 0
+
+        if not replaced and date_value:
+            rendered, _ = re.subn(
+                rf"\b{re.escape(date_value)}\b",
+                lambda m: f"{m.group(0)} {marker}",
+                rendered,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+
+    rendered = re.sub(r"(\[\d+\])(?:\s*\1)+", r"\1", rendered)
+    rendered = re.sub(r"[ \t]{2,}", " ", rendered)
+    return rendered.strip()
+
+
+def _format_numbered_citations_markdown(numbered_citations: list) -> str:
+    lines = []
+    for cite in numbered_citations or []:
+        number = cite.get("number")
+        source_name = _clean_citation_field(cite.get("source_name", "")) or "Source"
+        date_value = _citation_date_value(cite)
+        claim_text = _short_claim_text(cite.get("claim", ""), max_chars=140)
+        data_type = _clean_citation_field(cite.get("data_type", ""))
+        data_type = re.sub(r"\s*\(no URL provided\)\s*$", "", data_type, flags=re.IGNORECASE)
+        data_type = re.sub(r"^External reference cited in Step 05\s*\|\s*", "", data_type, flags=re.IGNORECASE)
+        data_type = re.sub(r"\bDate:\s*[^|]+", "", data_type, flags=re.IGNORECASE)
+        data_type = re.sub(r"\bClaim:\s*[^|]+", "", data_type, flags=re.IGNORECASE)
+        data_type = re.sub(r"\s*\|\s*", " ", data_type).strip(" -|")
+
+        detail_parts = []
+        if date_value:
+            detail_parts.append(date_value)
+        if claim_text:
+            detail_parts.append(claim_text)
+        elif data_type:
+            detail_parts.append(data_type)
+
+        url = _normalize_url_candidate(cite.get("url", ""))
+        source_md = f"[{source_name}]({url})" if url else source_name
+        if detail_parts:
+            lines.append(f"{number}. {source_md} — {' | '.join(detail_parts)}")
+        else:
+            lines.append(f"{number}. {source_md}")
+    return "\n".join(lines)
 
 
 def _send_contact_email(
@@ -5110,6 +5243,10 @@ if st.session_state.quarterly_analysis:
         with st.expander("AI Synthesis Error Details", expanded=False):
             st.code(str(ai_outlook_error))
 
+    forecast_for_citations = st.session_state.get("independent_forecast")
+    merged_citations = _merge_citations_for_step6(consensus_citations, forecast_for_citations, qual_sources)
+    numbered_citations = _number_citations(merged_citations)
+
     if st.session_state.independent_forecast:
         forecast = st.session_state.independent_forecast
         if forecast.get("error"):
@@ -5127,6 +5264,7 @@ if st.session_state.quarterly_analysis:
         else:
             extracted = forecast.get("extracted_forecast") or {}
             full_analysis = _sanitize_ai_valuation_language(forecast.get("full_analysis", "") or "")
+            full_analysis = _apply_inline_numeric_citations(full_analysis, numbered_citations)
             full_analysis = full_analysis.replace("$", "\\$")
             expanded_default = bool(st.session_state.get("forecast_just_generated", False))
             view_model = _build_outlook_view_model(extracted, full_analysis)
@@ -5207,8 +5345,6 @@ if st.session_state.quarterly_analysis:
     st.markdown("---")
     st.markdown('<div class="section-header"><span class="step-badge">Step 06</span><span class="section-title">Sources & Methodology</span></div>', unsafe_allow_html=True)
     st.caption("Reference material and citations for all report sections.")
-    forecast_for_citations = st.session_state.get("independent_forecast")
-    merged_citations = _merge_citations_for_step6(consensus_citations, forecast_for_citations, qual_sources)
 
     with st.expander("Methodology", expanded=False, icon="📚"):
         st.markdown("Core data sources and method notes used in this report:")
@@ -5224,17 +5360,10 @@ if st.session_state.quarterly_analysis:
             st.caption("Step 05 external URLs are merged into the Citations section below.")
 
     with st.expander("Citations", expanded=False, icon="🔗"):
-        if merged_citations:
-            for cite in merged_citations:
-                url = _normalize_url_candidate(cite.get("url", ""))
-                source_name = str(cite.get("source_name", "Source") or "Source")
-                data_type = str(cite.get("data_type", "") or "")
-                if url:
-                    st.markdown(f"- [{source_name}]({url}) — {data_type}")
-                else:
-                    st.markdown(f"- {source_name} — {data_type}")
+        if numbered_citations:
+            st.markdown(_format_numbered_citations_markdown(numbered_citations))
         else:
-            st.markdown(f"- [Yahoo Finance](https://finance.yahoo.com/quote/{ticker}/analysis) — EPS & Revenue estimates, analyst ratings")
+            st.markdown(f"1. [Yahoo Finance](https://finance.yahoo.com/quote/{ticker}/analysis) — EPS & Revenue estimates, analyst ratings")
 
 else:
     st.info("Enter a ticker and click 'Load Data' to begin analysis.")

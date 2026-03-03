@@ -2757,10 +2757,9 @@ def generate_independent_forecast(quarterly_analysis: dict, company_name: str = 
         5. CITATION REQUIREMENT: Any claim based on outside information (news, macro, analyst reports, segment outlook, rates) MUST include:
            - Specific date
            - Source name
-           - URL in the citation list JSON (NOT inline in narrative body)
+           - Inline numeric marker in the body, like [1], [2]
            - NO CITATION = DO NOT STATE IT AS FACT
-           - Example (body): "Fed held rates at 5.25% (Federal Reserve, Jan 2026)"
-           - Example (citation JSON): {{"claim":"Fed held rates at 5.25%","source":"Federal Reserve","date":"Jan 2026","url":"https://federalreserve.gov/..."}}
+           - Example: "Fed held rates at 5.25% (Federal Reserve, Jan 2026) [1]"
         
         6. NO SEGMENT CLAIMS: Do NOT mention segment drivers (Azure, AWS, Office, etc.) unless:
            - They appear in the provided inputs, OR
@@ -2810,8 +2809,8 @@ def generate_independent_forecast(quarterly_analysis: dict, company_name: str = 
         **Directional Stance:** [Bullish / Neutral / Bearish] — CONDITIONAL, not categorical
         
         **Key Drivers (3–5 bullets, tied to provided data or cited sources):**
-        - [Driver 1 with data reference or citation URL]
-        - [Driver 2 with data reference or citation URL]
+        - [Driver 1 with data reference or inline citation marker, e.g., [1]]
+        - [Driver 2 with data reference or inline citation marker, e.g., [2]]
         - [etc.]
         
         **Key Risks (3 bullets):**
@@ -2896,8 +2895,9 @@ def generate_independent_forecast(quarterly_analysis: dict, company_name: str = 
         ═══════════════════════════════════════════════════════════════
         CITATION FORMAT (MANDATORY FOR ALL EXTERNAL CLAIMS):
         ═══════════════════════════════════════════════════════════════
-        Narrative body format: "[claim] ([source], [date])" (NO URL in body)
-        Citation list JSON format: include full URL for every external claim.
+        Narrative body format: "[claim] ([source], [date]) [n]"
+        Use numeric tags like [1], [2], [3] and reuse a number if it is the same source basis.
+        Do NOT place raw URLs in the narrative body.
         
         Required for:
         - Analyst ratings/price targets
@@ -2909,8 +2909,7 @@ def generate_independent_forecast(quarterly_analysis: dict, company_name: str = 
         
         Preferred sources: SEC EDGAR, Company IR, Fed/Treasury, Damodaran, Reuters, Bloomberg, Yahoo Finance
         
-        Example (body): "Analysts have a mean price target of 220 USD (Yahoo Finance, Feb 2026)"
-        Example (citation JSON): {{"claim": "Analysts have a mean price target of 220 USD", "source": "Yahoo Finance", "date": "Feb 2026", "url": "https://finance.yahoo.com/quote/AMZN"}}
+        Example: "Analysts have a mean price target of 220 USD (Yahoo Finance, Feb 2026) [2]"
         
         NO CITATION = DO NOT STATE AS FACT. Say "Hypothesis" or omit the claim entirely.
         
