@@ -828,17 +828,27 @@ def _send_contact_email(
     sender_email: str,
     message: str,
 ) -> tuple[bool, str]:
-    smtp_host = str(os.environ.get("SMTP_HOST", "")).strip()
-    smtp_user = str(os.environ.get("SMTP_USER", "")).strip()
-    smtp_password = str(os.environ.get("SMTP_PASSWORD", "")).strip()
-    smtp_from = str(os.environ.get("SMTP_FROM", smtp_user)).strip()
-    smtp_port_raw = str(os.environ.get("SMTP_PORT", "587")).strip()
-    smtp_starttls = str(os.environ.get("SMTP_STARTTLS", "1")).strip().lower() in {"1", "true", "yes"}
+    def _env_or_secret(name: str, default: str = "") -> str:
+        env_value = str(os.environ.get(name, "")).strip()
+        if env_value:
+            return env_value
+        try:
+            secret_value = st.secrets.get(name, default)
+        except Exception:
+            secret_value = default
+        return str(secret_value or "").strip()
+
+    smtp_host = _env_or_secret("SMTP_HOST")
+    smtp_user = _env_or_secret("SMTP_USER")
+    smtp_password = _env_or_secret("SMTP_PASSWORD")
+    smtp_from = _env_or_secret("SMTP_FROM", smtp_user) or smtp_user
+    smtp_port_raw = _env_or_secret("SMTP_PORT", "587")
+    smtp_starttls = _env_or_secret("SMTP_STARTTLS", "1").lower() in {"1", "true", "yes"}
 
     if not smtp_host or not smtp_user or not smtp_password or not smtp_from:
         return (
             False,
-            "Email sending is not configured. Add SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, and optionally SMTP_FROM in environment settings.",
+            "Email sending is not configured. Add SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, and optionally SMTP_FROM in deployment secrets or environment variables.",
         )
 
     try:
@@ -4138,8 +4148,10 @@ if st.session_state.get("show_contact_panel"):
     st.session_state.show_user_guide = False
 if st.session_state.get("show_user_guide"):
     _show_user_guide_page()
+    st.stop()
 if st.session_state.get("show_contact_panel"):
     _show_contact_page()
+    st.stop()
 
 if st.session_state.quarterly_analysis:
     analysis = st.session_state.quarterly_analysis
