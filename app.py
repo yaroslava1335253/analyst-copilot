@@ -711,61 +711,80 @@ def _number_citations(citations: list) -> list:
             continue
         entry = dict(cite)
         entry["number"] = idx
+        entry["citation_tag"] = f"C{idx}"
         numbered.append(entry)
     return numbered
+
+
+def _citation_token_pattern(text: str) -> str:
+    token = _clean_citation_field(text)
+    if not token:
+        return ""
+    escaped = re.escape(token)
+    if token and token[0].isalnum():
+        escaped = rf"\b{escaped}"
+    if token and token[-1].isalnum():
+        escaped = rf"{escaped}\b"
+    return escaped
 
 
 def _apply_inline_numeric_citations(text: str, numbered_citations: list) -> str:
     if not isinstance(text, str) or not text.strip() or not numbered_citations:
         return text
-    rendered = text
+    rendered = re.sub(r"\[(\d{1,2})\]", r"[C\1]", text)
     for cite in numbered_citations:
-        marker = f"[{cite.get('number')}]"
+        citation_tag = str(cite.get("citation_tag") or f"C{cite.get('number')}")
+        marker = f"[{citation_tag}]"
+        if marker in rendered:
+            continue
         source_name = _clean_citation_field(cite.get("source_name", ""))
         date_value = _citation_date_value(cite)
-        claim_text = _clean_citation_field(cite.get("claim", ""))
+        source_pattern = _citation_token_pattern(source_name)
+        date_pattern = _citation_token_pattern(date_value)
         replaced = False
 
-        if claim_text and len(claim_text) >= 28:
-            snippet = claim_text[:100].rstrip(" .,;:")
-            if len(snippet) >= 24:
-                rendered, count = re.subn(
-                    re.escape(snippet),
-                    lambda m: f"{m.group(0)} {marker}",
-                    rendered,
-                    count=1,
-                    flags=re.IGNORECASE,
-                )
-                replaced = count > 0
-
-        if not replaced and source_name:
-            pattern = rf"\([^)]*{re.escape(source_name)}"
-            if date_value:
-                pattern += rf"[^)]*{re.escape(date_value)}"
-            pattern += r"[^)]*\)"
-            rendered, count = re.subn(pattern, marker, rendered, count=1, flags=re.IGNORECASE)
-            replaced = count > 0
-
-        if not replaced and source_name:
+        if source_pattern and date_pattern:
+            pattern = rf"(\([^)]*{source_pattern}[^)]*{date_pattern}[^)]*\))(?!\s*\[C\d+\])"
             rendered, count = re.subn(
-                rf"\b{re.escape(source_name)}\b",
-                lambda m: f"{m.group(0)} {marker}",
+                pattern,
+                lambda m: f"{m.group(1)} {marker}",
                 rendered,
                 count=1,
                 flags=re.IGNORECASE,
             )
             replaced = count > 0
 
-        if not replaced and date_value:
+        if not replaced and source_pattern:
+            pattern = rf"(\([^)]*{source_pattern}[^)]*\))(?!\s*\[C\d+\])"
+            rendered, count = re.subn(
+                pattern,
+                lambda m: f"{m.group(1)} {marker}",
+                rendered,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+            replaced = count > 0
+
+        if not replaced and source_pattern:
+            rendered, count = re.subn(
+                rf"({source_pattern})(?!\s*\[C\d+\])",
+                lambda m: f"{m.group(1)} {marker}",
+                rendered,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+            replaced = count > 0
+
+        if not replaced and date_pattern:
             rendered, _ = re.subn(
-                rf"\b{re.escape(date_value)}\b",
-                lambda m: f"{m.group(0)} {marker}",
+                rf"({date_pattern})(?!\s*\[C\d+\])",
+                lambda m: f"{m.group(1)} {marker}",
                 rendered,
                 count=1,
                 flags=re.IGNORECASE,
             )
 
-    rendered = re.sub(r"(\[\d+\])(?:\s*\1)+", r"\1", rendered)
+    rendered = re.sub(r"(\[C\d+\])(?:\s*\1)+", r"\1", rendered)
     rendered = re.sub(r"[ \t]{2,}", " ", rendered)
     return rendered.strip()
 
@@ -773,7 +792,7 @@ def _apply_inline_numeric_citations(text: str, numbered_citations: list) -> str:
 def _format_numbered_citations_markdown(numbered_citations: list) -> str:
     lines = []
     for cite in numbered_citations or []:
-        number = cite.get("number")
+        citation_tag = str(cite.get("citation_tag") or f"C{cite.get('number')}")
         source_name = _clean_citation_field(cite.get("source_name", "")) or "Source"
         date_value = _citation_date_value(cite)
         claim_text = _short_claim_text(cite.get("claim", ""), max_chars=140)
@@ -794,10 +813,11 @@ def _format_numbered_citations_markdown(numbered_citations: list) -> str:
 
         url = _normalize_url_candidate(cite.get("url", ""))
         source_md = f"[{source_name}]({url})" if url else source_name
+        prefix = f"- **[{citation_tag}]** {source_md}"
         if detail_parts:
-            lines.append(f"{number}. {source_md} — {' | '.join(detail_parts)}")
+            lines.append(f"{prefix} — {' | '.join(detail_parts)}")
         else:
-            lines.append(f"{number}. {source_md}")
+            lines.append(prefix)
     return "\n".join(lines)
 
 
@@ -5389,7 +5409,7 @@ if st.session_state.quarterly_analysis:
         for src in SOURCE_CATALOG.values():
             url = src["url"].replace("{ticker}", ticker_for_url)
             st.markdown(
-                f"**[{src['id']}]** **{src['label']}** — {src['description']}  \n"
+                f"**{src['label']}** — {src['description']}  \n"
                 f"*Method: {src['method']}*  \n"
                 f"[{url}]({url})"
             )
@@ -5400,7 +5420,7 @@ if st.session_state.quarterly_analysis:
         if numbered_citations:
             st.markdown(_format_numbered_citations_markdown(numbered_citations))
         else:
-            st.markdown(f"1. [Yahoo Finance](https://finance.yahoo.com/quote/{ticker}/analysis) — EPS & Revenue estimates, analyst ratings")
+            st.markdown(f"- **[C1]** [Yahoo Finance](https://finance.yahoo.com/quote/{ticker}/analysis) — EPS & Revenue estimates, analyst ratings")
 
 else:
     st.info("Enter a ticker and click 'Load Data' to begin analysis.")
