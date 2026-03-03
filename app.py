@@ -2754,7 +2754,7 @@ def _show_user_guide_page():
 
 
 def _show_contact_page():
-    """Render inline contact form on the main page."""
+    """Render a simple contact destination without any form submission flow."""
     _contact_title_col, _contact_close_col = st.columns([10, 1])
     with _contact_title_col:
         st.markdown(
@@ -2765,69 +2765,10 @@ def _show_contact_page():
         if st.button("Close", key="close_contact_panel_top", type="tertiary"):
             st.session_state.show_contact_panel = False
             st.rerun()
-    st.caption("If you have ideas or proposals, fill out the form below.")
-
-    st.markdown("### Share Your Idea or Proposal")
-    _smtp_missing = _smtp_config()[1]
-    if _smtp_missing:
-        fallback_target = _formsubmit_target_email()
-        if fallback_target:
-            st.caption("SMTP is not configured. Using browser-direct FormSubmit fallback.")
-            st.caption(f"Current fallback recipient: {fallback_target}")
-            _render_formsubmit_fallback_form(fallback_target)
-            return
-        st.warning(
-            "SMTP is not configured and FormSubmit fallback target is missing. "
-            "Set `FORMSUBMIT_TO` or configure SMTP secrets."
-        )
-    else:
-        st.caption(f"SMTP configured. Messages are sent to: {CONTACT_EMAIL_TO}")
-
-    with st.form("contact_feedback_form", clear_on_submit=True):
-        col_first, col_last, col_email = st.columns(3)
-        with col_first:
-            first_name = st.text_input("First name*", placeholder="First name")
-        with col_last:
-            last_name = st.text_input("Last name*", placeholder="Last name")
-        with col_email:
-            sender_email = st.text_input("Email*", placeholder="you@example.com")
-
-        message = st.text_area(
-            "Your idea or proposal*",
-            placeholder="Describe your idea, proposal, or feedback.",
-            height=180,
-        )
-        submitted = st.form_submit_button("Submit")
-
-    if submitted:
-        first_name_clean = first_name.strip()
-        last_name_clean = last_name.strip()
-        sender_email_clean = sender_email.strip()
-        message_clean = message.strip()
-
-        if not first_name_clean or not last_name_clean or not sender_email_clean or not message_clean:
-            st.error("Please fill out all required fields.")
-        elif not EMAIL_REGEX.match(sender_email_clean):
-            st.error("Please enter a valid email address.")
-        else:
-            ok, status_message = _send_contact_email(
-                first_name=first_name_clean,
-                last_name=last_name_clean,
-                sender_email=sender_email_clean,
-                message=message_clean,
-            )
-            if ok:
-                st.success("Thanks. Your message was sent.")
-            else:
-                st.error(status_message)
-                mailto_subject = quote(f"Analyst Co-Pilot Feedback - {first_name_clean} {last_name_clean}".strip())
-                mailto_body = quote(
-                    f"From: {first_name_clean} {last_name_clean} ({sender_email_clean})\n\n"
-                    f"{message_clean}"
-                )
-                st.markdown(
-                    f"If sending fails, email directly: [Compose Email](mailto:{CONTACT_EMAIL_TO}?subject={mailto_subject}&body={mailto_body})"
-                )
+    st.caption("For suggestions or feedback, email us directly.")
+    st.markdown("### Suggestions Email")
+    st.markdown(f"**{CONTACT_EMAIL_TO}**")
+    st.markdown(f"[Compose Email](mailto:{CONTACT_EMAIL_TO})")
 # --- App Configuration ---
 st.set_page_config(
     page_title="Analyst Co-Pilot",
