@@ -460,6 +460,8 @@ def _normalize_url_candidate(raw_url: str) -> str:
     if not candidate:
         return ""
     candidate = candidate.rstrip(".,;:!?)")
+    if "..." in candidate:
+        return ""
     if candidate.lower().startswith("www."):
         candidate = f"https://{candidate}"
     if re.match(r"^https?://", candidate, flags=re.IGNORECASE):
@@ -469,10 +471,43 @@ def _normalize_url_candidate(raw_url: str) -> str:
     return ""
 
 
+def _compact_search_query(text: str, max_words: int = 10, max_chars: int = 80) -> str:
+    cleaned = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not cleaned:
+        return ""
+    words = cleaned.split(" ")
+    short = " ".join(words[:max_words]).strip()
+    if len(short) > max_chars:
+        short = short[:max_chars].rsplit(" ", 1)[0].strip()
+    return short
+
+
+def _source_search_fallback_url(source_name: str, headline_or_claim: str) -> str:
+    source = str(source_name or "").strip().lower()
+    query = _compact_search_query(headline_or_claim)
+    if not source or not query:
+        return ""
+    encoded = quote(query)
+    if "reuters" in source:
+        return f"https://www.reuters.com/site-search/?query={encoded}"
+    if "wall street journal" in source or source == "wsj" or " wsj" in source:
+        return f"https://www.wsj.com/search?query={encoded}"
+    if "bloomberg" in source:
+        return f"https://www.bloomberg.com/search?query={encoded}"
+    if "financial times" in source or source == "ft":
+        return f"https://www.ft.com/search?q={encoded}"
+    return ""
+
+
 def _qualitative_source_url(item: dict) -> str:
     if not isinstance(item, dict):
         return ""
-    return _normalize_url_candidate(item.get("url", ""))
+    explicit = _normalize_url_candidate(item.get("url", ""))
+    if explicit:
+        return explicit
+    source_name = _clean_citation_field(item.get("source", ""))
+    headline = _clean_citation_field(item.get("headline", ""))
+    return _source_search_fallback_url(source_name, headline)
 
 
 def _source_name_from_url(url: str) -> str:
@@ -560,6 +595,8 @@ def _merge_citations_for_step6(consensus_citations: list, forecast: dict, qualit
                 )
                 if fallback_urls:
                     url = fallback_urls[0]
+            if not url:
+                url = _source_search_fallback_url(source_text, claim_text)
             claim_label = _short_claim_text(claim_text)
             source_label = source_text or (f"AI synthesis ({_source_name_from_url(url)})" if url else "AI synthesis citation")
             context_parts = []

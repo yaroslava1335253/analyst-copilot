@@ -2332,8 +2332,8 @@ def fetch_consensus_estimates(
                 {{
                     "summary": "Analysts remain constructive as AI infrastructure demand stays strong, while valuation sensitivity rises if macro demand cools.",
                     "sources": [
-                        {{"headline": "US Treasury Yield Curve Update", "source": "U.S. Treasury", "date": "Mar 2026", "url": "https://home.treasury.gov/...", "focus": "market", "note": "Rate backdrop influences discount rates and multiples"}},
-                        {{"headline": "NVIDIA Reports Data Center Momentum", "source": "NVIDIA IR", "date": "Feb 2026", "url": "https://investor.nvidia.com/...", "focus": "company", "note": "Direct signal on demand and execution"}}
+                        {{"headline": "Daily Treasury Yield Curve Rates", "source": "U.S. Treasury", "date": "Mar 2026", "url": "https://home.treasury.gov/resource-center/data-chart-center/interest-rates", "focus": "market", "note": "Rate backdrop influences discount rates and multiples"}},
+                        {{"headline": "NVIDIA Investor Relations News", "source": "NVIDIA IR", "date": "Feb 2026", "url": "https://investor.nvidia.com/news/default.aspx", "focus": "company", "note": "Direct signal on demand and execution"}}
                     ]
                 }}
 
@@ -2964,7 +2964,7 @@ def generate_independent_forecast(quarterly_analysis: dict, company_name: str = 
                         "claim": "short claim being supported",
                         "source": "publication or institution",
                         "date": "month/year or full date",
-                        "url": "https://..."
+                        "url": ""
                     }}
                 ]
             }}
