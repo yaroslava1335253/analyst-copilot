@@ -14,6 +14,7 @@ import html
 import math
 import smtplib
 import ssl
+from collections.abc import Mapping
 import streamlit as st
 import streamlit.components.v1 as components
 from pathlib import Path
@@ -102,7 +103,7 @@ def _initial_contact_email() -> str:
         if top_level:
             return top_level
         section = st.secrets.get("formsubmit", {})
-        if isinstance(section, dict):
+        if isinstance(section, Mapping):
             section_value = str(
                 section.get("to", "") or section.get("email", "") or section.get("recipient", "")
             ).strip()
@@ -850,7 +851,9 @@ def _format_numbered_citations_markdown(numbered_citations: list) -> str:
 def _secret_section(section_name: str) -> dict:
     try:
         section = st.secrets.get(section_name, {})
-        return section if isinstance(section, dict) else {}
+        if isinstance(section, Mapping):
+            return {str(k): section[k] for k in section.keys()}
+        return {}
     except Exception:
         return {}
 
