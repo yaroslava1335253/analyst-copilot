@@ -828,27 +828,67 @@ def _send_contact_email(
     sender_email: str,
     message: str,
 ) -> tuple[bool, str]:
-    def _env_or_secret(name: str, default: str = "") -> str:
-        env_value = str(os.environ.get(name, "")).strip()
-        if env_value:
-            return env_value
+    def _secret_section(section_name: str) -> dict:
         try:
-            secret_value = st.secrets.get(name, default)
+            section = st.secrets.get(section_name, {})
+            return section if isinstance(section, dict) else {}
         except Exception:
-            secret_value = default
-        return str(secret_value or "").strip()
+            return {}
 
-    smtp_host = _env_or_secret("SMTP_HOST")
-    smtp_user = _env_or_secret("SMTP_USER")
-    smtp_password = _env_or_secret("SMTP_PASSWORD")
-    smtp_from = _env_or_secret("SMTP_FROM", smtp_user) or smtp_user
-    smtp_port_raw = _env_or_secret("SMTP_PORT", "587")
-    smtp_starttls = _env_or_secret("SMTP_STARTTLS", "1").lower() in {"1", "true", "yes"}
+    def _env_or_secret(name: str, default: str = "", aliases: tuple[str, ...] = ()) -> str:
+        env_keys = (name, name.lower(), *aliases)
+        for env_key in env_keys:
+            env_value = str(os.environ.get(env_key, "")).strip()
+            if env_value:
+                return env_value
 
-    if not smtp_host or not smtp_user or not smtp_password or not smtp_from:
+        candidate_secret_keys = (
+            name,
+            name.lower(),
+            name.replace("SMTP_", "").lower(),
+            *aliases,
+        )
+        for key in candidate_secret_keys:
+            try:
+                value = st.secrets.get(key, "")
+            except Exception:
+                value = ""
+            text = str(value or "").strip()
+            if text:
+                return text
+
+        smtp_section = _secret_section("smtp")
+        for key in candidate_secret_keys:
+            value = smtp_section.get(key, "")
+            text = str(value or "").strip()
+            if text:
+                return text
+
+        return str(default or "").strip()
+
+    smtp_host = _env_or_secret("SMTP_HOST", aliases=("host",))
+    smtp_user = _env_or_secret("SMTP_USER", aliases=("user", "username"))
+    smtp_password = _env_or_secret("SMTP_PASSWORD", aliases=("password", "pass"))
+    smtp_from = _env_or_secret("SMTP_FROM", smtp_user, aliases=("from", "from_email", "sender"))
+    smtp_port_raw = _env_or_secret("SMTP_PORT", "587", aliases=("port",))
+    smtp_starttls = _env_or_secret("SMTP_STARTTLS", "1", aliases=("starttls", "tls", "use_starttls")).lower() in {"1", "true", "yes"}
+
+    missing = []
+    if not smtp_host:
+        missing.append("SMTP_HOST")
+    if not smtp_user:
+        missing.append("SMTP_USER")
+    if not smtp_password:
+        missing.append("SMTP_PASSWORD")
+    if not smtp_from:
+        missing.append("SMTP_FROM")
+
+    if missing:
         return (
             False,
-            "Email sending is not configured. Add SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, and optionally SMTP_FROM in deployment secrets or environment variables.",
+            "Email sending is not configured. Missing: "
+            + ", ".join(missing)
+            + ". Add SMTP settings in deployment secrets/env (top-level keys or [smtp] section).",
         )
 
     try:
