@@ -1633,7 +1633,7 @@ def _show_dcf_details_page():
                 return None
         return None
 
-    def _format_trace_chat_response(raw_text: str) -> str:
+    def _format_trace_chat_response(raw_text: str, ticker_symbol: str = "UNKNOWN") -> str:
         """Normalize model output into a consistent, readable structure."""
         def _normalize_credibility_score(value) -> int | None:
             if value is None or isinstance(value, bool):
@@ -1648,6 +1648,15 @@ def _show_dcf_details_page():
             if 0 <= raw_score <= 1:
                 raw_score *= 100
             return max(0, min(100, int(round(raw_score))))
+
+        def _yahoo_quote_url(section: str = "") -> str:
+            ticker_clean = _normalize_ticker(ticker_symbol) or "UNKNOWN"
+            if ticker_clean == "UNKNOWN":
+                return ""
+            base = f"https://finance.yahoo.com/quote/{quote(ticker_clean)}"
+            if section:
+                return f"{base}/{section.lstrip('/')}"
+            return base
 
         def _infer_source_name(source_name: str, source_detail: str, formula_text: str) -> str:
             combined = f"{source_name or ''} {source_detail or ''} {formula_text or ''}".lower()
@@ -1672,6 +1681,24 @@ def _show_dcf_details_page():
                 return "DCF model-derived value"
             return "Model context packet source"
 
+        def _infer_source_url(source_name: str, source_detail: str, formula_text: str) -> str:
+            combined = f"{source_name or ''} {source_detail or ''} {formula_text or ''}".lower()
+            if any(token in combined for token in ["tax provision", "pretax income", "income statement", "financials"]):
+                return _yahoo_quote_url("financials")
+            if any(token in combined for token in ["balance sheet", "total debt", "cash & equivalents", "cash and equivalents", "net debt"]):
+                return _yahoo_quote_url("balance-sheet")
+            if any(token in combined for token in ["cash flow", "operating cash flow", "capex", "free cash flow"]):
+                return _yahoo_quote_url("cash-flow")
+            if any(token in combined for token in ["analyst", "consensus", "estimate"]):
+                return _yahoo_quote_url("analysis")
+            if any(token in combined for token in ["price", "market cap", "shares", "beta", "quote"]):
+                return _yahoo_quote_url("")
+            if any(token in combined for token in ["^tnx", "risk-free", "treasury", "dgs10"]):
+                return "https://finance.yahoo.com/quote/%5ETNX"
+            if any(token in combined for token in ["damodaran", "equity risk premium", "erp"]):
+                return "https://pages.stern.nyu.edu/~adamodar/New_Home_Page/datafile/histimpl.html"
+            return ""
+
         def _infer_credibility(source_name: str, source_detail: str, formula_text: str) -> tuple[int, str]:
             combined = f"{source_name or ''} {source_detail or ''} {formula_text or ''}".lower()
             if any(token in combined for token in ["sec", "10-k", "10-q", "filing"]):
@@ -1694,6 +1721,7 @@ def _show_dcf_details_page():
                 "**Value:** N/A\n\n"
                 "**Formula Path:** N/A\n\n"
                 "**Source Name:** Not explicitly provided\n\n"
+                "**Verification Link:** N/A (no external source link available)\n\n"
                 "**Source Detail:** Not explicitly provided\n\n"
                 "**Credibility:** 65/100 - Moderate confidence because exact upstream field-level provenance was not explicit."
             )
@@ -1727,6 +1755,12 @@ def _show_dcf_details_page():
                 or parsed.get("source_origin")
                 or ""
             ).strip()
+            source_url = str(
+                parsed.get("source_url")
+                or parsed.get("verification_url")
+                or parsed.get("url")
+                or ""
+            ).strip()
             credibility_score = _normalize_credibility_score(
                 parsed.get("credibility_score", parsed.get("reliability_score"))
             )
@@ -1746,6 +1780,7 @@ def _show_dcf_details_page():
             if not source_name_match:
                 source_name_match = re.search(r"(?i)\bSource:\s*(.+)", cleaned)
             source_detail_match = re.search(r"(?i)\bSource\s*(?:detail|explanation|origin|notes?):\s*(.+)", cleaned)
+            source_url_match = re.search(r"(?i)\b(?:Source\s*url|Verification\s*link|URL):\s*(.+)", cleaned)
             credibility_score_match = re.search(r"(?i)\b(?:Credibility|Reliability)(?:\s*score)?:\s*(.+)", cleaned)
             credibility_explanation_match = re.search(
                 r"(?i)\b(?:Credibility|Reliability)\s*(?:explanation|reason|notes?):\s*(.+)",
@@ -1756,6 +1791,7 @@ def _show_dcf_details_page():
             formula_text = formula_match.group(1).strip() if formula_match else ""
             source_name = source_name_match.group(1).strip() if source_name_match else ""
             source_detail = source_detail_match.group(1).strip() if source_detail_match else ""
+            source_url = source_url_match.group(1).strip() if source_url_match else ""
             credibility_score = _normalize_credibility_score(
                 credibility_score_match.group(1).strip() if credibility_score_match else None
             )
@@ -1771,6 +1807,9 @@ def _show_dcf_details_page():
             formula_text = "Not explicitly provided."
         if not source_name:
             source_name = _infer_source_name(source_name, source_detail, formula_text)
+        source_url = _normalize_url_candidate(source_url)
+        if not source_url:
+            source_url = _infer_source_url(source_name, source_detail, formula_text)
         if not source_detail:
             source_detail = "Exact metric field/period was not explicitly provided."
 
@@ -1780,11 +1819,14 @@ def _show_dcf_details_page():
         if not credibility_explanation:
             credibility_explanation = inferred_expl
 
+        source_link_md = "[Open original source]({})".format(source_url) if source_url else "N/A (model-derived or no external publisher link)"
+
         return (
             f"**Answer:** {direct_answer}\n\n"
             f"**Value:** {value_text}\n\n"
             f"**Formula Path:** {formula_text}\n\n"
             f"**Source Name:** {source_name}\n\n"
+            f"**Verification Link:** {source_link_md}\n\n"
             f"**Source Detail:** {source_detail}\n\n"
             f"**Credibility:** {credibility_score}/100 - {credibility_explanation}"
         )
@@ -2616,12 +2658,201 @@ def _show_dcf_details_page():
         )
         submitted = st.form_submit_button("Ask")
 
+    def _build_trace_verifiable_sources(ticker_symbol: str) -> list[dict]:
+        ticker_clean = _normalize_ticker(ticker_symbol) or "UNKNOWN"
+        if ticker_clean == "UNKNOWN":
+            yahoo_quote = ""
+        else:
+            yahoo_quote = f"https://finance.yahoo.com/quote/{quote(ticker_clean)}"
+
+        urls = {
+            "quote": yahoo_quote,
+            "analysis": f"{yahoo_quote}/analysis" if yahoo_quote else "",
+            "financials": f"{yahoo_quote}/financials" if yahoo_quote else "",
+            "balance_sheet": f"{yahoo_quote}/balance-sheet" if yahoo_quote else "",
+            "cash_flow": f"{yahoo_quote}/cash-flow" if yahoo_quote else "",
+            "key_statistics": f"{yahoo_quote}/key-statistics" if yahoo_quote else "",
+            "tnx": "https://finance.yahoo.com/quote/%5ETNX",
+            "treasury": "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/textview?type=daily_treasury_yield_curve",
+            "damodaran_erp": "https://pages.stern.nyu.edu/~adamodar/New_Home_Page/datafile/histimpl.html",
+        }
+
+        input_source_map = {
+            "Current Price": ("Yahoo Finance Quote", urls["quote"]),
+            "Market Cap": ("Yahoo Finance Quote", urls["quote"]),
+            "Shares Outstanding": ("Yahoo Finance Key Statistics", urls["key_statistics"]),
+            "TTM Revenue": ("Yahoo Finance Financials", urls["financials"]),
+            "TTM Operating Income": ("Yahoo Finance Financials", urls["financials"]),
+            "TTM EBITDA": ("Yahoo Finance Financials", urls["financials"]),
+            "TTM Operating Cash Flow": ("Yahoo Finance Cash Flow", urls["cash_flow"]),
+            "TTM CapEx": ("Yahoo Finance Cash Flow", urls["cash_flow"]),
+            "TTM Free Cash Flow": ("Yahoo Finance Cash Flow", urls["cash_flow"]),
+            "Total Debt": ("Yahoo Finance Balance Sheet", urls["balance_sheet"]),
+            "Cash & Equivalents": ("Yahoo Finance Balance Sheet", urls["balance_sheet"]),
+        }
+
+        registry = []
+        seen = set()
+
+        def _register(
+            *,
+            metric: str,
+            value_text: str,
+            source_name: str,
+            source_url: str,
+            source_detail: str,
+            reliability_score=None,
+            model_field: str = "",
+        ) -> None:
+            metric_clean = str(metric or "").strip()
+            source_name_clean = str(source_name or "").strip() or "Not explicitly provided"
+            source_url_clean = _normalize_url_candidate(source_url)
+            source_detail_clean = str(source_detail or "").strip() or "Not explicitly provided."
+            value_clean = str(value_text or "N/A").strip() or "N/A"
+            key = (
+                metric_clean.lower(),
+                source_name_clean.lower(),
+                source_url_clean or "",
+                source_detail_clean.lower(),
+            )
+            if key in seen:
+                return
+            seen.add(key)
+
+            entry = {
+                "metric": metric_clean,
+                "value": value_clean,
+                "source_name": source_name_clean,
+                "source_url": source_url_clean or "",
+                "source_detail": source_detail_clean,
+            }
+            if model_field:
+                entry["model_field"] = model_field
+            score = _to_float(reliability_score)
+            if score is not None:
+                entry["reliability_score"] = max(0, min(100, int(round(score))))
+            registry.append(entry)
+
+        for row in input_table:
+            item = str(row.get("Item", "")).strip()
+            if not item:
+                continue
+            source_raw = str(row.get("Source", "")).strip()
+            period_raw = str(row.get("Period", "")).strip()
+            notes_raw = str(row.get("Notes", "")).strip()
+            reliability = _parse_reliability(row.get("Reliability"))
+            source_name, source_url = input_source_map.get(item, ("Yahoo Finance", urls["quote"]))
+            combined = f"{source_raw} {notes_raw}".lower()
+            if any(token in combined for token in ["default", "fallback", "unavailable", "proxy"]):
+                source_name = "Model fallback / derived estimate"
+                source_url = ""
+
+            detail_parts = []
+            if source_raw and source_raw not in {"N/A", "—"}:
+                detail_parts.append(f"Loaded from {source_raw}")
+            if period_raw and period_raw not in {"N/A", "—"}:
+                detail_parts.append(f"Period: {period_raw}")
+            if notes_raw and notes_raw not in {"N/A", "—"}:
+                detail_parts.append(notes_raw)
+            detail_text = " | ".join(detail_parts) if detail_parts else "Input used in this DCF run."
+
+            _register(
+                metric=f"Input: {item}",
+                value_text=str(row.get("Value", "N/A")),
+                source_name=source_name,
+                source_url=source_url,
+                source_detail=detail_text,
+                reliability_score=reliability,
+                model_field=f"inputs_table[{item}]",
+            )
+
+        effective_tax_meta = getattr(snapshot, "effective_tax_rate", None) if snapshot else None
+        effective_tax_source = str(getattr(effective_tax_meta, "source_path", "") or "").strip()
+        effective_tax_notes = str(getattr(effective_tax_meta, "notes", "") or "").strip()
+        effective_tax_period = str(getattr(effective_tax_meta, "period_end", "") or "").strip()
+        effective_tax_score = getattr(effective_tax_meta, "reliability_score", None) if effective_tax_meta else None
+        effective_tax_value = _to_float(getattr(effective_tax_meta, "value", None)) if effective_tax_meta else None
+        assumed_tax_value = _to_float(assumptions.get("tax_rate"))
+
+        if assumed_tax_value is not None:
+            tax_name = "Yahoo Finance Income Statement (Tax Provision / Pretax Income)"
+            tax_url = urls["financials"]
+            if "net income" in effective_tax_source.lower() and "operating income" in effective_tax_source.lower():
+                tax_name = "Yahoo Finance Income Statement (derived NI/OI tax proxy)"
+            if not effective_tax_source:
+                tax_name = "DCF model assumption (source not captured)"
+                tax_url = ""
+            if effective_tax_value is not None and abs(assumed_tax_value - effective_tax_value) > 1e-6:
+                tax_name = "User-adjusted DCF assumption (Tax Rate)"
+                tax_url = ""
+
+            tax_detail_parts = []
+            if effective_tax_source:
+                tax_detail_parts.append(f"Upstream calculation: {effective_tax_source}")
+            if effective_tax_period:
+                tax_detail_parts.append(f"Period: {effective_tax_period}")
+            if effective_tax_notes:
+                tax_detail_parts.append(effective_tax_notes)
+            if effective_tax_value is not None and abs(assumed_tax_value - effective_tax_value) > 1e-6:
+                tax_detail_parts.append(
+                    f"DCF run uses user-set {assumed_tax_value*100:.2f}% vs snapshot {effective_tax_value*100:.2f}%."
+                )
+            tax_detail = " | ".join(tax_detail_parts) if tax_detail_parts else "Tax assumption used directly in NOPAT/FCFF."
+
+            _register(
+                metric="Assumption: Tax Rate",
+                value_text=_fmt_rate(assumed_tax_value),
+                source_name=tax_name,
+                source_url=tax_url,
+                source_detail=tax_detail,
+                reliability_score=effective_tax_score,
+                model_field="assumptions.tax_rate",
+            )
+
+        wacc_components_local = getattr(snapshot, "wacc_components", {}) if snapshot else {}
+        if isinstance(wacc_components_local, dict) and wacc_components_local:
+            rf_source = str(wacc_components_local.get("rf_source", "") or "").strip()
+            rf_name = "Yahoo Finance ^TNX (10Y Treasury)"
+            rf_url = urls["tnx"]
+            if rf_source and "^tnx" not in rf_source.lower():
+                rf_name = "U.S. Treasury 10Y Yield"
+                rf_url = urls["treasury"]
+
+            _register(
+                metric="WACC Component: Risk-Free Rate",
+                value_text=_fmt_rate(wacc_components_local.get("risk_free_rate")),
+                source_name=rf_name,
+                source_url=rf_url,
+                source_detail=rf_source or "Risk-free input used in CAPM.",
+                model_field="wacc_components.risk_free_rate",
+            )
+            _register(
+                metric="WACC Component: Equity Risk Premium",
+                value_text=_fmt_rate(wacc_components_local.get("market_risk_premium")),
+                source_name="Damodaran Implied ERP Dataset",
+                source_url=urls["damodaran_erp"],
+                source_detail=f"Damodaran date: {wacc_components_local.get('damodaran_date') or 'n/a'}",
+                model_field="wacc_components.market_risk_premium",
+            )
+            _register(
+                metric="WACC Component: Beta",
+                value_text=_fmt_number(wacc_components_local.get("beta"), 2),
+                source_name="Yahoo Finance Beta",
+                source_url=urls["quote"],
+                source_detail=str(wacc_components_local.get("cost_of_equity_source") or "CAPM beta input."),
+                model_field="wacc_components.beta",
+            )
+
+        return registry
+
     if submitted and user_question:
+        verifiable_sources = _build_trace_verifiable_sources(details_ticker)
         context_packet = {
             "ticker": details_ticker,
             "company_name": getattr(snapshot, "company_name", None) if snapshot else None,
             "inputs_table": input_table,
             "assumptions_table": assumption_rows,
+            "verifiable_sources": verifiable_sources,
             "growth_summary": growth_summary_rows,
             "results": {
                 "enterprise_value": ev,
@@ -2657,15 +2888,18 @@ def _show_dcf_details_page():
             "  \"value\": \"specific numeric value(s) used\",\n"
             "  \"formula_path\": \"equation or calculation chain\",\n"
             "  \"source_name\": \"human-readable primary source name (e.g., Yahoo Finance, SEC 10-Q, Reuters, DCF model trace)\",\n"
+            "  \"source_url\": \"direct https URL to original source (or empty string if none)\",\n"
             "  \"source_detail\": \"exact metric origin with period and trace step; no internal path keys\",\n"
             "  \"credibility_score\": 0,\n"
             "  \"credibility_explanation\": \"one short sentence explaining why this score applies\"\n"
             "}\n"
-            "3) source_name must be specific and user-friendly.\n"
-            "4) source_detail must name the metric, period, and trace step used.\n"
-            "5) credibility_score must be an integer between 0 and 100.\n"
-            "6) If data is missing, say so explicitly in source_detail.\n"
-            "7) Do not provide investment advice.\n"
+            "3) Prefer source_name/source_url from `verifiable_sources` when available.\n"
+            "4) source_detail must name the metric and period used.\n"
+            "5) Do NOT use internal container names (assumptions_table, trace_steps, context packet) as source_name.\n"
+            "6) If value is model-derived, still cite the closest upstream external source_url; if truly none, set source_url to empty string and say why.\n"
+            "7) credibility_score must be an integer between 0 and 100.\n"
+            "8) If data is missing, say so explicitly in source_detail.\n"
+            "9) Do not provide investment advice.\n"
         )
 
         prior_history = [m for m in chat_history if isinstance(m, dict) and m.get("role") in {"user", "assistant"}]
@@ -2680,7 +2914,7 @@ def _show_dcf_details_page():
                 if raw_lower.startswith("chat error:") or raw_lower.startswith("error:"):
                     assistant_reply = _format_chat_runtime_message(assistant_raw)
                 else:
-                    assistant_reply = _format_trace_chat_response(assistant_raw)
+                    assistant_reply = _format_trace_chat_response(assistant_raw, details_ticker)
             st.markdown(assistant_reply)
 
         st.session_state[details_chat_key].append({"role": "user", "content": user_question})
