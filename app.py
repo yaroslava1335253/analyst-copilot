@@ -464,6 +464,47 @@ def _clear_view_query_param() -> None:
         pass
 
 
+def _queue_scroll_to_section(section_id: str) -> None:
+    target = str(section_id or "").strip()
+    st.session_state.pending_scroll_section = target
+
+
+def _render_pending_scroll_to_section(section_id: str) -> None:
+    pending = str(st.session_state.get("pending_scroll_section") or "").strip()
+    if pending != section_id:
+        return
+
+    safe_target = re.sub(r"[^A-Za-z0-9_-]", "", section_id)
+    if not safe_target:
+        st.session_state.pending_scroll_section = None
+        return
+
+    components.html(
+        f"""
+<script>
+(function() {{
+  const p = window.parent;
+  const targetId = "{safe_target}";
+  let attempts = 0;
+  const jump = () => {{
+    const el = p.document.getElementById(targetId);
+    if (el) {{
+      el.scrollIntoView({{ behavior: "auto", block: "start" }});
+      return;
+    }}
+    attempts += 1;
+    if (attempts < 40) p.setTimeout(jump, 50);
+  }};
+  p.requestAnimationFrame(() => p.setTimeout(jump, 0));
+}})();
+</script>
+        """,
+        height=0,
+        scrolling=False,
+    )
+    st.session_state.pending_scroll_section = None
+
+
 def _extract_urls_from_text(text: str) -> list[str]:
     if not isinstance(text, str) or not text.strip():
         return []
@@ -1517,6 +1558,7 @@ def _show_dcf_details_page():
     st.subheader("DCF Calculation Details")
 
     if st.button("<- Back to Summary", key="back_from_details_top"):
+        _queue_scroll_to_section("valuation")
         st.session_state.show_dcf_details = False
         st.rerun()
 
@@ -2575,6 +2617,7 @@ def _show_dcf_details_page():
 
     st.divider()
     if st.button("<- Back to Summary", key="back_from_details_bottom"):
+        _queue_scroll_to_section("valuation")
         st.session_state.show_dcf_details = False
         st.rerun()
 
@@ -3861,6 +3904,8 @@ if 'momentum_display_quarters' not in st.session_state:
     st.session_state.momentum_display_quarters = DEFAULT_INITIAL_QUARTERS
 if 'pending_momentum_display_quarters' not in st.session_state:
     st.session_state.pending_momentum_display_quarters = None
+if 'pending_scroll_section' not in st.session_state:
+    st.session_state.pending_scroll_section = None
 
 # --- Helper Functions ---
 def reset_analysis():
@@ -4781,6 +4826,7 @@ if st.session_state.quarterly_analysis:
 
     # SECTION B: Valuation Drivers
     st.markdown('<div id="valuation"></div>', unsafe_allow_html=True)
+    _render_pending_scroll_to_section("valuation")
     st.markdown("---")
     st.markdown('<div class="section-header"><span class="step-badge">Step 02</span><span class="section-title">Valuation Drivers</span></div>', unsafe_allow_html=True)
     st.caption("Tune assumptions, rerun the model, and review core valuation outputs.")
