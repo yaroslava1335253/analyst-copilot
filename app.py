@@ -1593,12 +1593,34 @@ def _show_dcf_details_page():
 
     def _format_trace_chat_response(raw_text: str) -> str:
         """Normalize model output into a consistent, readable structure."""
+        def _infer_source_origin(source_text: str, formula_text: str) -> str:
+            combined = f"{source_text or ''} {formula_text or ''}".lower()
+            if not combined.strip():
+                return "Not explicitly provided"
+
+            if any(token in combined for token in ["yahoo", "yfinance", "yahooquery", "yf.ticker", "fast_info", "info["]):
+                if any(token in combined for token in ["income_statement", "balance_sheet", "cash_flow", "quarterly", "ttm"]):
+                    return "Yahoo Finance statement data (company-reported financials)"
+                return "Yahoo Finance market/consensus data"
+
+            if any(token in combined for token in ["damodaran", "erp", "equity risk premium"]):
+                return "Damodaran reference dataset"
+            if any(token in combined for token in ["fred", "dgs10", "^tnx", "treasury", "risk-free"]):
+                return "Macro/rates reference (Treasury/FRED/Yahoo rates feed)"
+            if any(token in combined for token in ["sec", "10-k", "10-q", "filing", "report"]):
+                return "Company filing/report source"
+            if any(token in combined for token in ["calculated", "derived", "formula", "pv(", "discount", "wacc", "enterprise value", "equity value"]):
+                return "DCF model-derived calculation (built from loaded inputs)"
+
+            return "Model context packet source"
+
         if not isinstance(raw_text, str) or not raw_text.strip():
             return (
                 "**Answer:** Unable to generate a structured response.\n\n"
                 "**Value:** N/A\n\n"
                 "**Formula Path:** N/A\n\n"
-                "**Source Path:** N/A"
+                "**Source Path:** N/A\n\n"
+                "**Source Origin:** Not explicitly provided"
             )
 
         cleaned = raw_text.strip()
@@ -1624,6 +1646,7 @@ def _show_dcf_details_page():
             value_text = str(parsed.get("value") or "").strip()
             formula_text = str(parsed.get("formula_path") or parsed.get("formula") or "").strip()
             source_text = str(parsed.get("source_path") or parsed.get("source") or "").strip()
+            source_origin = str(parsed.get("source_origin") or "").strip()
         else:
             lines = [ln.strip() for ln in cleaned.splitlines() if ln.strip()]
             direct_answer = lines[0] if lines else cleaned
@@ -1631,10 +1654,12 @@ def _show_dcf_details_page():
             value_match = re.search(r"(?i)\bValue:\s*(.+)", cleaned)
             formula_match = re.search(r"(?i)\bFormula(?:\s*path)?:\s*(.+)", cleaned)
             source_match = re.search(r"(?i)\bSource(?:\s*path)?:\s*(.+)", cleaned)
+            source_origin_match = re.search(r"(?i)\bSource(?:\s*origin)?:\s*(.+)", cleaned)
 
             value_text = value_match.group(1).strip() if value_match else ""
             formula_text = formula_match.group(1).strip() if formula_match else ""
             source_text = source_match.group(1).strip() if source_match else ""
+            source_origin = source_origin_match.group(1).strip() if source_origin_match else ""
 
         if not direct_answer:
             direct_answer = "Direct answer not provided."
@@ -1644,12 +1669,15 @@ def _show_dcf_details_page():
             formula_text = "Not explicitly provided."
         if not source_text:
             source_text = "Not explicitly provided."
+        if not source_origin:
+            source_origin = _infer_source_origin(source_text, formula_text)
 
         return (
             f"**Answer:** {direct_answer}\n\n"
             f"**Value:** {value_text}\n\n"
             f"**Formula Path:** {formula_text}\n\n"
-            f"**Source Path:** {source_text}"
+            f"**Source Path:** {source_text}\n\n"
+            f"**Source Origin:** {source_origin}"
         )
 
     def _sanitize_notice_text(text: str) -> str:
@@ -2519,10 +2547,12 @@ def _show_dcf_details_page():
             "  \"direct_answer\": \"one-sentence direct answer\",\n"
             "  \"value\": \"specific numeric value(s) used\",\n"
             "  \"formula_path\": \"equation or calculation chain\",\n"
-            "  \"source_path\": \"table/field/trace step names and source labels\"\n"
+            "  \"source_path\": \"table/field/trace step names and source labels\",\n"
+            "  \"source_origin\": \"plain-language origin type, e.g. Yahoo Finance market data / company financial reports / DCF model-derived\"\n"
             "}\n"
             "3) If missing, be explicit and provide nearest available fields in source_path.\n"
-            "4) Do not provide investment advice.\n"
+            "4) source_origin must be concise and user-friendly.\n"
+            "5) Do not provide investment advice.\n"
         )
 
         prior_history = [m for m in chat_history if isinstance(m, dict) and m.get("role") in {"user", "assistant"}]
