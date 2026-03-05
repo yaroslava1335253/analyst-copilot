@@ -1635,34 +1635,67 @@ def _show_dcf_details_page():
 
     def _format_trace_chat_response(raw_text: str) -> str:
         """Normalize model output into a consistent, readable structure."""
-        def _infer_source_origin(source_text: str, formula_text: str) -> str:
-            combined = f"{source_text or ''} {formula_text or ''}".lower()
+        def _normalize_credibility_score(value) -> int | None:
+            if value is None or isinstance(value, bool):
+                return None
+            if isinstance(value, (int, float)):
+                raw_score = float(value)
+            else:
+                match = re.search(r"-?\d+(?:\.\d+)?", str(value))
+                if not match:
+                    return None
+                raw_score = float(match.group(0))
+            if 0 <= raw_score <= 1:
+                raw_score *= 100
+            return max(0, min(100, int(round(raw_score))))
+
+        def _infer_source_name(source_name: str, source_detail: str, formula_text: str) -> str:
+            combined = f"{source_name or ''} {source_detail or ''} {formula_text or ''}".lower()
             if not combined.strip():
                 return "Not explicitly provided"
 
-            if any(token in combined for token in ["yahoo", "yfinance", "yahooquery", "yf.ticker", "fast_info", "info["]):
-                if any(token in combined for token in ["income_statement", "balance_sheet", "cash_flow", "quarterly", "ttm"]):
-                    return "Yahoo Finance statement data (company-reported financials)"
-                return "Yahoo Finance market/consensus data"
-
-            if any(token in combined for token in ["damodaran", "erp", "equity risk premium"]):
-                return "Damodaran reference dataset"
+            if any(token in combined for token in ["yahoo", "yfinance", "yahooquery", "yf.ticker"]):
+                if any(token in combined for token in ["income statement", "balance sheet", "cash flow", "quarterly", "ttm"]):
+                    return "Yahoo Finance (company financial statements)"
+                if any(token in combined for token in ["analyst", "consensus", "estimate"]):
+                    return "Yahoo Finance (analyst consensus)"
+                return "Yahoo Finance"
+            if any(token in combined for token in ["sec", "10-k", "10-q", "filing"]):
+                return "SEC company filing"
+            if any(token in combined for token in ["reuters", "bloomberg", "wall street journal", "wsj"]):
+                return "External publication source"
             if any(token in combined for token in ["fred", "dgs10", "^tnx", "treasury", "risk-free"]):
-                return "Macro/rates reference (Treasury/FRED/Yahoo rates feed)"
-            if any(token in combined for token in ["sec", "10-k", "10-q", "filing", "report"]):
-                return "Company filing/report source"
-            if any(token in combined for token in ["calculated", "derived", "formula", "pv(", "discount", "wacc", "enterprise value", "equity value"]):
-                return "DCF model-derived calculation (built from loaded inputs)"
-
+                return "Treasury/rates market feed"
+            if any(token in combined for token in ["damodaran", "equity risk premium", "erp"]):
+                return "Damodaran dataset"
+            if any(token in combined for token in ["derived", "calculated", "formula", "pv(", "discount", "wacc"]):
+                return "DCF model-derived value"
             return "Model context packet source"
+
+        def _infer_credibility(source_name: str, source_detail: str, formula_text: str) -> tuple[int, str]:
+            combined = f"{source_name or ''} {source_detail or ''} {formula_text or ''}".lower()
+            if any(token in combined for token in ["sec", "10-k", "10-q", "filing"]):
+                return 95, "Company filing data is primary-source and highly reliable."
+            if any(token in combined for token in ["income statement", "balance sheet", "cash flow", "ttm", "quarterly"]):
+                return 90, "Company-reported statement data is high reliability; minor transformation risk remains."
+            if any(token in combined for token in ["yahoo", "consensus", "analyst", "estimate"]):
+                return 80, "Consensus/aggregator data is reliable but can drift with provider updates."
+            if any(token in combined for token in ["reuters", "bloomberg", "wall street journal", "wsj"]):
+                return 78, "Reputable publication data is generally reliable but can include interpretation."
+            if any(token in combined for token in ["derived", "calculated", "formula", "wacc", "pv(", "enterprise value"]):
+                return 72, "Model-derived value depends on assumptions and input quality."
+            if any(token in combined for token in ["fallback", "default", "missing"]):
+                return 55, "Fallback/default inputs reduce confidence versus directly observed data."
+            return 65, "Moderate confidence because exact upstream field-level provenance was not explicit."
 
         if not isinstance(raw_text, str) or not raw_text.strip():
             return (
                 "**Answer:** Unable to generate a structured response.\n\n"
                 "**Value:** N/A\n\n"
                 "**Formula Path:** N/A\n\n"
-                "**Source Path:** N/A\n\n"
-                "**Source Origin:** Not explicitly provided"
+                "**Source Name:** Not explicitly provided\n\n"
+                "**Source Detail:** Not explicitly provided\n\n"
+                "**Credibility:** 65/100 - Moderate confidence because exact upstream field-level provenance was not explicit."
             )
 
         cleaned = raw_text.strip()
@@ -1687,21 +1720,48 @@ def _show_dcf_details_page():
             direct_answer = str(parsed.get("direct_answer") or parsed.get("answer") or "").strip()
             value_text = str(parsed.get("value") or "").strip()
             formula_text = str(parsed.get("formula_path") or parsed.get("formula") or "").strip()
-            source_text = str(parsed.get("source_path") or parsed.get("source") or "").strip()
-            source_origin = str(parsed.get("source_origin") or "").strip()
+            source_name = str(parsed.get("source_name") or parsed.get("source") or "").strip()
+            source_detail = str(
+                parsed.get("source_detail")
+                or parsed.get("source_explanation")
+                or parsed.get("source_origin")
+                or ""
+            ).strip()
+            credibility_score = _normalize_credibility_score(
+                parsed.get("credibility_score", parsed.get("reliability_score"))
+            )
+            credibility_explanation = str(
+                parsed.get("credibility_explanation")
+                or parsed.get("reliability_explanation")
+                or parsed.get("credibility_reason")
+                or ""
+            ).strip()
         else:
             lines = [ln.strip() for ln in cleaned.splitlines() if ln.strip()]
             direct_answer = lines[0] if lines else cleaned
 
             value_match = re.search(r"(?i)\bValue:\s*(.+)", cleaned)
             formula_match = re.search(r"(?i)\bFormula(?:\s*path)?:\s*(.+)", cleaned)
-            source_match = re.search(r"(?i)\bSource(?:\s*path)?:\s*(.+)", cleaned)
-            source_origin_match = re.search(r"(?i)\bSource(?:\s*origin)?:\s*(.+)", cleaned)
+            source_name_match = re.search(r"(?i)\bSource\s*name:\s*(.+)", cleaned)
+            if not source_name_match:
+                source_name_match = re.search(r"(?i)\bSource:\s*(.+)", cleaned)
+            source_detail_match = re.search(r"(?i)\bSource\s*(?:detail|explanation|origin|notes?):\s*(.+)", cleaned)
+            credibility_score_match = re.search(r"(?i)\b(?:Credibility|Reliability)(?:\s*score)?:\s*(.+)", cleaned)
+            credibility_explanation_match = re.search(
+                r"(?i)\b(?:Credibility|Reliability)\s*(?:explanation|reason|notes?):\s*(.+)",
+                cleaned,
+            )
 
             value_text = value_match.group(1).strip() if value_match else ""
             formula_text = formula_match.group(1).strip() if formula_match else ""
-            source_text = source_match.group(1).strip() if source_match else ""
-            source_origin = source_origin_match.group(1).strip() if source_origin_match else ""
+            source_name = source_name_match.group(1).strip() if source_name_match else ""
+            source_detail = source_detail_match.group(1).strip() if source_detail_match else ""
+            credibility_score = _normalize_credibility_score(
+                credibility_score_match.group(1).strip() if credibility_score_match else None
+            )
+            credibility_explanation = (
+                credibility_explanation_match.group(1).strip() if credibility_explanation_match else ""
+            )
 
         if not direct_answer:
             direct_answer = "Direct answer not provided."
@@ -1709,17 +1769,24 @@ def _show_dcf_details_page():
             value_text = "Not explicitly provided."
         if not formula_text:
             formula_text = "Not explicitly provided."
-        if not source_text:
-            source_text = "Not explicitly provided."
-        if not source_origin:
-            source_origin = _infer_source_origin(source_text, formula_text)
+        if not source_name:
+            source_name = _infer_source_name(source_name, source_detail, formula_text)
+        if not source_detail:
+            source_detail = "Exact metric field/period was not explicitly provided."
+
+        inferred_score, inferred_expl = _infer_credibility(source_name, source_detail, formula_text)
+        if credibility_score is None:
+            credibility_score = inferred_score
+        if not credibility_explanation:
+            credibility_explanation = inferred_expl
 
         return (
             f"**Answer:** {direct_answer}\n\n"
             f"**Value:** {value_text}\n\n"
             f"**Formula Path:** {formula_text}\n\n"
-            f"**Source Path:** {source_text}\n\n"
-            f"**Source Origin:** {source_origin}"
+            f"**Source Name:** {source_name}\n\n"
+            f"**Source Detail:** {source_detail}\n\n"
+            f"**Credibility:** {credibility_score}/100 - {credibility_explanation}"
         )
 
     def _sanitize_notice_text(text: str) -> str:
@@ -2589,12 +2656,16 @@ def _show_dcf_details_page():
             "  \"direct_answer\": \"one-sentence direct answer\",\n"
             "  \"value\": \"specific numeric value(s) used\",\n"
             "  \"formula_path\": \"equation or calculation chain\",\n"
-            "  \"source_path\": \"table/field/trace step names and source labels\",\n"
-            "  \"source_origin\": \"plain-language origin type, e.g. Yahoo Finance market data / company financial reports / DCF model-derived\"\n"
+            "  \"source_name\": \"human-readable primary source name (e.g., Yahoo Finance, SEC 10-Q, Reuters, DCF model trace)\",\n"
+            "  \"source_detail\": \"exact metric origin with period and trace step; no internal path keys\",\n"
+            "  \"credibility_score\": 0,\n"
+            "  \"credibility_explanation\": \"one short sentence explaining why this score applies\"\n"
             "}\n"
-            "3) If missing, be explicit and provide nearest available fields in source_path.\n"
-            "4) source_origin must be concise and user-friendly.\n"
-            "5) Do not provide investment advice.\n"
+            "3) source_name must be specific and user-friendly.\n"
+            "4) source_detail must name the metric, period, and trace step used.\n"
+            "5) credibility_score must be an integer between 0 and 100.\n"
+            "6) If data is missing, say so explicitly in source_detail.\n"
+            "7) Do not provide investment advice.\n"
         )
 
         prior_history = [m for m in chat_history if isinstance(m, dict) and m.get("role") in {"user", "assistant"}]
