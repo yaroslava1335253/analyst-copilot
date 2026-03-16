@@ -37,6 +37,59 @@ class ExplodingInfoTicker:
     recommendations_summary = None
 
 
+class YahooQueryFallbackTicker:
+    def __init__(self, symbol: str):
+        self.symbol = symbol
+
+    @property
+    def financial_data(self):
+        return {
+            self.symbol: {
+                "targetMeanPrice": 594.62,
+                "targetHighPrice": 650.0,
+                "targetLowPrice": 500.0,
+                "numberOfAnalystOpinions": 57,
+            }
+        }
+
+    @property
+    def earnings_trend(self):
+        return {
+            self.symbol: {
+                "trend": [
+                    {
+                        "period": "0q",
+                        "revenueEstimate": {"avg": 81_360_000_000},
+                        "earningsEstimate": {"avg": 4.09},
+                    },
+                    {
+                        "period": "0y",
+                        "revenueEstimate": {"avg": 318_000_000_000},
+                        "earningsEstimate": {"avg": 15.30},
+                    },
+                ]
+            }
+        }
+
+    @property
+    def calendar_events(self):
+        return {self.symbol: {"earnings": {}}}
+
+    @property
+    def recommendation_trend(self):
+        return pd.DataFrame(
+            {
+                "period": ["0m"],
+                "strongBuy": [18],
+                "buy": [21],
+                "hold": [15],
+                "sell": [3],
+                "strongSell": [0],
+            },
+            index=pd.MultiIndex.from_tuples([(self.symbol, 0)], names=["symbol", "row"]),
+        )
+
+
 def test_fetch_consensus_estimates_handles_none_info(monkeypatch):
     monkeypatch.setattr("engine.get_yf_ticker", lambda ticker, use_cache=False: EmptyConsensusTicker())
 
@@ -69,3 +122,19 @@ def test_fetch_consensus_estimates_handles_info_property_error(monkeypatch):
     assert "error" not in result
     assert result["next_quarter"]["revenue_estimate"] == "N/A"
     assert result["warning"] == "Yahoo Finance did not return analyst consensus data for this run."
+
+
+def test_fetch_consensus_estimates_falls_back_to_yahooquery(monkeypatch):
+    monkeypatch.setattr("engine.get_yf_ticker", lambda ticker, use_cache=False: EmptyConsensusTicker())
+    monkeypatch.setattr("engine.YQTicker", YahooQueryFallbackTicker)
+
+    result = fetch_consensus_estimates("MSFT", "FY2026 Q1")
+
+    assert "error" not in result
+    assert result["next_quarter"]["revenue_estimate"] == "$81.36B"
+    assert result["next_quarter"]["eps_estimate"] == "$4.09"
+    assert result["full_year"]["revenue_estimate"] == "$318.00B"
+    assert result["price_targets"]["average"] == "$594.62"
+    assert result["analyst_coverage"]["num_analysts"] == 57
+    assert result["source"] == "Yahoo Finance (yfinance + yahooquery fallback)"
+    assert "warning" not in result

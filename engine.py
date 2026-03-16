@@ -19,6 +19,11 @@ from google.genai import types
 from industry_multiples import get_industry_multiple, DAMODARAN_SOURCE_URL, DAMODARAN_DATA_DATE
 from yf_cache import get_yf_fast_info, get_yf_frame, get_yf_info, get_yf_ticker
 
+try:
+    from yahooquery import Ticker as YQTicker
+except ImportError:
+    YQTicker = None
+
 _genai_client: "genai.Client | None" = None
 _sec_ticker_cik_map_cache = None
 SEC_CIK_FALLBACK_MAP = {
@@ -2137,20 +2142,251 @@ def fetch_consensus_estimates(
         ticker_symbol: Stock ticker
         next_quarter_label: Label for the upcoming quarter (e.g., "FY2026 Q3")
     """
+    def _has_value(value) -> bool:
+        return value is not None and pd.notna(value)
+
+    def _safe_int(value):
+        try:
+            if value is None or pd.isna(value):
+                return None
+            return int(value)
+        except Exception:
+            return None
+
+    def format_currency(val, is_billions=True):
+        if not _has_value(val):
+            return None
+        if is_billions:
+            return f"${val/1e9:.2f}B"
+        return f"${val:.2f}"
+
+    def format_price(val):
+        if not _has_value(val):
+            return None
+        return f"${val:.2f}"
+
+    def _build_consensus_result(
+        *,
+        source_label: str,
+        next_q_revenue=None,
+        next_q_eps=None,
+        full_year_revenue=None,
+        full_year_eps=None,
+        target_mean=None,
+        target_high=None,
+        target_low=None,
+        num_analysts=None,
+        buy_ratings=0,
+        hold_ratings=0,
+        sell_ratings=0,
+    ) -> dict:
+        total_ratings = int(buy_ratings or 0) + int(hold_ratings or 0) + int(sell_ratings or 0)
+        return {
+            "next_quarter": {
+                "revenue_estimate": format_currency(next_q_revenue) if _has_value(next_q_revenue) else "N/A",
+                "eps_estimate": format_price(next_q_eps) if _has_value(next_q_eps) else "N/A",
+                "quarter_label": f"{next_quarter_label} (Est.)",
+                "source": source_label,
+                "source_url": f"https://finance.yahoo.com/quote/{ticker_symbol}/analysis"
+            },
+            "full_year": {
+                "revenue_estimate": format_currency(full_year_revenue) if _has_value(full_year_revenue) else "N/A",
+                "eps_estimate": format_price(full_year_eps) if _has_value(full_year_eps) else "N/A",
+                "fiscal_year": "Current FY",
+                "source": source_label,
+                "source_url": f"https://finance.yahoo.com/quote/{ticker_symbol}/analysis"
+            },
+            "analyst_coverage": {
+                "num_analysts": total_ratings if total_ratings > 0 else _safe_int(num_analysts),
+                "buy_ratings": int(buy_ratings or 0),
+                "hold_ratings": int(hold_ratings or 0),
+                "sell_ratings": int(sell_ratings or 0),
+                "price_target_analysts": _safe_int(num_analysts),
+                "source": source_label,
+                "source_url": f"https://finance.yahoo.com/quote/{ticker_symbol}/analysis"
+            },
+            "price_targets": {
+                "average": format_price(target_mean),
+                "high": format_price(target_high),
+                "low": format_price(target_low),
+                "source": source_label,
+                "source_url": f"https://finance.yahoo.com/quote/{ticker_symbol}/analysis"
+            },
+            "citations": [
+                {
+                    "source_name": "Yahoo Finance",
+                    "url": f"https://finance.yahoo.com/quote/{ticker_symbol}/analysis",
+                    "data_type": "EPS & Revenue Estimates, Analyst Ratings",
+                    "access_date": "current"
+                }
+            ],
+            "source": source_label,
+            "last_updated": "current"
+        }
+
+    def _consensus_has_any_data(result: dict) -> bool:
+        return any(
+            (
+                result["next_quarter"]["revenue_estimate"] != "N/A",
+                result["next_quarter"]["eps_estimate"] != "N/A",
+                result["full_year"]["revenue_estimate"] != "N/A",
+                result["full_year"]["eps_estimate"] != "N/A",
+                bool(result["analyst_coverage"]["num_analysts"]),
+                bool(result["price_targets"]["average"]),
+                bool(result["price_targets"]["high"]),
+                bool(result["price_targets"]["low"]),
+            )
+        )
+
+    def _needs_secondary_consensus_source(result: dict) -> bool:
+        return (
+            result["next_quarter"]["revenue_estimate"] == "N/A"
+            and result["next_quarter"]["eps_estimate"] == "N/A"
+        ) or not result["analyst_coverage"]["num_analysts"] or not result["price_targets"]["average"]
+
+    def _merge_consensus_results(primary: dict, secondary: dict) -> dict:
+        merged = {**primary}
+        for section in ["next_quarter", "full_year", "analyst_coverage", "price_targets"]:
+            base = dict(primary.get(section, {}) or {})
+            extra = dict(secondary.get(section, {}) or {})
+            for key, value in extra.items():
+                current = base.get(key)
+                if current in (None, "", "N/A", 0) and value not in (None, "", "N/A", 0):
+                    base[key] = value
+            merged[section] = base
+
+        if _consensus_has_any_data(secondary):
+            merged["source"] = "Yahoo Finance (yfinance + yahooquery fallback)"
+            citations = primary.get("citations", []) if isinstance(primary.get("citations", []), list) else []
+            merged["citations"] = citations
+            if secondary.get("warning") and not _consensus_has_any_data(merged):
+                merged["warning"] = secondary.get("warning")
+            else:
+                merged.pop("warning", None)
+        return merged
+
+    def _extract_yq_symbol_payload(payload):
+        if not isinstance(payload, dict):
+            return {}
+        symbol_options = [ticker_symbol, ticker_symbol.upper(), ticker_symbol.lower()]
+        for symbol_key in symbol_options:
+            if symbol_key in payload and isinstance(payload[symbol_key], dict):
+                return payload[symbol_key]
+        if len(payload) == 1:
+            only_value = next(iter(payload.values()))
+            if isinstance(only_value, dict):
+                return only_value
+        return {}
+
+    def _extract_yq_recommendation_row(df: pd.DataFrame) -> dict:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return {}
+        working = df.copy()
+        if isinstance(working.index, pd.MultiIndex):
+            for symbol_key in [ticker_symbol, ticker_symbol.upper(), ticker_symbol.lower()]:
+                try:
+                    subset = working.xs(symbol_key, level=0, drop_level=False)
+                    if not subset.empty:
+                        working = subset
+                        break
+                except Exception:
+                    continue
+        working = working.reset_index(drop=False)
+        if "symbol" in working.columns:
+            symbol_mask = working["symbol"].astype(str).str.upper() == ticker_symbol.upper()
+            if symbol_mask.any():
+                working = working.loc[symbol_mask]
+        if "period" in working.columns:
+            current = working.loc[working["period"].astype(str) == "0m"]
+            if not current.empty:
+                working = current
+        if working.empty:
+            return {}
+        row = working.iloc[0]
+        return row.to_dict() if hasattr(row, "to_dict") else {}
+
+    def _fetch_consensus_estimates_yahooquery() -> dict | None:
+        if YQTicker is None:
+            return None
+        try:
+            yq = YQTicker(ticker_symbol)
+
+            financial_data = {}
+            earnings_trend = {}
+            calendar_events = {}
+            recommendation_trend = pd.DataFrame()
+
+            try:
+                financial_data = _extract_yq_symbol_payload(yq.financial_data)
+            except Exception:
+                financial_data = {}
+            try:
+                earnings_trend = _extract_yq_symbol_payload(yq.earnings_trend)
+            except Exception:
+                earnings_trend = {}
+            try:
+                calendar_events = _extract_yq_symbol_payload(yq.calendar_events)
+            except Exception:
+                calendar_events = {}
+            try:
+                recommendation_trend = yq.recommendation_trend
+            except Exception:
+                recommendation_trend = pd.DataFrame()
+
+            trend_items = earnings_trend.get("trend", []) if isinstance(earnings_trend, dict) else []
+            if not isinstance(trend_items, list):
+                trend_items = []
+
+            def _trend_item(period: str) -> dict:
+                for item in trend_items:
+                    if isinstance(item, dict) and item.get("period") == period:
+                        return item
+                return {}
+
+            next_q_item = _trend_item("0q")
+            full_year_item = _trend_item("0y")
+
+            next_q_rev = ((next_q_item.get("revenueEstimate") or {}) if isinstance(next_q_item, dict) else {}).get("avg")
+            next_q_eps = ((next_q_item.get("earningsEstimate") or {}) if isinstance(next_q_item, dict) else {}).get("avg")
+            full_year_rev = ((full_year_item.get("revenueEstimate") or {}) if isinstance(full_year_item, dict) else {}).get("avg")
+            full_year_eps = ((full_year_item.get("earningsEstimate") or {}) if isinstance(full_year_item, dict) else {}).get("avg")
+
+            calendar_earnings = calendar_events.get("earnings", {}) if isinstance(calendar_events, dict) else {}
+            if not _has_value(next_q_rev):
+                next_q_rev = calendar_earnings.get("revenueAverage")
+            if not _has_value(next_q_eps):
+                next_q_eps = calendar_earnings.get("earningsAverage")
+
+            rec_row = _extract_yq_recommendation_row(recommendation_trend)
+            strong_buy = _safe_int(rec_row.get("strongBuy")) or 0
+            buy = _safe_int(rec_row.get("buy")) or 0
+            hold = _safe_int(rec_row.get("hold")) or 0
+            sell = _safe_int(rec_row.get("sell")) or 0
+            strong_sell = _safe_int(rec_row.get("strongSell")) or 0
+
+            fallback_result = _build_consensus_result(
+                source_label="Yahoo Finance (yahooquery)",
+                next_q_revenue=next_q_rev,
+                next_q_eps=next_q_eps,
+                full_year_revenue=full_year_rev,
+                full_year_eps=full_year_eps,
+                target_mean=financial_data.get("targetMeanPrice"),
+                target_high=financial_data.get("targetHighPrice"),
+                target_low=financial_data.get("targetLowPrice"),
+                num_analysts=financial_data.get("numberOfAnalystOpinions"),
+                buy_ratings=strong_buy + buy,
+                hold_ratings=hold,
+                sell_ratings=sell + strong_sell,
+            )
+            if not _consensus_has_any_data(fallback_result):
+                fallback_result["warning"] = "Yahoo Finance did not return analyst consensus data for this run."
+            return fallback_result
+        except Exception:
+            return None
+
     try:
         stock = get_yf_ticker(ticker_symbol, use_cache=False)
         info = get_yf_info(stock)
-
-        def _has_value(value) -> bool:
-            return value is not None and pd.notna(value)
-
-        def _safe_int(value):
-            try:
-                if value is None or pd.isna(value):
-                    return None
-                return int(value)
-            except Exception:
-                return None
         
         # Get price targets from yfinance
         target_mean = info.get('targetMeanPrice')
@@ -2235,78 +2471,26 @@ def fetch_consensus_estimates(
                 total_ratings = buy_ratings + hold_ratings + sell_ratings
             except:
                 pass
-        
-        # Format values
-        def format_currency(val, is_billions=True):
-            if not _has_value(val):
-                return None
-            if is_billions:
-                return f"${val/1e9:.2f}B"
-            return f"${val:.2f}"
-        
-        def format_price(val):
-            if not _has_value(val):
-                return None
-            return f"${val:.2f}"
-        
-        # Build result - note: yfinance 0q = upcoming quarter to report, +1q = quarter after that
-        # These are FORWARD estimates, not historical data
-        result = {
-            "next_quarter": {
-                "revenue_estimate": format_currency(next_q_revenue) if _has_value(next_q_revenue) else "N/A",
-                "eps_estimate": format_price(next_q_eps) if _has_value(next_q_eps) else "N/A",
-                "quarter_label": f"{next_quarter_label} (Est.)",
-                "source": "Yahoo Finance",
-                "source_url": f"https://finance.yahoo.com/quote/{ticker_symbol}/analysis"
-            },
-            "full_year": {
-                "revenue_estimate": format_currency(full_year_revenue) if _has_value(full_year_revenue) else "N/A",
-                "eps_estimate": format_price(full_year_eps) if _has_value(full_year_eps) else "N/A",
-                "fiscal_year": "Current FY",
-                "source": "Yahoo Finance",
-                "source_url": f"https://finance.yahoo.com/quote/{ticker_symbol}/analysis"
-            },
-            "analyst_coverage": {
-                "num_analysts": total_ratings if total_ratings > 0 else (_safe_int(num_analysts) or next_q_analysts),  # Use ratings total for consistency with buy/hold/sell
-                "buy_ratings": buy_ratings,
-                "hold_ratings": hold_ratings,
-                "sell_ratings": sell_ratings,
-                "price_target_analysts": _safe_int(num_analysts),  # Separate field for price target analyst count
-                "source": "Yahoo Finance",
-                "source_url": f"https://finance.yahoo.com/quote/{ticker_symbol}/analysis"
-            },
-            "price_targets": {
-                "average": format_price(target_mean),
-                "high": format_price(target_high),
-                "low": format_price(target_low),
-                "source": "Yahoo Finance",
-                "source_url": f"https://finance.yahoo.com/quote/{ticker_symbol}/analysis"
-            },
-            "citations": [
-                {
-                    "source_name": "Yahoo Finance",
-                    "url": f"https://finance.yahoo.com/quote/{ticker_symbol}/analysis",
-                    "data_type": "EPS & Revenue Estimates, Analyst Ratings",
-                    "access_date": "current"
-                }
-            ],
-            "source": "Yahoo Finance (yfinance)",
-            "last_updated": "current"
-        }
 
-        has_any_consensus_data = any(
-            (
-                result["next_quarter"]["revenue_estimate"] != "N/A",
-                result["next_quarter"]["eps_estimate"] != "N/A",
-                result["full_year"]["revenue_estimate"] != "N/A",
-                result["full_year"]["eps_estimate"] != "N/A",
-                bool(result["analyst_coverage"]["num_analysts"]),
-                bool(result["price_targets"]["average"]),
-                bool(result["price_targets"]["high"]),
-                bool(result["price_targets"]["low"]),
-            )
+        result = _build_consensus_result(
+            source_label="Yahoo Finance (yfinance)",
+            next_q_revenue=next_q_revenue,
+            next_q_eps=next_q_eps,
+            full_year_revenue=full_year_revenue,
+            full_year_eps=full_year_eps,
+            target_mean=target_mean,
+            target_high=target_high,
+            target_low=target_low,
+            num_analysts=_safe_int(num_analysts) or next_q_analysts,
+            buy_ratings=buy_ratings,
+            hold_ratings=hold_ratings,
+            sell_ratings=sell_ratings,
         )
-        if not has_any_consensus_data:
+        if _needs_secondary_consensus_source(result):
+            fallback_result = _fetch_consensus_estimates_yahooquery()
+            if isinstance(fallback_result, dict):
+                result = _merge_consensus_results(result, fallback_result)
+        if not _consensus_has_any_data(result):
             result["warning"] = "Yahoo Finance did not return analyst consensus data for this run."
         
         # Optional qualitative summary using AI (disabled for initial-load performance).
