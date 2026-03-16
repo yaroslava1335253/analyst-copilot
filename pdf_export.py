@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from functools import lru_cache
 from io import BytesIO
+from pathlib import Path
 import re
 
 from PIL import Image, ImageDraw, ImageFont
 
 
+BASE_DIR = Path(__file__).resolve().parent
 PAGE_WIDTH = 1275
 PAGE_HEIGHT = 1650
 PAGE_MARGIN = 84
@@ -43,9 +45,18 @@ TONE_COLORS = {
 }
 
 FONT_CANDIDATES = [
-    ("/System/Library/Fonts/Avenir.ttc", 0, 1),
-    ("/System/Library/Fonts/Helvetica.ttc", 0, 1),
-    ("/System/Library/Fonts/Supplemental/Arial.ttf", 0, 0),
+    (BASE_DIR / "assets" / "fonts" / "DejaVuSans.ttf", None, False),
+    (BASE_DIR / "assets" / "fonts" / "DejaVuSans-Bold.ttf", None, True),
+    ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", None, False),
+    ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", None, True),
+    ("/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf", None, False),
+    ("/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf", None, True),
+    ("/System/Library/Fonts/Avenir.ttc", 0, False),
+    ("/System/Library/Fonts/Avenir.ttc", 1, True),
+    ("/System/Library/Fonts/Helvetica.ttc", 0, False),
+    ("/System/Library/Fonts/Helvetica.ttc", 1, True),
+    ("/System/Library/Fonts/Supplemental/Arial.ttf", None, False),
+    ("/System/Library/Fonts/Supplemental/Arial Bold.ttf", None, True),
 ]
 
 CHAR_REPLACEMENTS = {
@@ -77,9 +88,15 @@ def _mix(color_a: tuple[int, int, int], color_b: tuple[int, int, int], ratio: fl
 
 @lru_cache(maxsize=None)
 def _font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    for path, regular_index, bold_index in FONT_CANDIDATES:
+    for path, font_index, is_bold in FONT_CANDIDATES:
+        if is_bold != bold:
+            continue
         try:
-            return ImageFont.truetype(path, size=size, index=bold_index if bold else regular_index)
+            path_str = str(path)
+            kwargs = {"size": size}
+            if font_index is not None:
+                kwargs["index"] = font_index
+            return ImageFont.truetype(path_str, **kwargs)
         except Exception:
             continue
     return ImageFont.load_default()

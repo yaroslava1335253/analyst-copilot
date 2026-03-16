@@ -1,4 +1,4 @@
-from pdf_export import build_summary_pdf
+from pdf_export import _font, build_summary_pdf
 
 
 def test_build_summary_pdf_returns_valid_pdf_bytes():
@@ -54,3 +54,11 @@ def test_build_summary_pdf_accepts_unicode_text():
 
     assert pdf_bytes.startswith(b"%PDF")
     assert pdf_bytes.rstrip().endswith(b"%%EOF")
+
+
+def test_pdf_export_uses_bundled_scalable_fonts():
+    regular = _font(24, bold=False)
+    bold = _font(24, bold=True)
+
+    assert str(getattr(regular, "path", "")).endswith("assets/fonts/DejaVuSans.ttf")
+    assert str(getattr(bold, "path", "")).endswith("assets/fonts/DejaVuSans-Bold.ttf")
