@@ -2153,7 +2153,10 @@ def fetch_consensus_estimates(
     """
     try:
         stock = get_yf_ticker(ticker_symbol, use_cache=False)
-        info = stock.info
+        try:
+            info = stock.info
+        except Exception:
+            info = {}
         if not isinstance(info, dict):
             info = {}
 
