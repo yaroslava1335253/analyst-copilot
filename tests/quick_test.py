@@ -4,6 +4,13 @@ Quick test: Validate new DCF engine with real yfinance data
 
 import sys
 import os
+
+if __name__ != "__main__":
+    import pytest
+
+    if os.environ.get("RUN_LIVE_DATA_TESTS") != "1":
+        pytest.skip("manual live-data test; set RUN_LIVE_DATA_TESTS=1 to include it in pytest", allow_module_level=True)
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from data_adapter import DataAdapter

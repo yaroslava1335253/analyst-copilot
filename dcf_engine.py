@@ -13,11 +13,15 @@ Implements:
 import json
 import copy
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Optional, List, Tuple, Union
 from dataclasses import dataclass, asdict, field
 from data_adapter import NormalizedFinancialSnapshot, DataQualityMetadata
 from industry_multiples import get_industry_multiple, DAMODARAN_SOURCE_URL, DAMODARAN_DATA_DATE
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 @dataclass
@@ -168,7 +172,7 @@ class CalculationTraceStep:
         self.output = output
         self.output_units = output_units
         self.notes = notes or ""
-        self.timestamp = datetime.utcnow().isoformat()
+        self.timestamp = _utc_now_iso()
     
     def to_dict(self):
         return {
@@ -1191,6 +1195,7 @@ class DCFEngine:
         ttm_ebit = self.snapshot.ttm_operating_income.value  # Operating Income = EBIT
         ttm_ebitda = self.snapshot.ttm_ebitda.value
         ttm_revenue = self.snapshot.ttm_revenue.value
+        ttm_reported_fcf = self.snapshot.ttm_fcf.value
         ttm_capex = self.snapshot.ttm_capex.value
         ttm_da = self.snapshot.ttm_depreciation_amortization.value
         ttm_cfo = self.snapshot.ttm_operating_cash_flow.value
@@ -1312,6 +1317,31 @@ class DCFEngine:
                 "🔴 Using LEVERED FCF proxy (CFO - CapEx). Neither EBIT/D&A nor interest expense available. "
                 "This is cash flow to EQUITY discounted with WACC = framework mixing. "
                 "Results may be 10-20% off. Consider this a rough estimate only."
+            )
+        elif ttm_reported_fcf:
+            ttm_fcff = ttm_reported_fcf
+            fcff_method = "reported_fcf_proxy"
+            fcff_reliability = min(
+                getattr(self.snapshot.ttm_fcf, "reliability_score", 40) or 40,
+                60,
+            )
+
+            self.trace.append(CalculationTraceStep(
+                name="TTM FCF Fallback (Reported Proxy)",
+                formula="Use reported TTM FCF directly when FCFF ingredients are unavailable",
+                inputs={
+                    "ttm_fcf": f"${ttm_reported_fcf/1e9:.2f}B",
+                },
+                output=ttm_fcff,
+                output_units="USD",
+                notes=(
+                    "Fallback path: reported TTM FCF may be levered and is treated as a low-confidence "
+                    "proxy for FCFF."
+                ),
+            ))
+            self.warnings.append(
+                "Using reported TTM FCF as a proxy because EBIT/D&A/CapEx or CFO inputs are incomplete. "
+                "Treat valuation output as lower confidence until full FCFF inputs are available."
             )
         else:
             # No valid FCF calculation possible

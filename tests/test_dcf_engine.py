@@ -49,14 +49,20 @@ class TestNormalizedFinancialSnapshot:
     
     def test_recalculate_overall_quality(self):
         snap = NormalizedFinancialSnapshot("GOOG")
+        snap.price.value = 100
+        snap.shares_outstanding.value = 10
+        snap.ttm_revenue.value = 1000
+        snap.ttm_fcf.value = 100
+        snap.ttm_operating_income.value = 120
         snap.price.reliability_score = 100
         snap.shares_outstanding.reliability_score = 50
         snap.ttm_revenue.reliability_score = 80
         snap.ttm_fcf.reliability_score = 60
         snap.ttm_operating_income.reliability_score = 70
         snap.recalculate_overall_quality()
-        # Average of [100, 50, 80, 60, 70] = 72
-        assert snap.overall_quality_score == 72
+        # Missing core inputs are treated as zero-quality placeholders until populated.
+        # Average of [100, 50, 80, 60, 70, 0, 0, 0, 0] = 40
+        assert snap.overall_quality_score == 40
 
 
 class TestCalculationTraceStep:

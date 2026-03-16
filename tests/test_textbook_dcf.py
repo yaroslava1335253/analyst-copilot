@@ -1,5 +1,13 @@
 """Test the textbook DCF implementation with horizon rule and ROIC-based reinvestment."""
 
+import os
+
+if __name__ != "__main__":
+    import pytest
+
+    if os.environ.get("RUN_LIVE_DATA_TESTS") != "1":
+        pytest.skip("manual live-data test; set RUN_LIVE_DATA_TESTS=1 to include it in pytest", allow_module_level=True)
+
 from data_adapter import DataAdapter
 from dcf_engine import DCFEngine, DCFAssumptions
 

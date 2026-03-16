@@ -86,4 +86,4 @@ GEMINI_API_KEY=...
 FMP_API_KEY=...   # optional
 ```
 
-Key dependencies: `streamlit==1.53.1`, `yfinance==1.1.0`, `yahooquery==2.4.1`, `google-generativeai==0.8.6`, `chromadb==1.4.1`, `pytest==9.0.2`.
+Key dependencies: `streamlit==1.53.1`, `pandas>=2.2,<3`, `requests>=2.32.4,<3`, `yfinance==1.1.0`, `yahooquery==2.4.1`, `google-genai>=1.50,<2`, `python-dotenv==1.2.1`.

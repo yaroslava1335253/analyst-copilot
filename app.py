@@ -38,12 +38,13 @@ except Exception:
 import pandas as pd
 import altair as alt
 import json
-import yfinance as yf
 from engine import get_financials, run_structured_prompt, calculate_metrics, run_chat, analyze_quarterly_trends, generate_independent_forecast, get_latest_date_info, get_available_report_dates, calculate_comprehensive_analysis
 from data_adapter import DataAdapter, DataQualityMetadata, NormalizedFinancialSnapshot
 from dcf_engine import DCFEngine, DCFAssumptions
 from dcf_ui_adapter import DCFUIAdapter
+from pdf_export import build_summary_pdf
 from sources import SOURCE_CATALOG
+from yf_cache import get_yf_ticker
 
 UI_CACHE_VERSION = 2
 REPORT_DATES_CACHE_VERSION = "v5"
@@ -111,7 +112,7 @@ def _initial_contact_email() -> str:
                 return section_value
     except Exception:
         pass
-    return "yaroslava@uni.minerva.edu"
+    return ""
 
 
 CONTACT_EMAIL_TO = _initial_contact_email()
@@ -426,7 +427,8 @@ def load_ui_cache() -> dict:
             "ticker_library": _normalize_ticker_library(data.get("ticker_library", [])),
             "last_selected_ticker": _normalize_ticker(data.get("last_selected_ticker", DEFAULT_TICKER)) or DEFAULT_TICKER,
             "available_report_dates": available_dates_cache,
-            "results": data.get("results", {}) if isinstance(data.get("results", {}), dict) else {},
+            # Keep DCF/AI outputs session-local; persisting them to disk leaks state across users.
+            "results": {},
         }
         return cache
     except Exception:
@@ -442,7 +444,6 @@ def save_ui_cache(cache_obj: dict) -> None:
             "ticker_library": _normalize_ticker_library(cache_obj.get("ticker_library", [])),
             "last_selected_ticker": _normalize_ticker(cache_obj.get("last_selected_ticker", DEFAULT_TICKER)) or DEFAULT_TICKER,
             "available_report_dates": _normalize_available_report_dates_cache(cache_obj.get("available_report_dates", {})),
-            "results": _json_safe(cache_obj.get("results", {})),
         }
         tmp_path = UI_CACHE_PATH.with_suffix(".tmp")
         with tmp_path.open("w", encoding="utf-8") as f:
@@ -1096,6 +1097,12 @@ def _send_contact_email(
     sender_email: str,
     message: str,
 ) -> tuple[bool, str]:
+    if not EMAIL_REGEX.match(CONTACT_EMAIL_TO):
+        return (
+            False,
+            "Contact recipient email is not configured. Set CONTACT_EMAIL_TO or FORMSUBMIT_TO in deployment secrets/env.",
+        )
+
     smtp, missing = _smtp_config()
     if missing:
         return (
@@ -1138,8 +1145,8 @@ def _send_contact_email(
                 server.login(smtp["user"], smtp["password"])
                 server.send_message(msg)
         return True, "Message sent successfully."
-    except Exception as exc:
-        return False, f"Failed to send message: {exc}"
+    except Exception:
+        return False, "Failed to send message. Check SMTP configuration and server connectivity."
 
 
 def _metadata_from_dict(raw: dict) -> DataQualityMetadata:
@@ -1484,7 +1491,7 @@ def cached_company_name(ticker: str) -> str:
         return ""
     try:
         def _fetch_info() -> dict:
-            return yf.Ticker(normalized_ticker).info or {}
+            return get_yf_ticker(normalized_ticker).info or {}
 
         info = _call_with_timeout(
             _fetch_info,
@@ -1947,7 +1954,7 @@ def _show_dcf_details_page():
 
         return (
             "**Assistant unavailable right now.**\n\n"
-            f"**Details:** {message}\n\n"
+            "Retry in a moment. If the issue persists, verify Gemini configuration and inspect server-side logs.\n\n"
             "You can still inspect the trace and source tables above."
         )
 
@@ -3145,8 +3152,11 @@ def _show_contact_page():
             st.rerun()
     st.caption("For suggestions or feedback, email us directly.")
     st.markdown("### Suggestions Email")
-    st.markdown(f"**{CONTACT_EMAIL_TO}**")
-    st.markdown(f"[Compose Email](mailto:{CONTACT_EMAIL_TO})")
+    if EMAIL_REGEX.match(CONTACT_EMAIL_TO):
+        st.markdown(f"**{CONTACT_EMAIL_TO}**")
+        st.markdown(f"[Compose Email](mailto:{CONTACT_EMAIL_TO})")
+    else:
+        st.info("Contact email is not configured for this deployment.")
 # --- App Configuration ---
 st.set_page_config(
     page_title="Analyst Co-Pilot",
@@ -4176,6 +4186,7 @@ if 'ai_outlook_error' not in st.session_state:
     st.session_state.ai_outlook_error = None
 if 'ui_cache' not in st.session_state:
     st.session_state.ui_cache = load_ui_cache()
+    save_ui_cache(st.session_state.ui_cache)
 if st.session_state.ui_cache.get("available_report_dates_version") != REPORT_DATES_CACHE_VERSION:
     st.session_state.ui_cache["available_report_dates_version"] = REPORT_DATES_CACHE_VERSION
     st.session_state.ui_cache["available_report_dates"] = {}
@@ -4320,6 +4331,347 @@ def get_valuation_verdict(upside_pct: float):
         return "Modestly Overvalued", "badge-fail", "DCF 10-25% below market"
     return "Fairly Valued", "badge-neutral-plain", "DCF within +/-10% of market"
 
+
+def _format_summary_currency(value, decimals: int = 2) -> str:
+    try:
+        number = float(value)
+    except Exception:
+        return "N/A"
+    if not math.isfinite(number):
+        return "N/A"
+    return f"${number:,.{decimals}f}"
+
+
+def _format_summary_pct(value, signed: bool = False, decimals: int = 1) -> str:
+    try:
+        number = float(value)
+    except Exception:
+        return "N/A"
+    if not math.isfinite(number):
+        return "N/A"
+    sign = "+" if signed else ""
+    return f"{number:{sign}.{decimals}f}%"
+
+
+def _clean_summary_items(items, max_items: int = 3) -> list[str]:
+    cleaned = []
+    for item in items or []:
+        text = _sanitize_ai_valuation_language(str(item or "")).strip()
+        if not text or "null" in text.lower():
+            continue
+        cleaned.append(text)
+        if len(cleaned) >= max_items:
+            break
+    return cleaned
+
+
+def _join_summary_phrases(items: list[str]) -> str:
+    cleaned = [str(item).strip().rstrip(".") for item in (items or []) if str(item).strip()]
+    if not cleaned:
+        return ""
+    if len(cleaned) == 1:
+        return cleaned[0]
+    if len(cleaned) == 2:
+        return f"{cleaned[0]} and {cleaned[1]}"
+    return f"{', '.join(cleaned[:-1])}, and {cleaned[-1]}"
+
+
+def _build_summary_pdf_bytes(
+    *,
+    ticker: str,
+    company_name: str,
+    as_of_label: str,
+    data_source: str,
+    dcf_ui_data: dict | None,
+    consensus: dict | None,
+    next_forecast_label: str,
+    view_model: dict | None,
+    wacc_source_summary: str,
+    hist_data: list | None,
+    growth_summary: dict | None,
+) -> bytes | None:
+    if not isinstance(dcf_ui_data, dict) or not dcf_ui_data.get("success"):
+        return None
+
+    current_price = dcf_ui_data.get("current_price")
+    intrinsic_value = dcf_ui_data.get("price_per_share")
+    data_quality = dcf_ui_data.get("data_quality_score")
+    assumptions = dcf_ui_data.get("assumptions", {}) or {}
+
+    upside_pct = None
+    if current_price and intrinsic_value:
+        try:
+            if float(current_price) > 0 and float(intrinsic_value) > 0:
+                upside_pct = ((float(intrinsic_value) - float(current_price)) / float(current_price)) * 100.0
+        except Exception:
+            upside_pct = None
+
+    verdict_label = "Pending"
+    if upside_pct is not None:
+        verdict_label, _, _ = get_valuation_verdict(upside_pct)
+    verdict_tone = "neutral"
+    if upside_pct is not None:
+        if upside_pct > 10:
+            verdict_tone = "positive"
+        elif upside_pct < -10:
+            verdict_tone = "negative"
+
+    current_price_numeric = None
+    intrinsic_value_numeric = None
+    try:
+        current_price_numeric = float(current_price)
+    except Exception:
+        pass
+    try:
+        intrinsic_value_numeric = float(intrinsic_value)
+    except Exception:
+        pass
+
+    summary_model = view_model if isinstance(view_model, dict) else {}
+    summary_text = str(summary_model.get("summary", "") or "").strip()
+    drivers = _clean_summary_items(summary_model.get("drivers"), max_items=3)
+    risks = _clean_summary_items(summary_model.get("risks"), max_items=3)
+    key_conditional = _sanitize_ai_valuation_language(str(summary_model.get("key_conditional", "") or "")).strip()
+    evidence_gaps = _clean_summary_items(summary_model.get("evidence_gaps"), max_items=1)
+
+    title = f"{ticker} Summary Report"
+    subtitle_parts = []
+    if company_name and company_name != ticker:
+        subtitle_parts.append(company_name)
+    if as_of_label:
+        subtitle_parts.append(f"As of {as_of_label}")
+    subtitle = " | ".join(subtitle_parts)
+
+    bottom_line = []
+    if summary_text:
+        bottom_line.append(summary_text)
+    valuation_line = (
+        f"Verdict: {verdict_label} | "
+        f"Price {_format_summary_currency(current_price)} | "
+        f"Intrinsic {_format_summary_currency(intrinsic_value)}"
+    )
+    if upside_pct is not None:
+        valuation_line += f" | Upside/Downside {_format_summary_pct(upside_pct, signed=True)}"
+    bottom_line.append(valuation_line)
+
+    valuation_items = []
+    wacc_display = assumptions.get("discount_rate_used")
+    if wacc_display is not None:
+        try:
+            wacc_display = float(wacc_display) * 100.0
+        except Exception:
+            wacc_display = None
+    fcf_growth = assumptions.get("fcf_growth_rate")
+    if fcf_growth is not None:
+        try:
+            fcf_growth = float(fcf_growth) * 100.0
+        except Exception:
+            fcf_growth = None
+    terminal_growth = assumptions.get("terminal_growth_rate")
+    if terminal_growth is not None:
+        try:
+            terminal_growth = float(terminal_growth) * 100.0
+        except Exception:
+            terminal_growth = None
+
+    valuation_items.append(
+        "Assumptions: "
+        f"WACC {_format_summary_pct(wacc_display)} | "
+        f"FCF growth {_format_summary_pct(fcf_growth)} | "
+        f"Terminal growth {_format_summary_pct(terminal_growth, decimals=2)}"
+    )
+
+    tv_dominance = assumptions.get("tv_dominance_pct")
+    terminal_method = assumptions.get("terminal_value_method", "gordon_growth")
+    terminal_method_label = "Exit Multiple" if terminal_method == "exit_multiple" else "Gordon Growth"
+    valuation_items.append(
+        f"Quality: {data_quality:.0f}/100 | TV dominance {_format_summary_pct(tv_dominance)} | "
+        f"Terminal method {terminal_method_label}"
+        if isinstance(data_quality, (int, float))
+        else f"TV dominance {_format_summary_pct(tv_dominance)} | Terminal method {terminal_method_label}"
+    )
+
+    hero_metrics = [
+        {"label": "Market Price", "value": _format_summary_currency(current_price), "tone": "neutral"},
+        {"label": "Intrinsic Value", "value": _format_summary_currency(intrinsic_value), "tone": verdict_tone},
+        {
+            "label": "Upside / Downside",
+            "value": _format_summary_pct(upside_pct, signed=True) if upside_pct is not None else "N/A",
+            "tone": verdict_tone,
+        },
+        {"label": "Verdict", "value": verdict_label, "tone": verdict_tone},
+    ]
+
+    price_comparison = []
+    if current_price_numeric is not None:
+        price_comparison.append(
+            {
+                "label": "Market Price",
+                "value": current_price_numeric,
+                "display": _format_summary_currency(current_price_numeric),
+                "tone": "neutral",
+            }
+        )
+    if intrinsic_value_numeric is not None:
+        price_comparison.append(
+            {
+                "label": "Intrinsic Value",
+                "value": intrinsic_value_numeric,
+                "display": _format_summary_currency(intrinsic_value_numeric),
+                "tone": verdict_tone,
+            }
+        )
+    revenue_series = []
+    revenue_subtitle = ""
+    hist_rows = hist_data if isinstance(hist_data, list) else []
+    recent_revenue_rows = []
+    for row in hist_rows:
+        revenue_value = row.get("revenue") if isinstance(row, dict) else None
+        if revenue_value is None:
+            continue
+        try:
+            revenue_numeric = float(revenue_value)
+        except Exception:
+            continue
+        recent_revenue_rows.append(
+            {
+                "label": str(row.get("quarter", "")) if isinstance(row, dict) else "",
+                "value": revenue_numeric,
+            }
+        )
+        if len(recent_revenue_rows) >= 6:
+            break
+    revenue_series = list(reversed(recent_revenue_rows))
+    if isinstance(growth_summary, dict):
+        avg_revenue_yoy = growth_summary.get("avg_revenue_yoy")
+        if isinstance(avg_revenue_yoy, (int, float)):
+            revenue_subtitle = f"Avg revenue YoY {_format_summary_pct(avg_revenue_yoy, signed=True)}"
+
+    key_points = []
+    key_points.extend(f"- {driver}" for driver in drivers)
+    if key_conditional and "null" not in key_conditional.lower():
+        key_points.append(f"- Decision trigger: {key_conditional}")
+
+    risk_items = []
+    risk_items.extend(f"- {risk}" for risk in risks)
+    if evidence_gaps:
+        risk_items.append(f"- Evidence gap: {evidence_gaps[0]}")
+    if not risk_items and isinstance(tv_dominance, (int, float)) and tv_dominance >= 75:
+        risk_items.append("- Terminal value dominates the DCF, so small assumption changes can move fair value materially.")
+
+    street_items = []
+    consensus_payload = consensus if isinstance(consensus, dict) else {}
+    if consensus_payload and not consensus_payload.get("error"):
+        next_q = consensus_payload.get("next_quarter", {}) or {}
+        coverage = consensus_payload.get("analyst_coverage", {}) or {}
+        targets = consensus_payload.get("price_targets", {}) or {}
+        quarter_label = next_q.get("quarter_label") or next_forecast_label or "Next quarter"
+        revenue_estimate = next_q.get("revenue_estimate")
+        eps_estimate = next_q.get("eps_estimate")
+        analyst_count = coverage.get("num_analysts")
+        street_line_parts = [quarter_label]
+        if revenue_estimate:
+            street_line_parts.append(f"Revenue {revenue_estimate}")
+        if eps_estimate:
+            street_line_parts.append(f"EPS {eps_estimate}")
+        if analyst_count:
+            street_line_parts.append(f"Analysts {analyst_count}")
+        if len(street_line_parts) > 1:
+            street_items.append(" | ".join(street_line_parts))
+
+        avg_pt = parse_price_value(targets.get("average"))
+        if avg_pt is not None:
+            target_line = f"Average price target {_format_summary_currency(avg_pt)}"
+            if current_price:
+                try:
+                    pt_upside = ((avg_pt - float(current_price)) / float(current_price)) * 100.0
+                    target_line += f" ({_format_summary_pct(pt_upside, signed=True)} vs current)"
+                except Exception:
+                    pass
+            street_items.append(target_line)
+            price_comparison.append(
+                {
+                    "label": "Street Avg PT",
+                    "value": float(avg_pt),
+                    "display": _format_summary_currency(avg_pt),
+                    "tone": "positive" if current_price_numeric is None or avg_pt >= current_price_numeric else "negative",
+                }
+            )
+
+    source_items = []
+    if data_source:
+        source_items.append(f"Operating data: {data_source}")
+    if wacc_source_summary:
+        source_items.append(f"WACC inputs: {wacc_source_summary}")
+    if isinstance(consensus_payload, dict) and consensus_payload and not consensus_payload.get("error"):
+        estimate_sources = []
+        next_q = consensus_payload.get("next_quarter", {}) or {}
+        coverage = consensus_payload.get("analyst_coverage", {}) or {}
+        targets = consensus_payload.get("price_targets", {}) or {}
+        for source_value in [
+            next_q.get("source"),
+            coverage.get("source"),
+            targets.get("source"),
+        ]:
+            text = str(source_value or "").strip()
+            if text and text not in estimate_sources:
+                estimate_sources.append(text)
+        if estimate_sources:
+            source_items.append(f"Street data: {', '.join(estimate_sources)}")
+
+    sections = [
+        ("Bottom Line", bottom_line),
+        ("Valuation", valuation_items),
+    ]
+    if key_points:
+        sections.append(("What Matters Most", key_points))
+    if risk_items:
+        sections.append(("Main Risks", risk_items))
+    if street_items:
+        sections.append(("Street Context", street_items))
+    if source_items:
+        sections.append(("Core Sources", source_items))
+
+    qualitative_items = []
+    if summary_text:
+        qualitative_items.append(summary_text)
+    driver_sentence = _join_summary_phrases(drivers)
+    if driver_sentence:
+        qualitative_items.append(f"The call is supported by {driver_sentence}.")
+    risk_sentence = _join_summary_phrases(risks)
+    if risk_sentence:
+        qualitative_items.append(f"The main risks to the view are {risk_sentence}.")
+    if evidence_gaps:
+        qualitative_items.append(f"A remaining evidence gap is {evidence_gaps[0].rstrip('.')}.")
+    if key_conditional and "null" not in key_conditional.lower():
+        qualitative_items.append(f"The view would need to be revisited if {key_conditional.rstrip('.')}.")
+    if qualitative_items:
+        sections.append(("Why This Verdict", qualitative_items))
+
+    outlook_payload = {}
+    if summary_model:
+        outlook_payload = {
+            "short_stance": summary_model.get("short_stance", "Neutral"),
+            "fund_outlook": summary_model.get("fund_outlook", "Stable"),
+            "stock_outlook": summary_model.get("stock_outlook", "Neutral"),
+            "stock_horizon": summary_model.get("stock_horizon", ""),
+            "stock_conviction": summary_model.get("stock_conviction", ""),
+            "summary": summary_text,
+            "key_conditional": key_conditional,
+        }
+
+    return build_summary_pdf(
+        title=title,
+        subtitle=subtitle,
+        sections=sections,
+        footer="For research use only. Assumption-sensitive output, not investment advice.",
+        hero_metrics=hero_metrics,
+        price_comparison=price_comparison,
+        revenue_series=revenue_series,
+        revenue_subtitle=revenue_subtitle,
+        outlook=outlook_payload,
+    )
+
 # --- Sidebar Toggle State ---
 if "sidebar_visible" not in st.session_state:
     st.session_state.sidebar_visible = True
@@ -4453,8 +4805,9 @@ with st.sidebar:
 
     if available_dates:
         latest_date = available_dates[0]["display"]
+        safe_latest_date = html.escape(str(latest_date))
         st.markdown(f"""
-            <div class="sidebar-data-badge">Latest Data: {latest_date}</div>
+            <div class="sidebar-data-badge">Latest Data: {safe_latest_date}</div>
         """, unsafe_allow_html=True)
     elif ticker_valid:
         st.caption(st.session_state.report_dates_hint or "No report dates loaded yet.")
@@ -4783,7 +5136,7 @@ if st.session_state.quarterly_analysis:
     _mcap_str = f"${_mcap/1e9:.1f}B" if _mcap is not None else "—"
     _show_pe = _pe is not None and _pe > 0
     _pe_str = f"{_pe:.1f}x" if _show_pe else None
-    _company_name_display = html.escape(_company_name) if _company_name else ticker
+    _company_name_display = _company_name if _company_name else ticker
 
     _hero_tiles = [
         ("Price", _price_str, None),
@@ -4797,19 +5150,23 @@ if st.session_state.quarterly_analysis:
     for idx, (label, value, value_style) in enumerate(_hero_tiles):
         style = ' style="border-right:none"' if idx == len(_hero_tiles) - 1 else ""
         value_style_html = f' style="{value_style}"' if value_style else ""
+        safe_label = html.escape(str(label))
+        safe_value = html.escape(str(value))
         _hero_items_html.append(
-            f'<div class="hero-item"{style}><div class="hero-label">{label}</div>'
-            f'<div class="hero-value"{value_style_html}>{value}</div></div>'
+            f'<div class="hero-item"{style}><div class="hero-label">{safe_label}</div>'
+            f'<div class="hero-value"{value_style_html}>{safe_value}</div></div>'
         )
     _hero_items_html = "".join(_hero_items_html)
+    safe_ticker = html.escape(str(ticker))
+    safe_company_name = html.escape(str(_company_name_display))
 
     st.markdown(f"""
 <div class="hero-strip">
   {_hero_items_html}
   <div class="hero-divider"></div>
   <div class="hero-ticker">
-    <span class="hero-ticker-symbol">{ticker}</span>
-    <span class="hero-ticker-source">{_company_name_display}</span>
+    <span class="hero-ticker-symbol">{safe_ticker}</span>
+    <span class="hero-ticker-source">{safe_company_name}</span>
   </div>
 </div>
     """, unsafe_allow_html=True)
@@ -5094,17 +5451,27 @@ if st.session_state.quarterly_analysis:
             current_price_text = f"${current_price:.2f}" if current_price else "—"
             intrinsic_text = f"${intrinsic:.2f}" if intrinsic else "—"
             upside_text = f"{upside_downside:+.1f}%" if upside_downside is not None else "—"
+            safe_ticker = html.escape(str(ticker))
+            safe_current_price_text = html.escape(current_price_text)
+            safe_intrinsic_text = html.escape(intrinsic_text)
+            safe_upside_text = html.escape(upside_text)
+            safe_verdict_label = html.escape(str(verdict_label))
+            safe_terminal_method_label = html.escape(str(terminal_method_label))
+            safe_terminal_method_context = html.escape(str(terminal_method_context))
+            safe_cashflow_regime_label = html.escape(str(cashflow_regime_label))
+            safe_confidence_label = html.escape(str(confidence_label))
+            safe_discount_rate_text = html.escape(str(discount_rate_text))
             st.markdown(f"""
 <div class="decision-strip">
   <div class="decision-grid">
-    <div><div class="decision-tile-label">Ticker</div><div class="decision-tile-value">{ticker}</div></div>
-    <div><div class="decision-tile-label">Current Price</div><div class="decision-tile-value">{current_price_text}</div></div>
+    <div><div class="decision-tile-label">Ticker</div><div class="decision-tile-value">{safe_ticker}</div></div>
+    <div><div class="decision-tile-label">Current Price</div><div class="decision-tile-value">{safe_current_price_text}</div></div>
     <div>
       <div class="decision-tile-label">Intrinsic Value</div>
-      <div class="decision-tile-value">{intrinsic_text}</div>
+      <div class="decision-tile-value">{safe_intrinsic_text}</div>
     </div>
-    <div><div class="decision-tile-label">Upside/Downside</div><div class="decision-tile-value">{upside_text}</div></div>
-    <div><div class="decision-tile-label">Verdict</div><span class="badge {verdict_badge}">{verdict_label}</span></div>
+    <div><div class="decision-tile-label">Upside/Downside</div><div class="decision-tile-value">{safe_upside_text}</div></div>
+    <div><div class="decision-tile-label">Verdict</div><span class="badge {verdict_badge}">{safe_verdict_label}</span></div>
   </div>
 </div>
             """, unsafe_allow_html=True)
@@ -5113,9 +5480,9 @@ if st.session_state.quarterly_analysis:
 <div class="confidence-strip">
   <span class="confidence-pill">Data Quality: {data_quality:.0f}/100</span>
   <span class="confidence-pill">TV Dominance: {tv_dominance:.0f}%</span>
-  <span class="confidence-pill">Terminal Method: {terminal_method_label} ({terminal_method_context})</span>
-  <span class="confidence-pill">Cash Flow Regime: {cashflow_regime_label} ({confidence_label})</span>
-  <span class="confidence-pill">{discount_rate_text}</span>
+  <span class="confidence-pill">Terminal Method: {safe_terminal_method_label} ({safe_terminal_method_context})</span>
+  <span class="confidence-pill">Cash Flow Regime: {safe_cashflow_regime_label} ({safe_confidence_label})</span>
+  <span class="confidence-pill">{safe_discount_rate_text}</span>
 </div>
             """, unsafe_allow_html=True)
             st.caption(verdict_hint)
@@ -5137,21 +5504,16 @@ if st.session_state.quarterly_analysis:
     st.caption("Tune assumptions, rerun the model, and review core valuation outputs.")
 
     snapshot_for_suggestions = None
-    suggestions_source_label = "cached snapshot"
     _active_dcf_snapshot = st.session_state.get("dcf_snapshot")
     _active_dcf_ticker = _normalize_ticker(getattr(_active_dcf_snapshot, "ticker", "")) if _active_dcf_snapshot is not None else ""
     if _active_dcf_snapshot is not None and _active_dcf_ticker == ticker:
         snapshot_for_suggestions = _active_dcf_snapshot
-        suggestions_source_label = "current DCF run snapshot"
     else:
         snapshot_for_suggestions = cached_financial_snapshot(
             ticker,
             suggestion_algo_version=SNAPSHOT_SUGGESTION_VERSION,
         )
-    st.caption(
-        "Suggested assumptions are auto-loaded for the active ticker. "
-        f"Source: {suggestions_source_label}."
-    )
+    st.caption("Suggested assumptions are auto-loaded for the active ticker.")
 
     suggested_wacc = 9.0
     suggested_fcf_growth = 8.0
@@ -5160,6 +5522,7 @@ if st.session_state.quarterly_analysis:
     raw_suggested_wacc = None
     wacc_was_bounded = False
     wacc_bound_reason = ""
+    wacc_source_summary = ""
     if snapshot_for_suggestions:
         if snapshot_for_suggestions.suggested_wacc.value:
             suggested_wacc = round(snapshot_for_suggestions.suggested_wacc.value * 100, 1)
@@ -5172,6 +5535,22 @@ if st.session_state.quarterly_analysis:
                     raw_suggested_wacc = None
             wacc_was_bounded = bool(wacc_components.get("wacc_was_bounded", False))
             wacc_bound_reason = str(wacc_components.get("wacc_bound_reason", "") or "")
+            rf_source = str(wacc_components.get("rf_source") or getattr(snapshot_for_suggestions, "rf_source", "") or "").strip()
+            damodaran_date = str(wacc_components.get("damodaran_date", "") or "").strip()
+            beta_source_path = str(getattr(snapshot_for_suggestions.beta, "source_path", "") or "").lower()
+            rf_label = ""
+            if rf_source.startswith("^TNX live"):
+                rf_label = rf_source.replace(" live", "")
+            elif rf_source:
+                rf_label = rf_source
+            beta_label = "beta Yahoo Finance" if "yf.ticker.info['beta']" in beta_source_path else "beta source"
+            source_parts = []
+            if rf_label:
+                source_parts.append(f"Rf {rf_label}")
+            source_parts.append(f"ERP Damodaran ({damodaran_date or 'latest'})")
+            if getattr(snapshot_for_suggestions.beta, "value", None):
+                source_parts.append(beta_label)
+            wacc_source_summary = " · ".join(source_parts)
         if snapshot_for_suggestions.suggested_fcf_growth.value is not None:
             suggested_fcf_growth = round(snapshot_for_suggestions.suggested_fcf_growth.value * 100, 1)
             suggested_fcf_reliability = snapshot_for_suggestions.suggested_fcf_growth.reliability_score
@@ -5231,16 +5610,17 @@ if st.session_state.quarterly_analysis:
             beta_text = f", beta {beta_val:.2f}" if beta_val else ""
             if all(v is not None for v in [we, wd, cost_of_equity_rate, rd, tax_rate]):
                 inputs_line = (
-                    f"We {we*100:.0f}% × Re {cost_of_equity_rate*100:.1f}% + "
-                    f"Wd {wd*100:.0f}% × Rd {rd*100:.1f}% × (1-T {tax_rate*100:.1f}%) | "
-                    f"Rf {rf_source}{beta_text}"
+                    f"We {we*100:.0f}% / Wd {wd*100:.0f}% | "
+                    f"Re {cost_of_equity_rate*100:.1f}% / Rd {rd*100:.1f}% / T {tax_rate*100:.1f}%"
                 )
             else:
                 inputs_line = f"Rf {rf_source}{beta_text}"
             suggested_text = f"Suggested WACC: {suggested_wacc:.1f}%"
             if raw_suggested_wacc is not None:
-                suggested_text = f"Suggested WACC: {raw_suggested_wacc:.1f}% (raw), {suggested_wacc:.1f}% (used)"
-            st.caption(f"{suggested_text} | Inputs: {inputs_line} | Source: {suggestions_source_label}")
+                suggested_text = f"Suggested WACC: {suggested_wacc:.1f}%"
+            st.caption(f"{suggested_text} | {inputs_line}")
+            if wacc_source_summary:
+                st.caption(f"Sources: {wacc_source_summary}")
             if wacc_was_bounded and wacc_bound_reason:
                 st.caption(f"Guardrail applied: {wacc_bound_reason}")
             if we is not None and wd is not None and we <= 0.01 and wd >= 0.99:
@@ -5861,6 +6241,7 @@ if st.session_state.quarterly_analysis:
         with st.expander("AI Synthesis Error Details", expanded=False):
             st.code(str(ai_outlook_error))
 
+    pdf_outlook_view_model = {}
     forecast_for_citations = st.session_state.get("independent_forecast")
     merged_citations = _merge_citations_for_step6(consensus_citations, forecast_for_citations, qual_sources)
     numbered_citations = _number_citations(merged_citations)
@@ -5887,6 +6268,7 @@ if st.session_state.quarterly_analysis:
             expanded_default = bool(st.session_state.get("forecast_just_generated", False))
             view_model = _build_outlook_view_model(extracted, full_analysis)
             summary_text = str(view_model.get("summary", "") or "").strip()
+            pdf_outlook_view_model = view_model
             if summary_text:
                 st.markdown(
                     f"""
@@ -5963,6 +6345,28 @@ if st.session_state.quarterly_analysis:
     st.markdown("---")
     st.markdown('<div class="section-header"><span class="step-badge">Step 06</span><span class="section-title">Sources & Methodology</span></div>', unsafe_allow_html=True)
     st.caption("Reference material and citations for all report sections.")
+
+    summary_pdf_bytes = _build_summary_pdf_bytes(
+        ticker=ticker,
+        company_name=_company_name_display,
+        as_of_label=most_recent.get("label", ""),
+        data_source=data_source,
+        dcf_ui_data=dcf_ui_data,
+        consensus=consensus,
+        next_forecast_label=next_forecast_label,
+        view_model=pdf_outlook_view_model,
+        wacc_source_summary=wacc_source_summary,
+        hist_data=hist_data,
+        growth_summary=growth_summary,
+    )
+    if summary_pdf_bytes:
+        st.download_button(
+            "Download Summary PDF",
+            data=summary_pdf_bytes,
+            file_name=f"{ticker.lower()}_summary_report.pdf",
+            mime="application/pdf",
+            help="Analyst-style PDF with price comparison, revenue trend, outlook, key drivers, risks, and sources.",
+        )
 
     with st.expander("Methodology", expanded=False, icon="📚"):
         st.markdown("Core data sources and method notes used in this report:")

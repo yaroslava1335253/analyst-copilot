@@ -11,12 +11,20 @@ Key responsibilities:
 5. Track which line items are estimated vs actual
 """
 
-import yfinance as yf
 import pandas as pd
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Optional, Tuple, List
-from yahooquery import Ticker as YQTicker
+from yf_cache import get_yf_ticker
+
+try:
+    from yahooquery import Ticker as YQTicker
+except ImportError:
+    YQTicker = None
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 class DataQualityMetadata:
@@ -54,7 +62,7 @@ class NormalizedFinancialSnapshot:
     """Standardized financial data for a ticker with quality metadata."""
     def __init__(self, ticker: str):
         self.ticker = ticker
-        self.retrieved_at = datetime.utcnow().isoformat()
+        self.retrieved_at = _utc_now_iso()
         
         # Core price/shares data
         self.price = DataQualityMetadata()
@@ -215,7 +223,7 @@ class DataAdapter:
     def fetch(self) -> NormalizedFinancialSnapshot:
         """Fetch all available data from yfinance."""
         try:
-            stock = yf.Ticker(self.ticker)
+            stock = get_yf_ticker(self.ticker)
             
             # Step 1: Price and shares data
             self._fetch_price_and_shares(stock)
@@ -304,10 +312,10 @@ class DataAdapter:
                 self.snapshot.price = DataQualityMetadata(
                     value=price,
                     units="USD",
-                    period_end=datetime.utcnow().isoformat(),
+                    period_end=_utc_now_iso(),
                     period_type="current",
                     source_path="yf.Ticker.info['currentPrice|regularMarketPrice'] or fast_info['lastPrice|regularMarketPrice|previousClose']",
-                    retrieved_at=datetime.utcnow().isoformat(),
+                    retrieved_at=_utc_now_iso(),
                     reliability_score=95 if info.get('currentPrice') or info.get('regularMarketPrice') else 85
                 )
             else:
@@ -349,10 +357,10 @@ class DataAdapter:
                 self.snapshot.market_cap = DataQualityMetadata(
                     value=market_cap,
                     units="USD",
-                    period_end=datetime.utcnow().isoformat(),
+                    period_end=_utc_now_iso(),
                     period_type="current",
                     source_path=market_cap_source,
-                    retrieved_at=datetime.utcnow().isoformat(),
+                    retrieved_at=_utc_now_iso(),
                     reliability_score=market_cap_reliability
                 )
             else:
@@ -363,10 +371,10 @@ class DataAdapter:
                 self.snapshot.shares_outstanding = DataQualityMetadata(
                     value=shares,
                     units="shares",
-                    period_end=datetime.utcnow().isoformat(),
+                    period_end=_utc_now_iso(),
                     period_type="current",
                     source_path=shares_source,
-                    retrieved_at=datetime.utcnow().isoformat(),
+                    retrieved_at=_utc_now_iso(),
                     reliability_score=shares_reliability
                 )
             else:
@@ -395,7 +403,7 @@ class DataAdapter:
                     units="ratio",
                     period_type="5-year monthly",
                     source_path="yf.Ticker.info['beta']",
-                    retrieved_at=datetime.utcnow().isoformat(),
+                    retrieved_at=_utc_now_iso(),
                     reliability_score=85,
                     notes="5-year monthly beta vs S&P 500 (Yahoo Finance)"
                 )
@@ -423,6 +431,8 @@ class DataAdapter:
             # Total Debt - PRIMARY: Use yahooquery for accurate Total Debt
             yq_bs_sorted = None
             try:
+                if YQTicker is None:
+                    raise ImportError("yahooquery is not installed")
                 yq_ticker = YQTicker(self.ticker)
                 yq_bs = yq_ticker.balance_sheet(frequency='q')
                 if isinstance(yq_bs, pd.DataFrame) and 'TotalDebt' in yq_bs.columns:
@@ -437,7 +447,7 @@ class DataAdapter:
                             period_end=str(yq_as_of)[:10],
                             period_type="quarterly",
                             source_path="yahooquery_balance_sheet['TotalDebt']",
-                            retrieved_at=datetime.utcnow().isoformat(),
+                            retrieved_at=_utc_now_iso(),
                             reliability_score=98
                         )
                     else:
@@ -473,7 +483,7 @@ class DataAdapter:
                         period_end=str(most_recent_date)[:10],
                         period_type="quarterly" if "quarterly" in str(type(stock.quarterly_balance_sheet)) else "annual",
                         source_path=f"balance_sheet[{', '.join(debt_sources)}]",
-                        retrieved_at=datetime.utcnow().isoformat(),
+                        retrieved_at=_utc_now_iso(),
                         reliability_score=80,
                         notes=f"Fallback from yahooquery: {str(yq_err)}"
                     )
@@ -538,7 +548,7 @@ class DataAdapter:
                     period_end="TTM",
                     period_type="quarterly_average",
                     source_path=avg_debt_source,
-                    retrieved_at=datetime.utcnow().isoformat(),
+                    retrieved_at=_utc_now_iso(),
                     reliability_score=avg_debt_reliability,
                     notes="Average debt basis used for cost-of-debt guardrails"
                 )
@@ -562,7 +572,7 @@ class DataAdapter:
                     period_end=str(most_recent_date)[:10],
                     period_type="quarterly",
                     source_path=f"balance_sheet[{cash_sources[0] if cash_sources else 'Cash'}]",
-                    retrieved_at=datetime.utcnow().isoformat(),
+                    retrieved_at=_utc_now_iso(),
                     reliability_score=90
                 )
             else:
@@ -705,7 +715,7 @@ class DataAdapter:
                     period_end="TTM",
                     period_type=period_type,
                     source_path="cash_flow['Operating Cash Flow'] (sum of last 4 Q or last annual)",
-                    retrieved_at=datetime.utcnow().isoformat(),
+                    retrieved_at=_utc_now_iso(),
                     reliability_score=90 if period_type == "quarterly_ttm" else 70,
                     fallback_reason=fallback_reason
                 )
@@ -739,7 +749,7 @@ class DataAdapter:
                     period_end="TTM",
                     period_type=period_type,
                     source_path="cash_flow['Capital Expenditure'] (sum of last 4 Q, absolute value, or last annual)",
-                    retrieved_at=datetime.utcnow().isoformat(),
+                    retrieved_at=_utc_now_iso(),
                     reliability_score=90 if period_type == "quarterly_ttm" else 70,
                     fallback_reason=fallback_reason
                 )
@@ -757,7 +767,7 @@ class DataAdapter:
                     period_end="TTM",
                     period_type="ttm_proxy",
                     source_path="TTM_OCF - TTM_CapEx",
-                    retrieved_at=datetime.utcnow().isoformat(),
+                    retrieved_at=_utc_now_iso(),
                     reliability_score=min(
                         self.snapshot.ttm_operating_cash_flow.reliability_score,
                         self.snapshot.ttm_capex.reliability_score
@@ -785,7 +795,7 @@ class DataAdapter:
                             period_end="TTM",
                             period_type="quarterly_ttm",
                             source_path="cash_flow['Change In Working Capital'] (sum of last 4 Q)",
-                            retrieved_at=datetime.utcnow().isoformat(),
+                            retrieved_at=_utc_now_iso(),
                             reliability_score=90,
                             notes=f"TTM ΔNWC from CF statement: ${ttm_delta_nwc/1e9:.2f}B (already in CFO)"
                         )
@@ -825,7 +835,7 @@ class DataAdapter:
                     period_end="TTM",
                     period_type=rev_period,
                     source_path=rev_source,
-                    retrieved_at=datetime.utcnow().isoformat(),
+                    retrieved_at=_utc_now_iso(),
                     reliability_score=95 if rev_period == "quarterly_ttm" else 80,
                 )
             else:
@@ -841,7 +851,7 @@ class DataAdapter:
                     period_end="TTM",
                     period_type=oi_period,
                     source_path=oi_source,
-                    retrieved_at=datetime.utcnow().isoformat(),
+                    retrieved_at=_utc_now_iso(),
                     reliability_score=90 if oi_period == "quarterly_ttm" else 75
                 )
             else:
@@ -857,12 +867,14 @@ class DataAdapter:
                     period_end="TTM",
                     period_type=ni_period,
                     source_path=ni_source,
-                    retrieved_at=datetime.utcnow().isoformat(),
+                    retrieved_at=_utc_now_iso(),
                     reliability_score=90 if ni_period == "quarterly_ttm" else 75
                 )
             
             # TTM EBITDA - PRIMARY: Use yahooquery to get real TTM from Yahoo Finance
             try:
+                if YQTicker is None:
+                    raise ImportError("yahooquery is not installed")
                 yq_ticker = YQTicker(self.ticker)
                 inc_stmt = yq_ticker.income_statement(frequency='q', trailing=True)
                 if isinstance(inc_stmt, pd.DataFrame) and 'EBITDA' in inc_stmt.columns and 'periodType' in inc_stmt.columns:
@@ -879,7 +891,7 @@ class DataAdapter:
                                 period_end=str(as_of_date),
                                 period_type="ttm",
                                 source_path="yahooquery_income_statement_TTM",
-                                retrieved_at=datetime.utcnow().isoformat(),
+                                retrieved_at=_utc_now_iso(),
                                 reliability_score=98  # Highest reliability - actual TTM from Yahoo
                             )
                         else:
@@ -898,7 +910,7 @@ class DataAdapter:
                         period_end="TTM",
                         period_type="ttm",
                         source_path="yfinance_info['ebitda']",
-                        retrieved_at=datetime.utcnow().isoformat(),
+                        retrieved_at=_utc_now_iso(),
                         reliability_score=85,
                         notes=f"Fallback from yahooquery: {str(yq_err)}"
                     )
@@ -912,7 +924,7 @@ class DataAdapter:
                             period_end="TTM",
                             period_type=ebitda_period,
                             source_path=ebitda_source,
-                            retrieved_at=datetime.utcnow().isoformat(),
+                            retrieved_at=_utc_now_iso(),
                             reliability_score=75 if ebitda_period == "quarterly_ttm" else 65
                         )
                     else:
@@ -926,7 +938,7 @@ class DataAdapter:
                                 period_end="TTM",
                                 period_type=da_period,
                                 source_path="OI + D&A",
-                                retrieved_at=datetime.utcnow().isoformat(),
+                                retrieved_at=_utc_now_iso(),
                                 reliability_score=55,
                                 is_estimated=True,
                                 notes="Approximated from Operating Income + D&A; direct EBITDA unavailable"
@@ -953,7 +965,7 @@ class DataAdapter:
                             period_end=period_date,
                             period_type="annual",
                             source_path="Tax Provision / Pretax Income (annual income statement)",
-                            retrieved_at=datetime.utcnow().isoformat(),
+                            retrieved_at=_utc_now_iso(),
                             reliability_score=90,
                             is_estimated=False,
                             notes=f"From annual filing: Tax Provision ${tax_provision/1e9:.2f}B / Pretax Income ${pretax_income/1e9:.2f}B"
@@ -970,7 +982,7 @@ class DataAdapter:
                         period_end="TTM",
                         period_type="estimated",
                         source_path="1 - (Net Income / Operating Income)",
-                        retrieved_at=datetime.utcnow().isoformat(),
+                        retrieved_at=_utc_now_iso(),
                         reliability_score=60,
                         is_estimated=True,
                         notes="Fallback: Inferred from NI/OI; Tax Provision data unavailable"
@@ -992,7 +1004,7 @@ class DataAdapter:
                         period_end="TTM",
                         period_type=int_period,
                         source_path=int_source,
-                        retrieved_at=datetime.utcnow().isoformat(),
+                        retrieved_at=_utc_now_iso(),
                         reliability_score=85 if int_period == "quarterly_ttm" else 70,
                         notes=f"TTM Interest Expense: ${ttm_int_exp/1e9:.2f}B (for FCFF proxy)"
                     )
@@ -1039,7 +1051,7 @@ class DataAdapter:
         
         # Get live 10-year Treasury yield from Yahoo Finance
         try:
-            tnx = yf.Ticker("^TNX")
+            tnx = get_yf_ticker("^TNX")
             tnx_hist = tnx.history(period="5d")
             if not tnx_hist.empty:
                 RISK_FREE_RATE = tnx_hist['Close'].iloc[-1] / 100  # Convert from % to decimal
@@ -1102,7 +1114,7 @@ class DataAdapter:
             units="rate",
             period_type="calculated",
             source_path=coe_source,
-            retrieved_at=datetime.utcnow().isoformat(),
+            retrieved_at=_utc_now_iso(),
             reliability_score=coe_reliability,
             is_estimated=True,
             notes=coe_note,
@@ -1204,7 +1216,7 @@ class DataAdapter:
             units="rate",
             period_type="calculated" if total_debt > 0 else "not_applicable",
             source_path=debt_cost_source,
-            retrieved_at=datetime.utcnow().isoformat(),
+            retrieved_at=_utc_now_iso(),
             reliability_score=debt_cost_reliability,
             is_estimated=total_debt > 0,
             notes=debt_note,
@@ -1322,7 +1334,7 @@ class DataAdapter:
             units="rate",
             period_type="calculated_estimate",
             source_path=wacc_mode_label,
-            retrieved_at=datetime.utcnow().isoformat(),
+            retrieved_at=_utc_now_iso(),
             reliability_score=wacc_reliability,
             is_estimated=True,
             notes=(
@@ -1416,7 +1428,7 @@ class DataAdapter:
                     units="rate",
                     period_type="forward_analyst_consensus",
                     source_path="yf.Ticker.revenue_estimate (forward consensus chain)",
-                    retrieved_at=datetime.utcnow().isoformat(),
+                    retrieved_at=_utc_now_iso(),
                     reliability_score=reliability,
                     is_estimated=True,
                     notes=(
@@ -1434,7 +1446,7 @@ class DataAdapter:
                 units="rate",
                 period_type="forward_analyst_long_term",
                 source_path=self.snapshot.analyst_long_term_growth.source_path,
-                retrieved_at=datetime.utcnow().isoformat(),
+                retrieved_at=_utc_now_iso(),
                 reliability_score=max(70, self.snapshot.analyst_long_term_growth.reliability_score or 70),
                 is_estimated=True,
                 notes=f"Analyst long-term growth anchor used as fallback: {suggested_fcf_growth*100:.1f}%."
@@ -1451,7 +1463,7 @@ class DataAdapter:
                 units="rate",
                 period_type="trailing_historical",
                 source_path="yf.Ticker.info['revenueGrowth']",
-                retrieved_at=datetime.utcnow().isoformat(),
+                retrieved_at=_utc_now_iso(),
                 reliability_score=80,
                 is_estimated=True,
                 notes=f"Yahoo Finance trailing revenue growth: {suggested_fcf_growth*100:.1f}% (historical fallback)"
@@ -1477,7 +1489,7 @@ class DataAdapter:
                         units="rate",
                         period_type="calculated_fallback",
                         source_path="Calculated YoY Revenue × 0.7 (Yahoo revenueGrowth unavailable)",
-                        retrieved_at=datetime.utcnow().isoformat(),
+                        retrieved_at=_utc_now_iso(),
                         reliability_score=60,  # Lower reliability - only 5 quarters
                         is_estimated=True,
                         notes=f"⚠️ Fallback: Based on single YoY calc ({yoy_growth*100:.1f}% × 0.7 = {suggested_fcf_growth*100:.1f}%). Limited to 5 quarters - less reliable."
@@ -1490,7 +1502,7 @@ class DataAdapter:
             units="rate",
             period_type="default",
             source_path="Industry average default",
-            retrieved_at=datetime.utcnow().isoformat(),
+            retrieved_at=_utc_now_iso(),
             reliability_score=40,
             is_estimated=True,
             notes="Fallback: No analyst estimates or historical data, using 8% default"
@@ -1623,7 +1635,7 @@ class DataAdapter:
                     units="rate",
                     period_type="forward_long_term",
                     source_path=lt_source,
-                    retrieved_at=datetime.utcnow().isoformat(),
+                    retrieved_at=_utc_now_iso(),
                     reliability_score=lt_reliability,
                     notes="Long-term analyst growth estimate (used as 10Y mid-curve anchor when available).",
                 )

@@ -9,14 +9,15 @@ Includes financial math logic to pre-process data for the LLM.
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 import requests
-import yfinance as yf
 import pandas as pd
 from pathlib import Path
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from industry_multiples import get_industry_multiple, DAMODARAN_SOURCE_URL, DAMODARAN_DATA_DATE
+from yf_cache import get_yf_ticker
 
 _genai_client: "genai.Client | None" = None
 _sec_ticker_cik_map_cache = None
@@ -75,7 +76,7 @@ def _redact_api_secrets(text: str, known_secret: str = "") -> str:
 def config_genai():
     """Configures the Gemini API client."""
     global _genai_client
-    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("OPENAI_API_KEY")
+    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     if api_key:
         _genai_client = genai.Client(api_key=api_key)
     return api_key
@@ -86,7 +87,7 @@ def get_financials(ticker_symbol: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.D
     Returns: (income_stmt, balance_sheet, cash_flow, quarterly_cash_flow)
     """
     try:
-        stock = yf.Ticker(ticker_symbol)
+        stock = get_yf_ticker(ticker_symbol)
         income_statement = stock.income_stmt
         balance_sheet = stock.balance_sheet
         cash_flow = stock.cashflow
@@ -220,7 +221,7 @@ def calculate_comprehensive_analysis(
         
         if ticker_symbol:
             try:
-                stock = yf.Ticker(ticker_symbol)
+                stock = get_yf_ticker(ticker_symbol)
                 info = stock.info
                 current_price = info.get('currentPrice') or info.get('regularMarketPrice')
                 shares_outstanding = info.get('sharesOutstanding')
@@ -371,7 +372,7 @@ def calculate_comprehensive_analysis(
                 
                 if ticker_symbol:
                     try:
-                        stock_info = yf.Ticker(ticker_symbol).info
+                        stock_info = get_yf_ticker(ticker_symbol).info
                         yf_industry = stock_info.get('industry')
                         yf_sector = stock_info.get('sector')
                         
@@ -1342,7 +1343,7 @@ def _get_quarterly_income_history(ticker_symbol: str, max_quarters: int = 20) ->
 
     yahoo_quarterly_income = pd.DataFrame()
     try:
-        stock = yf.Ticker(ticker_symbol)
+        stock = get_yf_ticker(ticker_symbol)
         yahoo_quarterly_income = stock.quarterly_income_stmt
     except Exception:
         yahoo_quarterly_income = pd.DataFrame()
@@ -1397,20 +1398,20 @@ def get_financial_data(ticker: str, fmp_api_key: str = None) -> tuple:
             income_url = f"https://financialmodelingprep.com/api/v3/income-statement/{ticker}?period=quarter&limit=20&apikey={fmp_api_key}"
             balance_url = f"https://financialmodelingprep.com/api/v3/balance-sheet-statement/{ticker}?period=quarter&limit=20&apikey={fmp_api_key}"
             cashflow_url = f"https://financialmodelingprep.com/api/v3/cash-flow-statement/{ticker}?period=quarter&limit=20&apikey={fmp_api_key}"
-            
-            # Make API calls with error checking
-            income_resp = requests.get(income_url, timeout=10)
-            balance_resp = requests.get(balance_url, timeout=10)
-            cashflow_resp = requests.get(cashflow_url, timeout=10)
-            
-            # Check HTTP status
-            income_resp.raise_for_status()
-            balance_resp.raise_for_status()
-            cashflow_resp.raise_for_status()
-            
-            income_response = income_resp.json()
-            balance_response = balance_resp.json()
-            cashflow_response = cashflow_resp.json()
+
+            def _fetch_statement(url: str):
+                response = requests.get(url, timeout=10)
+                response.raise_for_status()
+                return response.json()
+
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                income_future = executor.submit(_fetch_statement, income_url)
+                balance_future = executor.submit(_fetch_statement, balance_url)
+                cashflow_future = executor.submit(_fetch_statement, cashflow_url)
+
+                income_response = income_future.result()
+                balance_response = balance_future.result()
+                cashflow_response = cashflow_future.result()
             
             # Check for FMP-specific errors
             def check_fmp_error(response):
@@ -1498,7 +1499,7 @@ def get_financial_data(ticker: str, fmp_api_key: str = None) -> tuple:
         warning_message = "⚠️ Using limited yfinance data (5-8 quarters). For accurate YoY growth calculations based on 12+ quarters, provide an FMP API key in the sidebar."
     
     try:
-        stock = yf.Ticker(ticker)
+        stock = get_yf_ticker(ticker)
         income_stmt = stock.quarterly_income_stmt
         balance_sheet = stock.quarterly_balance_sheet
         cash_flow = stock.quarterly_cashflow
@@ -1672,7 +1673,7 @@ def analyze_quarterly_trends(ticker_symbol: str, num_quarters: int = 8, end_date
         pe_ratio = None
         company_name = ticker_symbol
         try:
-            stock = yf.Ticker(ticker_symbol)
+            stock = get_yf_ticker(ticker_symbol)
             stock_info = {}
             fast_info = {}
 
@@ -2149,7 +2150,7 @@ def fetch_consensus_estimates(
         next_quarter_label: Label for the upcoming quarter (e.g., "FY2026 Q3")
     """
     try:
-        stock = yf.Ticker(ticker_symbol)
+        stock = get_yf_ticker(ticker_symbol)
         info = stock.info
         
         # Get price targets from yfinance
@@ -2412,7 +2413,7 @@ def generate_independent_forecast(quarterly_analysis: dict, company_name: str = 
     # This is critical for understanding CapEx ramps vs FCF compression
     cash_flow_context = ""
     try:
-        stock = yf.Ticker(ticker)
+        stock = get_yf_ticker(ticker)
         qcf = stock.quarterly_cashflow
         
         if qcf is not None and not qcf.empty:

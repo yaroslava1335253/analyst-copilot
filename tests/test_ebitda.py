@@ -1,5 +1,12 @@
 import yfinance as yf
 
+if __name__ != "__main__":
+    import os
+    import pytest
+
+    if os.environ.get("RUN_LIVE_DATA_TESTS") != "1":
+        pytest.skip("manual live-data test; set RUN_LIVE_DATA_TESTS=1 to include it in pytest", allow_module_level=True)
+
 ticker = 'MSFT'
 stock = yf.Ticker(ticker)
 
