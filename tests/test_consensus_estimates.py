@@ -101,6 +101,11 @@ class FakeResponse:
         return self._payload
 
 
+class FakeErrorResponse(FakeResponse):
+    def raise_for_status(self):
+        return None
+
+
 def test_fetch_consensus_estimates_handles_none_info(monkeypatch):
     monkeypatch.delenv("FMP_API_KEY", raising=False)
     monkeypatch.setattr("engine.get_yf_ticker", lambda ticker, use_cache=False: EmptyConsensusTicker())
@@ -218,3 +223,95 @@ def test_fetch_consensus_estimates_uses_fmp_when_available(monkeypatch):
     assert result["analyst_coverage"]["buy_ratings"] == 39
     assert result["source"].startswith("Financial Modeling Prep")
     assert "warning" not in result
+
+
+def test_fetch_consensus_estimates_keeps_fmp_targets_when_estimates_unavailable(monkeypatch):
+    def fake_requests_get(url, timeout=10):
+        if "analyst-estimates" in url:
+            return FakeErrorResponse(
+                {
+                    "Error Message": "Premium Query Parameter: 'Special Endpoint : This value set for 'period' is not available under your current subscription",
+                }
+            )
+        if "price-target-consensus" in url:
+            return FakeResponse(
+                [
+                    {
+                        "targetConsensus": 583.67,
+                        "targetHigh": 675.00,
+                        "targetLow": 392.00,
+                    }
+                ]
+            )
+        if "grades-consensus" in url:
+            return FakeResponse(
+                [
+                    {
+                        "strongBuy": 0,
+                        "buy": 62,
+                        "hold": 16,
+                        "sell": 0,
+                        "strongSell": 0,
+                    }
+                ]
+            )
+        raise AssertionError(url)
+
+    monkeypatch.setattr("engine.get_yf_ticker", lambda ticker, use_cache=False: EmptyConsensusTicker())
+    monkeypatch.setattr("engine.requests.get", fake_requests_get)
+    monkeypatch.setattr("engine.YQTicker", None)
+
+    result = fetch_consensus_estimates("MSFT", "FY2026 Q1", fmp_api_key="test-key")
+
+    assert "error" not in result
+    assert result["next_quarter"]["revenue_estimate"] == "N/A"
+    assert result["next_quarter"]["eps_estimate"] == "N/A"
+    assert result["price_targets"]["average"] == "$583.67"
+    assert result["analyst_coverage"]["num_analysts"] == 78
+    assert result["analyst_coverage"]["buy_ratings"] == 62
+    assert result["analyst_coverage"]["hold_ratings"] == 16
+    assert result["source"].startswith("Financial Modeling Prep")
+    assert "warning" not in result
+
+
+def test_fetch_consensus_estimates_preserves_per_section_source_attribution(monkeypatch):
+    def fake_requests_get(url, timeout=10):
+        if "analyst-estimates" in url:
+            return FakeErrorResponse(
+                {
+                    "Error Message": "Premium Query Parameter: 'Special Endpoint : This value set for 'period' is not available under your current subscription",
+                }
+            )
+        if "price-target-consensus" in url:
+            return FakeResponse(
+                [
+                    {
+                        "targetConsensus": 583.67,
+                        "targetHigh": 675.00,
+                        "targetLow": 392.00,
+                    }
+                ]
+            )
+        if "grades-consensus" in url:
+            return FakeResponse(
+                [
+                    {
+                        "strongBuy": 0,
+                        "buy": 62,
+                        "hold": 16,
+                        "sell": 0,
+                        "strongSell": 0,
+                    }
+                ]
+            )
+        raise AssertionError(url)
+
+    monkeypatch.setattr("engine.get_yf_ticker", lambda ticker, use_cache=False: PartialConsensusTicker())
+    monkeypatch.setattr("engine.requests.get", fake_requests_get)
+    monkeypatch.setattr("engine.YQTicker", None)
+
+    result = fetch_consensus_estimates("MSFT", "FY2026 Q1", fmp_api_key="test-key")
+
+    assert result["source"] == "Financial Modeling Prep + Yahoo Finance (yfinance)"
+    assert result["next_quarter"]["source"] == "Yahoo Finance (yfinance)"
+    assert result["price_targets"]["source"] == "Financial Modeling Prep"

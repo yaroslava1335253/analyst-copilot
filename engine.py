@@ -2254,21 +2254,56 @@ def fetch_consensus_estimates(
             and result["next_quarter"]["eps_estimate"] == "N/A"
         ) or not result["analyst_coverage"]["num_analysts"] or not result["price_targets"]["average"]
 
+    def _join_source_labels(*labels) -> str:
+        parts = []
+        for label in labels:
+            clean = str(label or "").strip()
+            if clean and clean not in parts:
+                parts.append(clean)
+        return " + ".join(parts)
+
+    def _section_has_data(section: dict, value_keys: tuple[str, ...]) -> bool:
+        return any(section.get(key) not in (None, "", "N/A", 0) for key in value_keys)
+
     def _merge_consensus_results(primary: dict, secondary: dict) -> dict:
         merged = {**primary}
+        section_value_keys = {
+            "next_quarter": ("revenue_estimate", "eps_estimate"),
+            "full_year": ("revenue_estimate", "eps_estimate"),
+            "analyst_coverage": ("num_analysts", "buy_ratings", "hold_ratings", "sell_ratings", "price_target_analysts"),
+            "price_targets": ("average", "high", "low"),
+        }
         for section in ["next_quarter", "full_year", "analyst_coverage", "price_targets"]:
             base = dict(primary.get(section, {}) or {})
             extra = dict(secondary.get(section, {}) or {})
+            value_keys = section_value_keys.get(section, ())
+            had_data_before = _section_has_data(base, value_keys)
+            filled_from_secondary = False
             for key, value in extra.items():
                 current = base.get(key)
                 if current in (None, "", "N/A", 0) and value not in (None, "", "N/A", 0):
                     base[key] = value
+                    if key in value_keys:
+                        filled_from_secondary = True
+            if filled_from_secondary:
+                extra_source = str(extra.get("source", "") or "").strip()
+                extra_source_url = str(extra.get("source_url", "") or "").strip()
+                if not had_data_before:
+                    if extra_source:
+                        base["source"] = extra_source
+                    if extra_source_url:
+                        base["source_url"] = extra_source_url
+                elif extra_source:
+                    base["source"] = _join_source_labels(base.get("source"), extra_source)
             merged[section] = base
 
         if _consensus_has_any_data(secondary):
             primary_source = str(primary.get("source", "") or "").strip()
             secondary_source = str(secondary.get("source", "") or "").strip()
-            merged["source"] = " + ".join(part for part in [primary_source, secondary_source] if part and part not in primary_source)
+            if _consensus_has_any_data(primary):
+                merged["source"] = _join_source_labels(primary_source, secondary_source)
+            else:
+                merged["source"] = secondary_source or primary_source
             citations = primary.get("citations", []) if isinstance(primary.get("citations", []), list) else []
             extra_citations = secondary.get("citations", []) if isinstance(secondary.get("citations", []), list) else []
             merged["citations"] = citations + [cite for cite in extra_citations if cite not in citations]
@@ -2358,7 +2393,9 @@ def fetch_consensus_estimates(
         if not fmp_api_key:
             return None
 
-        docs_base = "https://site.financialmodelingprep.com/developer/docs"
+        analyst_docs_url = "https://site.financialmodelingprep.com/developer/docs/stable/financial-estimates"
+        price_target_docs_url = "https://site.financialmodelingprep.com/developer/docs/stable/price-target-consensus"
+        grades_docs_url = "https://site.financialmodelingprep.com/developer/docs/stable/grades-summary"
         analyst_url = (
             f"https://financialmodelingprep.com/stable/analyst-estimates"
             f"?symbol={ticker_symbol}&period=quarter&page=0&limit=8&apikey={fmp_api_key}"
@@ -2376,24 +2413,25 @@ def fetch_consensus_estimates(
             f"?symbol={ticker_symbol}&apikey={fmp_api_key}"
         )
 
-        try:
-            with ThreadPoolExecutor(max_workers=4) as executor:
-                quarter_future = executor.submit(_fmp_request_json, analyst_url)
-                annual_future = executor.submit(_fmp_request_json, annual_url)
-                target_future = executor.submit(_fmp_request_json, target_url)
-                grades_future = executor.submit(_fmp_request_json, grades_url)
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            future_map = {
+                "quarter": executor.submit(_fmp_request_json, analyst_url),
+                "annual": executor.submit(_fmp_request_json, annual_url),
+                "targets": executor.submit(_fmp_request_json, target_url),
+                "grades": executor.submit(_fmp_request_json, grades_url),
+            }
 
-                quarter_payload = quarter_future.result()
-                annual_payload = annual_future.result()
-                target_payload = target_future.result()
-                grades_payload = grades_future.result()
-        except Exception:
-            return None
+            payloads = {name: None for name in future_map}
+            for name, future in future_map.items():
+                try:
+                    payloads[name] = future.result()
+                except Exception:
+                    payloads[name] = None
 
-        quarter_record = _pick_record_by_date(_extract_records(quarter_payload), future_bias=True)
-        annual_record = _pick_record_by_date(_extract_records(annual_payload), future_bias=True)
-        target_record = _extract_first_record(target_payload)
-        grades_record = _extract_first_record(grades_payload)
+        quarter_record = _pick_record_by_date(_extract_records(payloads["quarter"]), future_bias=True)
+        annual_record = _pick_record_by_date(_extract_records(payloads["annual"]), future_bias=True)
+        target_record = _extract_first_record(payloads["targets"])
+        grades_record = _extract_first_record(payloads["grades"])
 
         next_q_revenue = _pick_value(
             quarter_record,
@@ -2448,10 +2486,20 @@ def fetch_consensus_estimates(
         hold = _safe_int(_pick_value(grades_record, "hold", "holds")) or 0
         sell = _safe_int(_pick_value(grades_record, "sell", "sells")) or 0
         strong_sell = _safe_int(_pick_value(grades_record, "strongSell", "strong_sell")) or 0
+        if analyst_count is None:
+            ratings_total = strong_buy + buy + hold + sell + strong_sell
+            analyst_count = ratings_total or None
+
+        primary_docs_url = analyst_docs_url
+        if not any((next_q_revenue, next_q_eps, full_year_revenue, full_year_eps)):
+            if _pick_value(target_record, "targetConsensus", "targetMedian", "targetMean") is not None:
+                primary_docs_url = price_target_docs_url
+            elif analyst_count or strong_buy or buy or hold or sell or strong_sell:
+                primary_docs_url = grades_docs_url
 
         result = _build_consensus_result(
             source_label="Financial Modeling Prep",
-            source_url=f"{docs_base}/stable/analyst-estimates",
+            source_url=primary_docs_url,
             next_q_revenue=next_q_revenue,
             next_q_eps=next_q_eps,
             full_year_revenue=full_year_revenue,
@@ -2464,30 +2512,42 @@ def fetch_consensus_estimates(
             hold_ratings=hold,
             sell_ratings=sell + strong_sell,
         )
-        result["next_quarter"]["source_url"] = f"{docs_base}/stable/analyst-estimates"
-        result["full_year"]["source_url"] = f"{docs_base}/stable/analyst-estimates"
-        result["analyst_coverage"]["source_url"] = f"{docs_base}/stable/grades-consensus"
-        result["price_targets"]["source_url"] = f"{docs_base}/stable/price-target-consensus"
-        result["citations"] = [
-            {
-                "source_name": "Financial Modeling Prep",
-                "url": f"{docs_base}/stable/analyst-estimates",
-                "data_type": "Analyst revenue and EPS estimates",
-                "access_date": "current",
-            },
-            {
-                "source_name": "Financial Modeling Prep",
-                "url": f"{docs_base}/stable/price-target-consensus",
-                "data_type": "Analyst price target consensus",
-                "access_date": "current",
-            },
-            {
-                "source_name": "Financial Modeling Prep",
-                "url": f"{docs_base}/stable/grades-consensus",
-                "data_type": "Analyst ratings consensus",
-                "access_date": "current",
-            },
-        ]
+        result["next_quarter"]["source_url"] = analyst_docs_url
+        result["full_year"]["source_url"] = analyst_docs_url
+        result["analyst_coverage"]["source_url"] = grades_docs_url
+        result["price_targets"]["source_url"] = price_target_docs_url
+        citations = []
+        if any((next_q_revenue, next_q_eps, full_year_revenue, full_year_eps)):
+            citations.append(
+                {
+                    "source_name": "Financial Modeling Prep",
+                    "url": analyst_docs_url,
+                    "data_type": "Analyst revenue and EPS estimates",
+                    "access_date": "current",
+                }
+            )
+        if any(
+            _pick_value(target_record, key) is not None
+            for key in ("targetConsensus", "targetMedian", "targetMean", "targetHigh", "targetHighPrice", "targetLow", "targetLowPrice")
+        ):
+            citations.append(
+                {
+                    "source_name": "Financial Modeling Prep",
+                    "url": price_target_docs_url,
+                    "data_type": "Analyst price target consensus",
+                    "access_date": "current",
+                }
+            )
+        if analyst_count or strong_buy or buy or hold or sell or strong_sell:
+            citations.append(
+                {
+                    "source_name": "Financial Modeling Prep",
+                    "url": grades_docs_url,
+                    "data_type": "Analyst ratings consensus",
+                    "access_date": "current",
+                }
+            )
+        result["citations"] = citations
         if not _consensus_has_any_data(result):
             result["warning"] = "Financial Modeling Prep did not return analyst consensus data for this run."
         return result
