@@ -38,7 +38,7 @@ except Exception:
 import pandas as pd
 import altair as alt
 import json
-from engine import get_financials, run_structured_prompt, calculate_metrics, run_chat, analyze_quarterly_trends, generate_independent_forecast, get_latest_date_info, get_available_report_dates, calculate_comprehensive_analysis
+from engine import get_financial_data, run_structured_prompt, calculate_metrics, run_chat, analyze_quarterly_trends, generate_independent_forecast, get_latest_date_info, get_available_report_dates, calculate_comprehensive_analysis
 from data_adapter import DataAdapter, DataQualityMetadata, NormalizedFinancialSnapshot
 from dcf_engine import DCFEngine, DCFAssumptions
 from dcf_ui_adapter import DCFUIAdapter
@@ -1466,17 +1466,30 @@ def cached_independent_forecast(ticker: str, quarterly_data_hash: str, company_n
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def cached_financials(ticker: str) -> tuple:
-    """Cached version of get_financials."""
-    fallback = (pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
+    """Cached version of get_financial_data with provider/error metadata."""
+    fmp_api_key = _env_or_secret("FMP_API_KEY", section_name="fmp") or None
+    fallback = (
+        pd.DataFrame(),
+        pd.DataFrame(),
+        pd.DataFrame(),
+        pd.DataFrame(),
+        "Error",
+        f"Financial statement fetch timed out after {FINANCIALS_TIMEOUT_SECONDS}s.",
+    )
     result = _call_with_timeout(
-        get_financials,
+        get_financial_data,
         ticker,
+        fmp_api_key,
         timeout_seconds=FINANCIALS_TIMEOUT_SECONDS,
         fallback=fallback,
     )
-    if not isinstance(result, tuple) or len(result) != 4:
+    if not isinstance(result, tuple):
         return fallback
-    return result
+    if len(result) == 6:
+        return result
+    if len(result) == 4:
+        return result + ("Yahoo Finance", None)
+    return fallback
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def cached_latest_date_info(ticker: str) -> dict:
@@ -4197,6 +4210,8 @@ if 'last_restore_key' not in st.session_state:
     st.session_state.last_restore_key = None
 if 'cache_restore_notice' not in st.session_state:
     st.session_state.cache_restore_notice = ""
+if 'financials_load_notice' not in st.session_state:
+    st.session_state.financials_load_notice = ""
 if 'ticker_dropdown' not in st.session_state:
     last_selected = _normalize_ticker(st.session_state.ui_cache.get("last_selected_ticker", DEFAULT_TICKER))
     library = st.session_state.ticker_library
@@ -4230,6 +4245,7 @@ def reset_analysis():
     st.session_state.forecast_just_generated = False
     st.session_state.ai_outlook_error = None
     st.session_state.cache_restore_notice = ""
+    st.session_state.financials_load_notice = ""
     st.session_state.last_restore_key = None
     # Reset DCF assumptions so they get re-calculated for new ticker
     st.session_state.dcf_wacc = None
@@ -4942,11 +4958,18 @@ with st.sidebar:
                     selected_end_date,
                 )
                 with st.spinner(f"Loading {ticker}..."):
-                    inc, bal, cf, qcf = cached_financials(ticker)
-                    if not inc.empty:
+                    inc, bal, cf, qcf, financials_source, financials_warning = cached_financials(ticker)
+                    analysis = cached_quarterly_analysis(ticker, num_quarters, selected_end_date)
+                    quarterly_data = analysis.get("historical_trends", {}).get("quarterly_data", [])
+                    analysis_errors = analysis.get("errors", []) if isinstance(analysis, dict) else []
+
+                    has_statement_data = not inc.empty
+                    has_quarterly_data = bool(quarterly_data)
+
+                    if has_statement_data or has_quarterly_data:
                         st.session_state.financials = {"income": inc, "balance": bal, "cashflow": cf, "quarterly_cashflow": qcf}
                         st.session_state.ticker = ticker
-                        st.session_state.metrics = calculate_metrics(inc, bal)
+                        st.session_state.metrics = calculate_metrics(inc, bal) if has_statement_data else {}
                         st.session_state.config_num_quarters = num_quarters
                         st.session_state.num_quarters = num_quarters
                         st.session_state.end_date = selected_end_date
@@ -4958,11 +4981,7 @@ with st.sidebar:
                         st.session_state.ui_cache = cache
                         save_ui_cache(cache)
 
-                        # Auto-run quarterly analysis (cached) with user-selected end date
-                        analysis = cached_quarterly_analysis(ticker, num_quarters, selected_end_date)
                         st.session_state.quarterly_analysis = analysis
-                        # Calculate comprehensive analysis (DuPont + DCF)
-                        quarterly_data = analysis.get("historical_trends", {}).get("quarterly_data", [])
                         st.session_state.momentum_display_quarters = min(
                             max(1, len(quarterly_data)),
                             max(4, num_quarters)
@@ -4974,7 +4993,17 @@ with st.sidebar:
                             ticker,
                             cf,
                             qcf
-                        )
+                        ) if has_statement_data else {}
+
+                        partial_notice = ""
+                        if not has_statement_data and has_quarterly_data:
+                            partial_notice = (
+                                "Loaded quarterly analysis, but annual financial statements were unavailable "
+                                f"from {financials_source or 'the upstream provider'}. Some metrics and DuPont-style views may be limited."
+                            )
+                        elif financials_warning and has_statement_data:
+                            partial_notice = str(financials_warning)
+                        st.session_state.financials_load_notice = partial_notice
 
                         # Restore cached per-context DCF / AI outputs (if available)
                         restored = _restore_cached_results_for_context(ticker, selected_end_date, num_quarters)
@@ -4989,7 +5018,7 @@ with st.sidebar:
                         else:
                             st.session_state.cache_restore_notice = ""
                             st.session_state.last_restore_key = None
-                        
+
                         # Show what was loaded
                         most_recent = analysis.get("historical_trends", {}).get("most_recent_quarter", {})
                         next_q = analysis.get("next_forecast_quarter", {})
@@ -5000,7 +5029,15 @@ with st.sidebar:
                         else:
                             st.success(f"Loaded {ticker}")
                     else:
-                        st.error("Failed to fetch data.")
+                        error_parts = []
+                        if financials_warning:
+                            error_parts.append(str(financials_warning))
+                        if analysis_errors:
+                            error_parts.append(str(analysis_errors[0]))
+                        if financials_source and financials_source != "Error":
+                            error_parts.append(f"Statement source attempted: {financials_source}.")
+                        error_message = " ".join(part for part in error_parts if part).strip() or "Failed to fetch data."
+                        st.error(error_message)
 
     st.divider()
     st.markdown('<div class="sidebar-section-label">Help</div>', unsafe_allow_html=True)
@@ -5078,6 +5115,10 @@ if st.session_state.quarterly_analysis:
   <div class="disclaimer-text">AI-generated outputs may contain mistakes. This is not investment advice. Results are highly dependent on assumptions and input data quality.</div>
 </div>
     """, unsafe_allow_html=True)
+
+    financials_load_notice = str(st.session_state.get("financials_load_notice", "") or "").strip()
+    if financials_load_notice:
+        st.warning(financials_load_notice)
 
     # Top context strip
     _market_data = analysis.get("market_data", {})
