@@ -90,7 +90,19 @@ class YahooQueryFallbackTicker:
         )
 
 
+class FakeResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
+
+
 def test_fetch_consensus_estimates_handles_none_info(monkeypatch):
+    monkeypatch.delenv("FMP_API_KEY", raising=False)
     monkeypatch.setattr("engine.get_yf_ticker", lambda ticker, use_cache=False: EmptyConsensusTicker())
 
     result = fetch_consensus_estimates("MSFT", "FY2026 Q1")
@@ -103,6 +115,7 @@ def test_fetch_consensus_estimates_handles_none_info(monkeypatch):
 
 
 def test_fetch_consensus_estimates_uses_partial_data_without_error(monkeypatch):
+    monkeypatch.delenv("FMP_API_KEY", raising=False)
     monkeypatch.setattr("engine.get_yf_ticker", lambda ticker, use_cache=False: PartialConsensusTicker())
 
     result = fetch_consensus_estimates("MSFT", "FY2026 Q1")
@@ -115,6 +128,7 @@ def test_fetch_consensus_estimates_uses_partial_data_without_error(monkeypatch):
 
 
 def test_fetch_consensus_estimates_handles_info_property_error(monkeypatch):
+    monkeypatch.delenv("FMP_API_KEY", raising=False)
     monkeypatch.setattr("engine.get_yf_ticker", lambda ticker, use_cache=False: ExplodingInfoTicker())
 
     result = fetch_consensus_estimates("AAPL", "FY2026 Q1")
@@ -125,6 +139,7 @@ def test_fetch_consensus_estimates_handles_info_property_error(monkeypatch):
 
 
 def test_fetch_consensus_estimates_falls_back_to_yahooquery(monkeypatch):
+    monkeypatch.delenv("FMP_API_KEY", raising=False)
     monkeypatch.setattr("engine.get_yf_ticker", lambda ticker, use_cache=False: EmptyConsensusTicker())
     monkeypatch.setattr("engine.YQTicker", YahooQueryFallbackTicker)
 
@@ -136,5 +151,70 @@ def test_fetch_consensus_estimates_falls_back_to_yahooquery(monkeypatch):
     assert result["full_year"]["revenue_estimate"] == "$318.00B"
     assert result["price_targets"]["average"] == "$594.62"
     assert result["analyst_coverage"]["num_analysts"] == 57
-    assert result["source"] == "Yahoo Finance (yfinance + yahooquery fallback)"
+    assert result["source"] == "Yahoo Finance (yahooquery)"
+    assert "warning" not in result
+
+
+def test_fetch_consensus_estimates_uses_fmp_when_available(monkeypatch):
+    def fake_requests_get(url, timeout=10):
+        if "analyst-estimates" in url and "period=quarter" in url:
+            return FakeResponse(
+                [
+                    {
+                        "date": "2026-03-31",
+                        "estimatedRevenueAvg": 81_360_000_000,
+                        "estimatedEpsAvg": 4.09,
+                        "numberAnalystsEstimatedRevenue": 57,
+                    }
+                ]
+            )
+        if "analyst-estimates" in url and "period=annual" in url:
+            return FakeResponse(
+                [
+                    {
+                        "date": "2026-06-30",
+                        "estimatedRevenueAvg": 318_000_000_000,
+                        "estimatedEpsAvg": 15.30,
+                    }
+                ]
+            )
+        if "price-target-consensus" in url:
+            return FakeResponse(
+                [
+                    {
+                        "targetConsensus": 594.62,
+                        "targetHigh": 650.00,
+                        "targetLow": 500.00,
+                        "analystCount": 57,
+                    }
+                ]
+            )
+        if "grades-consensus" in url:
+            return FakeResponse(
+                [
+                    {
+                        "strongBuy": 18,
+                        "buy": 21,
+                        "hold": 15,
+                        "sell": 3,
+                        "strongSell": 0,
+                    }
+                ]
+            )
+        raise AssertionError(url)
+
+    monkeypatch.setattr("engine.get_yf_ticker", lambda ticker, use_cache=False: EmptyConsensusTicker())
+    monkeypatch.setattr("engine.requests.get", fake_requests_get)
+    monkeypatch.setattr("engine.YQTicker", None)
+
+    result = fetch_consensus_estimates("MSFT", "FY2026 Q1", fmp_api_key="test-key")
+
+    assert "error" not in result
+    assert result["next_quarter"]["revenue_estimate"] == "$81.36B"
+    assert result["next_quarter"]["eps_estimate"] == "$4.09"
+    assert result["full_year"]["revenue_estimate"] == "$318.00B"
+    assert result["price_targets"]["average"] == "$594.62"
+    assert result["analyst_coverage"]["num_analysts"] == 57
+    assert result["analyst_coverage"]["buy_ratings"] == 39
+    assert result["source"].startswith("Financial Modeling Prep")
     assert "warning" not in result

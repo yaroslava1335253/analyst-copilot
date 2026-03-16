@@ -28,10 +28,11 @@ from dotenv import load_dotenv
 # Load API keys from .env file (if exists)
 load_dotenv()
 try:
-    if not os.environ.get("GEMINI_API_KEY"):
-        secret_key = st.secrets.get("GEMINI_API_KEY")
-        if secret_key:
-            os.environ["GEMINI_API_KEY"] = str(secret_key)
+    for secret_name in ("GEMINI_API_KEY", "FMP_API_KEY"):
+        if not os.environ.get(secret_name):
+            secret_key = st.secrets.get(secret_name)
+            if secret_key:
+                os.environ[secret_name] = str(secret_key)
 except Exception:
     # st.secrets is not always available locally.
     pass
@@ -1422,6 +1423,7 @@ def cached_quarterly_analysis(
 ) -> dict:
     """Cached version of analyze_quarterly_trends to avoid API rate limits."""
     _ = history_source_version  # cache-key salt when quarterly history sourcing logic changes
+    fmp_api_key = _env_or_secret("FMP_API_KEY", section_name="fmp") or None
     fallback = {
         "ticker": ticker,
         "analysis_date": datetime.now().strftime("%Y-%m-%d"),
@@ -1437,6 +1439,7 @@ def cached_quarterly_analysis(
         ticker,
         num_quarters,
         end_date,
+        fmp_api_key,
         timeout_seconds=QUARTERLY_ANALYSIS_TIMEOUT_SECONDS,
         fallback=fallback,
     )

@@ -1641,7 +1641,12 @@ def get_extended_financials_fmp(ticker: str, fmp_api_key: str, statement_type: s
     return pd.DataFrame()
 
 
-def analyze_quarterly_trends(ticker_symbol: str, num_quarters: int = 8, end_date: str = None) -> dict:
+def analyze_quarterly_trends(
+    ticker_symbol: str,
+    num_quarters: int = 8,
+    end_date: str = None,
+    fmp_api_key: str = None,
+) -> dict:
     """
     Analyzes historical quarterly trends and fetches consensus estimates.
     Uses FMP extended quarterly history when FMP_API_KEY is available, otherwise Yahoo Finance.
@@ -2121,6 +2126,7 @@ def analyze_quarterly_trends(ticker_symbol: str, num_quarters: int = 8, end_date
             ticker_symbol,
             next_q_label,
             include_qualitative=False,
+            fmp_api_key=fmp_api_key,
         )
         
     except Exception as e:
@@ -2133,6 +2139,7 @@ def fetch_consensus_estimates(
     ticker_symbol: str,
     next_quarter_label: str = "next quarter",
     include_qualitative: bool = False,
+    fmp_api_key: str = None,
 ) -> dict:
     """
     Fetches consensus analyst estimates directly from Yahoo Finance via yfinance.
@@ -2142,6 +2149,8 @@ def fetch_consensus_estimates(
         ticker_symbol: Stock ticker
         next_quarter_label: Label for the upcoming quarter (e.g., "FY2026 Q3")
     """
+    fmp_api_key = str(fmp_api_key or os.getenv("FMP_API_KEY") or "").strip() or None
+
     def _has_value(value) -> bool:
         return value is not None and pd.notna(value)
 
@@ -2168,6 +2177,7 @@ def fetch_consensus_estimates(
     def _build_consensus_result(
         *,
         source_label: str,
+        source_url: str = "",
         next_q_revenue=None,
         next_q_eps=None,
         full_year_revenue=None,
@@ -2187,14 +2197,14 @@ def fetch_consensus_estimates(
                 "eps_estimate": format_price(next_q_eps) if _has_value(next_q_eps) else "N/A",
                 "quarter_label": f"{next_quarter_label} (Est.)",
                 "source": source_label,
-                "source_url": f"https://finance.yahoo.com/quote/{ticker_symbol}/analysis"
+                "source_url": source_url
             },
             "full_year": {
                 "revenue_estimate": format_currency(full_year_revenue) if _has_value(full_year_revenue) else "N/A",
                 "eps_estimate": format_price(full_year_eps) if _has_value(full_year_eps) else "N/A",
                 "fiscal_year": "Current FY",
                 "source": source_label,
-                "source_url": f"https://finance.yahoo.com/quote/{ticker_symbol}/analysis"
+                "source_url": source_url
             },
             "analyst_coverage": {
                 "num_analysts": total_ratings if total_ratings > 0 else _safe_int(num_analysts),
@@ -2203,19 +2213,19 @@ def fetch_consensus_estimates(
                 "sell_ratings": int(sell_ratings or 0),
                 "price_target_analysts": _safe_int(num_analysts),
                 "source": source_label,
-                "source_url": f"https://finance.yahoo.com/quote/{ticker_symbol}/analysis"
+                "source_url": source_url
             },
             "price_targets": {
                 "average": format_price(target_mean),
                 "high": format_price(target_high),
                 "low": format_price(target_low),
                 "source": source_label,
-                "source_url": f"https://finance.yahoo.com/quote/{ticker_symbol}/analysis"
+                "source_url": source_url
             },
             "citations": [
                 {
-                    "source_name": "Yahoo Finance",
-                    "url": f"https://finance.yahoo.com/quote/{ticker_symbol}/analysis",
+                    "source_name": source_label,
+                    "url": source_url,
                     "data_type": "EPS & Revenue Estimates, Analyst Ratings",
                     "access_date": "current"
                 }
@@ -2256,14 +2266,231 @@ def fetch_consensus_estimates(
             merged[section] = base
 
         if _consensus_has_any_data(secondary):
-            merged["source"] = "Yahoo Finance (yfinance + yahooquery fallback)"
+            primary_source = str(primary.get("source", "") or "").strip()
+            secondary_source = str(secondary.get("source", "") or "").strip()
+            merged["source"] = " + ".join(part for part in [primary_source, secondary_source] if part and part not in primary_source)
             citations = primary.get("citations", []) if isinstance(primary.get("citations", []), list) else []
-            merged["citations"] = citations
+            extra_citations = secondary.get("citations", []) if isinstance(secondary.get("citations", []), list) else []
+            merged["citations"] = citations + [cite for cite in extra_citations if cite not in citations]
             if secondary.get("warning") and not _consensus_has_any_data(merged):
                 merged["warning"] = secondary.get("warning")
             else:
                 merged.pop("warning", None)
         return merged
+
+    def _fmp_request_json(url: str):
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        payload = response.json()
+        if isinstance(payload, dict):
+            message = payload.get("Error Message") or payload.get("error") or payload.get("message")
+            if isinstance(message, str) and message.strip():
+                raise ValueError(message.strip())
+        return payload
+
+    def _extract_first_record(payload):
+        if isinstance(payload, list):
+            for item in payload:
+                if isinstance(item, dict):
+                    return item
+            return {}
+        if isinstance(payload, dict):
+            if "symbol" in payload or "date" in payload:
+                return payload
+            for value in payload.values():
+                if isinstance(value, list):
+                    for item in value:
+                        if isinstance(item, dict):
+                            return item
+        return {}
+
+    def _extract_records(payload) -> list[dict]:
+        if isinstance(payload, list):
+            return [item for item in payload if isinstance(item, dict)]
+        if isinstance(payload, dict):
+            if "symbol" in payload or "date" in payload:
+                return [payload]
+            for value in payload.values():
+                if isinstance(value, list):
+                    return [item for item in value if isinstance(item, dict)]
+        return []
+
+    def _pick_record_by_date(records: list[dict], *, future_bias: bool) -> dict:
+        if not records:
+            return {}
+        parsed_rows = []
+        now_ts = pd.Timestamp.now(tz="UTC").tz_localize(None).normalize()
+        for index, record in enumerate(records):
+            raw_date = (
+                record.get("date")
+                or record.get("fiscalDateEnding")
+                or record.get("fiscalDate")
+                or record.get("publishedDate")
+            )
+            parsed = pd.to_datetime(raw_date, errors="coerce") if raw_date else pd.NaT
+            if not pd.isna(parsed) and getattr(parsed, "tzinfo", None) is not None:
+                parsed = parsed.tz_localize(None)
+            parsed_rows.append((record, parsed, index))
+
+        dated_rows = [row for row in parsed_rows if not pd.isna(row[1])]
+        if future_bias and dated_rows:
+            future_rows = [row for row in dated_rows if row[1].normalize() >= now_ts]
+            if future_rows:
+                future_rows.sort(key=lambda row: row[1])
+                return future_rows[0][0]
+            dated_rows.sort(key=lambda row: row[1], reverse=True)
+            return dated_rows[0][0]
+        if dated_rows:
+            dated_rows.sort(key=lambda row: row[1])
+            return dated_rows[0][0]
+        return records[0]
+
+    def _pick_value(record: dict, *keys):
+        for key in keys:
+            if not isinstance(record, dict):
+                continue
+            value = record.get(key)
+            if _has_value(value):
+                return value
+        return None
+
+    def _fetch_consensus_estimates_fmp() -> dict | None:
+        if not fmp_api_key:
+            return None
+
+        docs_base = "https://site.financialmodelingprep.com/developer/docs"
+        analyst_url = (
+            f"https://financialmodelingprep.com/stable/analyst-estimates"
+            f"?symbol={ticker_symbol}&period=quarter&page=0&limit=8&apikey={fmp_api_key}"
+        )
+        annual_url = (
+            f"https://financialmodelingprep.com/stable/analyst-estimates"
+            f"?symbol={ticker_symbol}&period=annual&page=0&limit=4&apikey={fmp_api_key}"
+        )
+        target_url = (
+            f"https://financialmodelingprep.com/stable/price-target-consensus"
+            f"?symbol={ticker_symbol}&apikey={fmp_api_key}"
+        )
+        grades_url = (
+            f"https://financialmodelingprep.com/stable/grades-consensus"
+            f"?symbol={ticker_symbol}&apikey={fmp_api_key}"
+        )
+
+        try:
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                quarter_future = executor.submit(_fmp_request_json, analyst_url)
+                annual_future = executor.submit(_fmp_request_json, annual_url)
+                target_future = executor.submit(_fmp_request_json, target_url)
+                grades_future = executor.submit(_fmp_request_json, grades_url)
+
+                quarter_payload = quarter_future.result()
+                annual_payload = annual_future.result()
+                target_payload = target_future.result()
+                grades_payload = grades_future.result()
+        except Exception:
+            return None
+
+        quarter_record = _pick_record_by_date(_extract_records(quarter_payload), future_bias=True)
+        annual_record = _pick_record_by_date(_extract_records(annual_payload), future_bias=True)
+        target_record = _extract_first_record(target_payload)
+        grades_record = _extract_first_record(grades_payload)
+
+        next_q_revenue = _pick_value(
+            quarter_record,
+            "estimatedRevenueAvg",
+            "revenueAvg",
+            "revenueAverage",
+            "estimatedRevenue",
+        )
+        next_q_eps = _pick_value(
+            quarter_record,
+            "estimatedEpsAvg",
+            "epsAvg",
+            "epsAverage",
+            "estimatedEPSAvg",
+        )
+        full_year_revenue = _pick_value(
+            annual_record,
+            "estimatedRevenueAvg",
+            "revenueAvg",
+            "revenueAverage",
+            "estimatedRevenue",
+        )
+        full_year_eps = _pick_value(
+            annual_record,
+            "estimatedEpsAvg",
+            "epsAvg",
+            "epsAverage",
+            "estimatedEPSAvg",
+        )
+
+        analyst_count = _safe_int(
+            _pick_value(
+                target_record,
+                "analystCount",
+                "numberOfAnalystOpinions",
+                "numberAnalysts",
+                "numberOfAnalysts",
+            )
+            or _pick_value(
+                quarter_record,
+                "numberAnalystsEstimatedRevenue",
+                "numberOfAnalystsEstimatedRevenue",
+                "numberAnalystsRevenue",
+                "numberOfAnalystsRevenue",
+                "numberAnalystsEstimatedEps",
+                "numberOfAnalystsEstimatedEps",
+            )
+        )
+
+        strong_buy = _safe_int(_pick_value(grades_record, "strongBuy", "strong_buy")) or 0
+        buy = _safe_int(_pick_value(grades_record, "buy", "buys")) or 0
+        hold = _safe_int(_pick_value(grades_record, "hold", "holds")) or 0
+        sell = _safe_int(_pick_value(grades_record, "sell", "sells")) or 0
+        strong_sell = _safe_int(_pick_value(grades_record, "strongSell", "strong_sell")) or 0
+
+        result = _build_consensus_result(
+            source_label="Financial Modeling Prep",
+            source_url=f"{docs_base}/stable/analyst-estimates",
+            next_q_revenue=next_q_revenue,
+            next_q_eps=next_q_eps,
+            full_year_revenue=full_year_revenue,
+            full_year_eps=full_year_eps,
+            target_mean=_pick_value(target_record, "targetConsensus", "targetMedian", "targetMean"),
+            target_high=_pick_value(target_record, "targetHigh", "targetHighPrice"),
+            target_low=_pick_value(target_record, "targetLow", "targetLowPrice"),
+            num_analysts=analyst_count,
+            buy_ratings=strong_buy + buy,
+            hold_ratings=hold,
+            sell_ratings=sell + strong_sell,
+        )
+        result["next_quarter"]["source_url"] = f"{docs_base}/stable/analyst-estimates"
+        result["full_year"]["source_url"] = f"{docs_base}/stable/analyst-estimates"
+        result["analyst_coverage"]["source_url"] = f"{docs_base}/stable/grades-consensus"
+        result["price_targets"]["source_url"] = f"{docs_base}/stable/price-target-consensus"
+        result["citations"] = [
+            {
+                "source_name": "Financial Modeling Prep",
+                "url": f"{docs_base}/stable/analyst-estimates",
+                "data_type": "Analyst revenue and EPS estimates",
+                "access_date": "current",
+            },
+            {
+                "source_name": "Financial Modeling Prep",
+                "url": f"{docs_base}/stable/price-target-consensus",
+                "data_type": "Analyst price target consensus",
+                "access_date": "current",
+            },
+            {
+                "source_name": "Financial Modeling Prep",
+                "url": f"{docs_base}/stable/grades-consensus",
+                "data_type": "Analyst ratings consensus",
+                "access_date": "current",
+            },
+        ]
+        if not _consensus_has_any_data(result):
+            result["warning"] = "Financial Modeling Prep did not return analyst consensus data for this run."
+        return result
 
     def _extract_yq_symbol_payload(payload):
         if not isinstance(payload, dict):
@@ -2366,6 +2593,7 @@ def fetch_consensus_estimates(
 
             fallback_result = _build_consensus_result(
                 source_label="Yahoo Finance (yahooquery)",
+                source_url=f"https://finance.yahoo.com/quote/{ticker_symbol}/analysis",
                 next_q_revenue=next_q_rev,
                 next_q_eps=next_q_eps,
                 full_year_revenue=full_year_rev,
@@ -2474,6 +2702,7 @@ def fetch_consensus_estimates(
 
         result = _build_consensus_result(
             source_label="Yahoo Finance (yfinance)",
+            source_url=f"https://finance.yahoo.com/quote/{ticker_symbol}/analysis",
             next_q_revenue=next_q_revenue,
             next_q_eps=next_q_eps,
             full_year_revenue=full_year_revenue,
@@ -2486,12 +2715,16 @@ def fetch_consensus_estimates(
             hold_ratings=hold_ratings,
             sell_ratings=sell_ratings,
         )
+        primary_result = _fetch_consensus_estimates_fmp()
+        if isinstance(primary_result, dict) and _consensus_has_any_data(primary_result):
+            result = _merge_consensus_results(primary_result, result)
         if _needs_secondary_consensus_source(result):
             fallback_result = _fetch_consensus_estimates_yahooquery()
             if isinstance(fallback_result, dict):
                 result = _merge_consensus_results(result, fallback_result)
         if not _consensus_has_any_data(result):
-            result["warning"] = "Yahoo Finance did not return analyst consensus data for this run."
+            provider_name = "Financial Modeling Prep and Yahoo Finance" if fmp_api_key else "Yahoo Finance"
+            result["warning"] = f"{provider_name} did not return analyst consensus data for this run."
         
         # Optional qualitative summary using AI (disabled for initial-load performance).
         try:
