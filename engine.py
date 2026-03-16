@@ -87,7 +87,9 @@ def get_financials(ticker_symbol: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.D
     Returns: (income_stmt, balance_sheet, cash_flow, quarterly_cash_flow)
     """
     try:
-        stock = get_yf_ticker(ticker_symbol)
+        # Statement endpoints are fetched from a fresh client because cached yfinance
+        # ticker instances can retain stale empty frames across repeated requests.
+        stock = get_yf_ticker(ticker_symbol, use_cache=False)
         income_statement = stock.income_stmt
         balance_sheet = stock.balance_sheet
         cash_flow = stock.cashflow
@@ -1343,7 +1345,7 @@ def _get_quarterly_income_history(ticker_symbol: str, max_quarters: int = 20) ->
 
     yahoo_quarterly_income = pd.DataFrame()
     try:
-        stock = get_yf_ticker(ticker_symbol)
+        stock = get_yf_ticker(ticker_symbol, use_cache=False)
         yahoo_quarterly_income = stock.quarterly_income_stmt
     except Exception:
         yahoo_quarterly_income = pd.DataFrame()
@@ -1499,7 +1501,7 @@ def get_financial_data(ticker: str, fmp_api_key: str = None) -> tuple:
         warning_message = "⚠️ Using limited yfinance data (5-8 quarters). For accurate YoY growth calculations based on 12+ quarters, provide an FMP API key in the sidebar."
     
     try:
-        stock = get_yf_ticker(ticker)
+        stock = get_yf_ticker(ticker, use_cache=False)
         income_stmt = stock.quarterly_income_stmt
         balance_sheet = stock.quarterly_balance_sheet
         cash_flow = stock.quarterly_cashflow
@@ -2413,7 +2415,7 @@ def generate_independent_forecast(quarterly_analysis: dict, company_name: str = 
     # This is critical for understanding CapEx ramps vs FCF compression
     cash_flow_context = ""
     try:
-        stock = get_yf_ticker(ticker)
+        stock = get_yf_ticker(ticker, use_cache=False)
         qcf = stock.quarterly_cashflow
         
         if qcf is not None and not qcf.empty:

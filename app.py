@@ -38,7 +38,7 @@ except Exception:
 import pandas as pd
 import altair as alt
 import json
-from engine import get_financial_data, run_structured_prompt, calculate_metrics, run_chat, analyze_quarterly_trends, generate_independent_forecast, get_latest_date_info, get_available_report_dates, calculate_comprehensive_analysis
+from engine import get_financials, run_structured_prompt, calculate_metrics, run_chat, analyze_quarterly_trends, generate_independent_forecast, get_latest_date_info, get_available_report_dates, calculate_comprehensive_analysis
 from data_adapter import DataAdapter, DataQualityMetadata, NormalizedFinancialSnapshot
 from dcf_engine import DCFEngine, DCFAssumptions
 from dcf_ui_adapter import DCFUIAdapter
@@ -1466,30 +1466,30 @@ def cached_independent_forecast(ticker: str, quarterly_data_hash: str, company_n
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def cached_financials(ticker: str) -> tuple:
-    """Cached version of get_financial_data with provider/error metadata."""
-    fmp_api_key = _env_or_secret("FMP_API_KEY", section_name="fmp") or None
+    """Cached version of the annual-statement loader with provider metadata."""
     fallback = (
         pd.DataFrame(),
         pd.DataFrame(),
         pd.DataFrame(),
         pd.DataFrame(),
-        "Error",
-        f"Financial statement fetch timed out after {FINANCIALS_TIMEOUT_SECONDS}s.",
+        "Yahoo Finance",
+        f"Annual financial statement fetch timed out after {FINANCIALS_TIMEOUT_SECONDS}s.",
     )
     result = _call_with_timeout(
-        get_financial_data,
+        get_financials,
         ticker,
-        fmp_api_key,
         timeout_seconds=FINANCIALS_TIMEOUT_SECONDS,
-        fallback=fallback,
+        fallback=fallback[:4],
     )
     if not isinstance(result, tuple):
         return fallback
-    if len(result) == 6:
-        return result
-    if len(result) == 4:
-        return result + ("Yahoo Finance", None)
-    return fallback
+    if len(result) != 4:
+        return fallback
+    income_stmt, balance_sheet, cash_flow, quarterly_cash_flow = result
+    warning = None
+    if income_stmt.empty:
+        warning = "Yahoo Finance returned empty annual statements for this ticker."
+    return income_stmt, balance_sheet, cash_flow, quarterly_cash_flow, "Yahoo Finance", warning
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def cached_latest_date_info(ticker: str) -> dict:

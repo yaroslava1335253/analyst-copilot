@@ -217,13 +217,14 @@ class DataAdapter:
     """Fetches and normalizes yfinance data with quality tracking."""
     
     def __init__(self, ticker: str):
-        self.ticker = ticker.upper()
+        self.ticker = str(ticker or "").strip().upper()
         self.snapshot = NormalizedFinancialSnapshot(self.ticker)
     
     def fetch(self) -> NormalizedFinancialSnapshot:
         """Fetch all available data from yfinance."""
         try:
-            stock = get_yf_ticker(self.ticker)
+            # Use a fresh client for statement-heavy reads to avoid stale DataFrames.
+            stock = get_yf_ticker(self.ticker, use_cache=False)
             
             # Step 1: Price and shares data
             self._fetch_price_and_shares(stock)
