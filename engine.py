@@ -2152,8 +2152,24 @@ def fetch_consensus_estimates(
         next_quarter_label: Label for the upcoming quarter (e.g., "FY2026 Q3")
     """
     try:
-        stock = get_yf_ticker(ticker_symbol)
+        stock = get_yf_ticker(ticker_symbol, use_cache=False)
         info = stock.info
+        if not isinstance(info, dict):
+            info = {}
+
+        def _safe_frame(value) -> pd.DataFrame:
+            return value if isinstance(value, pd.DataFrame) else pd.DataFrame()
+
+        def _has_value(value) -> bool:
+            return value is not None and pd.notna(value)
+
+        def _safe_int(value):
+            try:
+                if value is None or pd.isna(value):
+                    return None
+                return int(value)
+            except Exception:
+                return None
         
         # Get price targets from yfinance
         target_mean = info.get('targetMeanPrice')
@@ -2163,18 +2179,18 @@ def fetch_consensus_estimates(
         recommendation = info.get('recommendationKey', '')
         
         # Get earnings and revenue estimates
-        earnings_est = None
-        revenue_est = None
+        earnings_est = pd.DataFrame()
+        revenue_est = pd.DataFrame()
         try:
-            earnings_est = stock.earnings_estimate
-            revenue_est = stock.revenue_estimate
+            earnings_est = _safe_frame(stock.earnings_estimate)
+            revenue_est = _safe_frame(stock.revenue_estimate)
         except:
             pass
         
         # Get recommendations summary (buy/hold/sell)
-        rec_summary = None
+        rec_summary = pd.DataFrame()
         try:
-            rec_summary = stock.recommendations_summary
+            rec_summary = _safe_frame(stock.recommendations_summary)
         except:
             pass
         
@@ -2182,19 +2198,19 @@ def fetch_consensus_estimates(
         next_q_revenue = None
         next_q_eps = None
         next_q_analysts = None
-        if revenue_est is not None and not revenue_est.empty:
+        if not revenue_est.empty:
             try:
                 # 0q is current quarter estimate
                 if '0q' in revenue_est.index:
                     next_q_revenue = revenue_est.loc['0q', 'avg']
-                    next_q_analysts = int(revenue_est.loc['0q', 'numberOfAnalysts']) if 'numberOfAnalysts' in revenue_est.columns else None
+                    next_q_analysts = _safe_int(revenue_est.loc['0q', 'numberOfAnalysts']) if 'numberOfAnalysts' in revenue_est.columns else None
                 elif len(revenue_est) > 0:
                     next_q_revenue = revenue_est.iloc[0]['avg']
-                    next_q_analysts = int(revenue_est.iloc[0]['numberOfAnalysts']) if 'numberOfAnalysts' in revenue_est.columns else None
+                    next_q_analysts = _safe_int(revenue_est.iloc[0]['numberOfAnalysts']) if 'numberOfAnalysts' in revenue_est.columns else None
             except:
                 pass
         
-        if earnings_est is not None and not earnings_est.empty:
+        if not earnings_est.empty:
             try:
                 if '0q' in earnings_est.index:
                     next_q_eps = earnings_est.loc['0q', 'avg']
@@ -2206,7 +2222,7 @@ def fetch_consensus_estimates(
         # Parse full year estimates (0y = current year)
         full_year_revenue = None
         full_year_eps = None
-        if revenue_est is not None and not revenue_est.empty:
+        if not revenue_est.empty:
             try:
                 if '0y' in revenue_est.index:
                     full_year_revenue = revenue_est.loc['0y', 'avg']
@@ -2215,7 +2231,7 @@ def fetch_consensus_estimates(
             except:
                 pass
         
-        if earnings_est is not None and not earnings_est.empty:
+        if not earnings_est.empty:
             try:
                 if '0y' in earnings_est.index:
                     full_year_eps = earnings_est.loc['0y', 'avg']
@@ -2229,7 +2245,7 @@ def fetch_consensus_estimates(
         hold_ratings = 0
         sell_ratings = 0
         total_ratings = 0
-        if rec_summary is not None and not rec_summary.empty:
+        if not rec_summary.empty:
             try:
                 current = rec_summary.iloc[0]  # Most recent month
                 buy_ratings = int(current.get('strongBuy', 0) or 0) + int(current.get('buy', 0) or 0)
@@ -2241,14 +2257,14 @@ def fetch_consensus_estimates(
         
         # Format values
         def format_currency(val, is_billions=True):
-            if val is None:
+            if not _has_value(val):
                 return None
             if is_billions:
                 return f"${val/1e9:.2f}B"
             return f"${val:.2f}"
         
         def format_price(val):
-            if val is None:
+            if not _has_value(val):
                 return None
             return f"${val:.2f}"
         
@@ -2256,25 +2272,25 @@ def fetch_consensus_estimates(
         # These are FORWARD estimates, not historical data
         result = {
             "next_quarter": {
-                "revenue_estimate": format_currency(next_q_revenue) if next_q_revenue else "N/A",
-                "eps_estimate": format_price(next_q_eps) if next_q_eps else "N/A",
+                "revenue_estimate": format_currency(next_q_revenue) if _has_value(next_q_revenue) else "N/A",
+                "eps_estimate": format_price(next_q_eps) if _has_value(next_q_eps) else "N/A",
                 "quarter_label": f"{next_quarter_label} (Est.)",
                 "source": "Yahoo Finance",
                 "source_url": f"https://finance.yahoo.com/quote/{ticker_symbol}/analysis"
             },
             "full_year": {
-                "revenue_estimate": format_currency(full_year_revenue) if full_year_revenue else "N/A",
-                "eps_estimate": format_price(full_year_eps) if full_year_eps else "N/A",
+                "revenue_estimate": format_currency(full_year_revenue) if _has_value(full_year_revenue) else "N/A",
+                "eps_estimate": format_price(full_year_eps) if _has_value(full_year_eps) else "N/A",
                 "fiscal_year": "Current FY",
                 "source": "Yahoo Finance",
                 "source_url": f"https://finance.yahoo.com/quote/{ticker_symbol}/analysis"
             },
             "analyst_coverage": {
-                "num_analysts": total_ratings if total_ratings > 0 else num_analysts,  # Use ratings total for consistency with buy/hold/sell
+                "num_analysts": total_ratings if total_ratings > 0 else (_safe_int(num_analysts) or next_q_analysts),  # Use ratings total for consistency with buy/hold/sell
                 "buy_ratings": buy_ratings,
                 "hold_ratings": hold_ratings,
                 "sell_ratings": sell_ratings,
-                "price_target_analysts": num_analysts,  # Separate field for price target analyst count
+                "price_target_analysts": _safe_int(num_analysts),  # Separate field for price target analyst count
                 "source": "Yahoo Finance",
                 "source_url": f"https://finance.yahoo.com/quote/{ticker_symbol}/analysis"
             },
@@ -2296,6 +2312,21 @@ def fetch_consensus_estimates(
             "source": "Yahoo Finance (yfinance)",
             "last_updated": "current"
         }
+
+        has_any_consensus_data = any(
+            (
+                result["next_quarter"]["revenue_estimate"] != "N/A",
+                result["next_quarter"]["eps_estimate"] != "N/A",
+                result["full_year"]["revenue_estimate"] != "N/A",
+                result["full_year"]["eps_estimate"] != "N/A",
+                bool(result["analyst_coverage"]["num_analysts"]),
+                bool(result["price_targets"]["average"]),
+                bool(result["price_targets"]["high"]),
+                bool(result["price_targets"]["low"]),
+            )
+        )
+        if not has_any_consensus_data:
+            result["warning"] = "Yahoo Finance did not return analyst consensus data for this run."
         
         # Optional qualitative summary using AI (disabled for initial-load performance).
         try:

@@ -6142,16 +6142,26 @@ if st.session_state.quarterly_analysis:
         targets = consensus.get("price_targets", {})
         consensus_citations = consensus.get("citations", [])
         qual_sources = consensus.get("qualitative_sources", [])
+        consensus_warning = str(consensus.get("warning", "") or "").strip()
+
+        has_next_estimate = any((next_q.get("revenue_estimate"), next_q.get("eps_estimate"))) and any(
+            value not in (None, "", "N/A") for value in (next_q.get("revenue_estimate"), next_q.get("eps_estimate"))
+        )
+        has_coverage = any((coverage.get("num_analysts"), coverage.get("buy_ratings"), coverage.get("hold_ratings"), coverage.get("sell_ratings")))
+        has_targets = any(value not in (None, "", "N/A") for value in (targets.get("low"), targets.get("average"), targets.get("high")))
+
+        if consensus_warning and not (has_next_estimate or has_coverage or has_targets):
+            st.info(consensus_warning)
 
         quarter_label = next_q.get("quarter_label") or next_forecast_label
         st.markdown(f"**{quarter_label} Estimates**")
         col_c1, col_c2, col_c3, col_c4 = st.columns(4)
         with col_c1:
-            st.metric("Revenue", next_q.get("revenue_estimate", "N/A"))
+            st.metric("Revenue", next_q.get("revenue_estimate") or "N/A")
         with col_c2:
-            st.metric("EPS", next_q.get("eps_estimate", "N/A"))
+            st.metric("EPS", next_q.get("eps_estimate") or "N/A")
         with col_c3:
-            st.metric("Analysts", coverage.get("num_analysts", "N/A"))
+            st.metric("Analysts", coverage.get("num_analysts") or "N/A")
         with col_c4:
             buy = coverage.get("buy_ratings", 0) or 0
             hold = coverage.get("hold_ratings", 0) or 0
@@ -6167,21 +6177,21 @@ if st.session_state.quarterly_analysis:
         if estimate_sources:
             st.caption(f"Source: {', '.join(estimate_sources)}")
 
-        if targets:
+        if has_targets:
             col_t1, col_t2, col_t3 = st.columns(3)
             with col_t1:
-                st.metric("Price Target (Low)", targets.get("low", "N/A"))
+                st.metric("Price Target (Low)", targets.get("low") or "N/A")
             with col_t2:
-                st.metric("Price Target (Avg)", targets.get("average", "N/A"))
+                st.metric("Price Target (Avg)", targets.get("average") or "N/A")
             with col_t3:
-                st.metric("Price Target (High)", targets.get("high", "N/A"))
+                st.metric("Price Target (High)", targets.get("high") or "N/A")
             if targets.get("source"):
                 st.caption(f"Price target source: {targets.get('source')}")
 
         market_data = analysis.get("market_data", {})
         shares_outstanding = market_data.get("shares_outstanding")
         current_market_cap = market_data.get("market_cap")
-        if targets and shares_outstanding:
+        if has_targets and shares_outstanding:
             avg_pt = parse_price_value(targets.get("average"))
             high_pt = parse_price_value(targets.get("high"))
             low_pt = parse_price_value(targets.get("low"))
@@ -6207,7 +6217,7 @@ if st.session_state.quarterly_analysis:
             with col_i3:
                 implied_high = high_pt * shares_outstanding if high_pt is not None else None
                 st.metric("Implied Value (High PT)", format_mcap(implied_high), delta=format_delta(implied_high))
-        elif targets and not shares_outstanding:
+        elif has_targets and not shares_outstanding:
             st.caption("Implied total value unavailable (shares outstanding missing).")
 
         qualitative = consensus.get("qualitative_summary")
