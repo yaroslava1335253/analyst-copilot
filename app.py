@@ -44,7 +44,7 @@ from dcf_engine import DCFEngine, DCFAssumptions
 from dcf_ui_adapter import DCFUIAdapter
 from pdf_export import build_summary_pdf
 from sources import SOURCE_CATALOG
-from yf_cache import get_yf_ticker
+from yf_cache import get_yf_info, get_yf_ticker
 
 UI_CACHE_VERSION = 2
 REPORT_DATES_CACHE_VERSION = "v5"
@@ -1504,7 +1504,7 @@ def cached_company_name(ticker: str) -> str:
         return ""
     try:
         def _fetch_info() -> dict:
-            return get_yf_ticker(normalized_ticker).info or {}
+            return get_yf_info(get_yf_ticker(normalized_ticker))
 
         info = _call_with_timeout(
             _fetch_info,

@@ -15,7 +15,7 @@ import pandas as pd
 import json
 from datetime import datetime, timezone
 from typing import Dict, Optional, Tuple, List
-from yf_cache import get_yf_ticker
+from yf_cache import get_yf_fast_info, get_yf_frame, get_yf_info, get_yf_ticker
 
 try:
     from yahooquery import Ticker as YQTicker
@@ -261,28 +261,11 @@ class DataAdapter:
     def _fetch_price_and_shares(self, stock):
         """Fetch current price, market cap, shares outstanding, and company classification."""
         try:
-            info = {}
-            fast_info = {}
-            info_error = None
-            fast_info_error = None
-
-            try:
-                raw_info = stock.info
-                if isinstance(raw_info, dict):
-                    info = raw_info
-            except Exception as exc:
-                info_error = exc
-
-            try:
-                raw_fast_info = stock.fast_info
-                if raw_fast_info:
-                    # yfinance may return a mapping-like object; convert safely.
-                    fast_info = dict(raw_fast_info)
-            except Exception as exc:
-                fast_info_error = exc
+            info = get_yf_info(stock)
+            fast_info = get_yf_fast_info(stock)
 
             # Store info for later use (e.g., analyst estimates)
-            self._ticker_info = info if isinstance(info, dict) else {}
+            self._ticker_info = info
 
             # Company classification (sector, industry, name)
             self.snapshot.company_name = info.get('longName') or info.get('shortName')
@@ -409,11 +392,6 @@ class DataAdapter:
                     notes="5-year monthly beta vs S&P 500 (Yahoo Finance)"
                 )
 
-            if info_error and not info:
-                self.snapshot.add_warning("PRICE_INFO_FALLBACK", f"info endpoint unavailable, used fallbacks: {str(info_error)}")
-            if fast_info_error and not fast_info:
-                self.snapshot.add_warning("PRICE_FASTINFO_UNAVAILABLE", f"fast_info endpoint unavailable: {str(fast_info_error)}")
-        
         except Exception as e:
             self.snapshot.add_warning("PRICE_FETCH_ERROR", f"Error fetching price/shares: {str(e)}")
     
@@ -421,7 +399,9 @@ class DataAdapter:
         """Fetch debt, cash, and other balance sheet items needed for EV."""
         try:
             # Try quarterly first, fallback to annual
-            balance_sheet = stock.quarterly_balance_sheet if not stock.quarterly_balance_sheet.empty else stock.balance_sheet
+            quarterly_balance_sheet = get_yf_frame(stock, "quarterly_balance_sheet")
+            annual_balance_sheet = get_yf_frame(stock, "balance_sheet")
+            balance_sheet = quarterly_balance_sheet if not quarterly_balance_sheet.empty else annual_balance_sheet
             
             if balance_sheet.empty:
                 self.snapshot.add_warning("NO_BALANCE_SHEET", "No balance sheet data available")
@@ -482,7 +462,7 @@ class DataAdapter:
                         value=total_debt,
                         units="USD",
                         period_end=str(most_recent_date)[:10],
-                        period_type="quarterly" if "quarterly" in str(type(stock.quarterly_balance_sheet)) else "annual",
+                        period_type="quarterly" if not quarterly_balance_sheet.empty else "annual",
                         source_path=f"balance_sheet[{', '.join(debt_sources)}]",
                         retrieved_at=_utc_now_iso(),
                         reliability_score=80,
@@ -512,7 +492,7 @@ class DataAdapter:
 
             if avg_debt is None:
                 try:
-                    quarterly_bs = stock.quarterly_balance_sheet
+                    quarterly_bs = quarterly_balance_sheet
                     if isinstance(quarterly_bs, pd.DataFrame) and not quarterly_bs.empty:
                         debt_values = []
                         if 'Total Debt' in quarterly_bs.index:
@@ -687,8 +667,8 @@ class DataAdapter:
         """Fetch operating cash flow and capex for TTM FCF."""
         try:
             # Prefer quarterly for TTM calculation
-            quarterly_cf = stock.quarterly_cashflow
-            annual_cf = stock.cashflow
+            quarterly_cf = get_yf_frame(stock, "quarterly_cashflow")
+            annual_cf = get_yf_frame(stock, "cashflow")
             
             # Build TTM CFO
             ttm_cfo = None
@@ -807,8 +787,8 @@ class DataAdapter:
     def _fetch_income_statement(self, stock):
         """Fetch revenue, EBITDA, operating income, net income, tax rate."""
         try:
-            quarterly_is = stock.quarterly_income_stmt
-            annual_is = stock.income_stmt
+            quarterly_is = get_yf_frame(stock, "quarterly_income_stmt")
+            annual_is = get_yf_frame(stock, "income_stmt")
             
             # Helper to fetch from quarterly first, then annual
             def fetch_line_item(line_item_name, quarterly=True):
@@ -903,7 +883,7 @@ class DataAdapter:
                     raise ValueError("yahooquery response invalid")
             except Exception as yq_err:
                 # FALLBACK 1: Use yfinance info['ebitda'] (Statistics page value)
-                info_ebitda = stock.info.get('ebitda')
+                info_ebitda = self._ticker_info.get('ebitda')
                 if info_ebitda is not None and info_ebitda > 0:
                     self.snapshot.ttm_ebitda = DataQualityMetadata(
                         value=info_ebitda,
@@ -1017,8 +997,7 @@ class DataAdapter:
     def _fetch_quarterly_history(self, stock):
         """Fetch quarterly history for trend analysis."""
         try:
-            quarterly_is = stock.quarterly_income_stmt
-            quarterly_cf = stock.quarterly_cashflow
+            quarterly_is = get_yf_frame(stock, "quarterly_income_stmt")
             
             if quarterly_is.empty:
                 self.snapshot.num_quarters_available = 0
@@ -1553,8 +1532,8 @@ class DataAdapter:
                 "+5y": 60,
             }
 
-            rev_est = stock.revenue_estimate
-            if rev_est is not None and not rev_est.empty:
+            rev_est = get_yf_frame(stock, "revenue_estimate")
+            if not rev_est.empty:
                 labels = [idx for idx in rev_est.index if _period_rank(idx) is not None]
                 labels = sorted(labels, key=lambda x: _period_rank(x))
                 for label in labels:
@@ -1582,8 +1561,8 @@ class DataAdapter:
             lt_reliability = 0
 
             try:
-                growth_est = stock.growth_estimates
-                if growth_est is not None and isinstance(growth_est, pd.DataFrame) and not growth_est.empty and "+5y" in growth_est.columns:
+                growth_est = get_yf_frame(stock, "growth_estimates")
+                if not growth_est.empty and "+5y" in growth_est.columns:
                     row_key = None
                     for candidate in ["stock", self.ticker]:
                         if candidate in growth_est.index:
@@ -1601,8 +1580,8 @@ class DataAdapter:
 
             if lt_growth is None:
                 try:
-                    earnings_trend = stock.earnings_trend
-                    if earnings_trend is not None and isinstance(earnings_trend, pd.DataFrame) and not earnings_trend.empty:
+                    earnings_trend = get_yf_frame(stock, "earnings_trend")
+                    if not earnings_trend.empty:
                         candidate_rate = None
                         if "+5y" in earnings_trend.index:
                             row = earnings_trend.loc["+5y"]

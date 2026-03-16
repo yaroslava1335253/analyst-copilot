@@ -2,7 +2,7 @@ import pandas as pd
 
 from data_adapter import DataAdapter
 from engine import get_financial_data, get_financials
-from yf_cache import clear_yf_ticker_cache, get_yf_ticker, normalize_yf_ticker
+from yf_cache import clear_yf_ticker_cache, get_yf_fast_info, get_yf_frame, get_yf_info, get_yf_ticker, normalize_yf_ticker
 
 
 class DummyTicker:
@@ -48,6 +48,49 @@ def test_get_yf_ticker_can_bypass_cache(monkeypatch):
 
     assert first is not second
     assert calls == ["AAPL", "AAPL"]
+
+
+def test_get_yf_info_handles_none_and_property_errors():
+    class NoneInfoTicker:
+        info = None
+
+    class ErrorInfoTicker:
+        @property
+        def info(self):
+            raise AttributeError("upstream broken")
+
+    assert get_yf_info(NoneInfoTicker()) == {}
+    assert get_yf_info(ErrorInfoTicker()) == {}
+
+
+def test_get_yf_fast_info_converts_mapping_like_values():
+    class MappingLike:
+        def __iter__(self):
+            yield ("lastPrice", 123.45)
+
+    class FastInfoTicker:
+        fast_info = MappingLike()
+
+    assert get_yf_fast_info(FastInfoTicker()) == {"lastPrice": 123.45}
+
+
+def test_get_yf_frame_handles_none_and_property_errors():
+    expected = pd.DataFrame({"latest": [1]})
+
+    class FrameTicker:
+        quarterly_income_stmt = expected
+
+    class NoneFrameTicker:
+        quarterly_income_stmt = None
+
+    class ErrorFrameTicker:
+        @property
+        def quarterly_income_stmt(self):
+            raise RuntimeError("broken frame")
+
+    assert get_yf_frame(FrameTicker(), "quarterly_income_stmt").equals(expected)
+    assert get_yf_frame(NoneFrameTicker(), "quarterly_income_stmt").empty
+    assert get_yf_frame(ErrorFrameTicker(), "quarterly_income_stmt").empty
 
 
 def test_get_financials_bypasses_shared_ticker_cache(monkeypatch):

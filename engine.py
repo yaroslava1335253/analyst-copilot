@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from industry_multiples import get_industry_multiple, DAMODARAN_SOURCE_URL, DAMODARAN_DATA_DATE
-from yf_cache import get_yf_ticker
+from yf_cache import get_yf_fast_info, get_yf_frame, get_yf_info, get_yf_ticker
 
 _genai_client: "genai.Client | None" = None
 _sec_ticker_cik_map_cache = None
@@ -90,10 +90,10 @@ def get_financials(ticker_symbol: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.D
         # Statement endpoints are fetched from a fresh client because cached yfinance
         # ticker instances can retain stale empty frames across repeated requests.
         stock = get_yf_ticker(ticker_symbol, use_cache=False)
-        income_statement = stock.income_stmt
-        balance_sheet = stock.balance_sheet
-        cash_flow = stock.cashflow
-        quarterly_cash_flow = stock.quarterly_cashflow
+        income_statement = get_yf_frame(stock, "income_stmt")
+        balance_sheet = get_yf_frame(stock, "balance_sheet")
+        cash_flow = get_yf_frame(stock, "cashflow")
+        quarterly_cash_flow = get_yf_frame(stock, "quarterly_cashflow")
         return income_statement, balance_sheet, cash_flow, quarterly_cash_flow
     except Exception as e:
         print(f"Error fetching data for {ticker_symbol}: {e}")
@@ -224,7 +224,7 @@ def calculate_comprehensive_analysis(
         if ticker_symbol:
             try:
                 stock = get_yf_ticker(ticker_symbol)
-                info = stock.info
+                info = get_yf_info(stock)
                 current_price = info.get('currentPrice') or info.get('regularMarketPrice')
                 shares_outstanding = info.get('sharesOutstanding')
                 current_market_cap = info.get('marketCap')
@@ -374,7 +374,7 @@ def calculate_comprehensive_analysis(
                 
                 if ticker_symbol:
                     try:
-                        stock_info = get_yf_ticker(ticker_symbol).info
+                        stock_info = get_yf_info(get_yf_ticker(ticker_symbol))
                         yf_industry = stock_info.get('industry')
                         yf_sector = stock_info.get('sector')
                         
@@ -1346,7 +1346,7 @@ def _get_quarterly_income_history(ticker_symbol: str, max_quarters: int = 20) ->
     yahoo_quarterly_income = pd.DataFrame()
     try:
         stock = get_yf_ticker(ticker_symbol, use_cache=False)
-        yahoo_quarterly_income = stock.quarterly_income_stmt
+        yahoo_quarterly_income = get_yf_frame(stock, "quarterly_income_stmt")
     except Exception:
         yahoo_quarterly_income = pd.DataFrame()
 
@@ -1502,9 +1502,9 @@ def get_financial_data(ticker: str, fmp_api_key: str = None) -> tuple:
     
     try:
         stock = get_yf_ticker(ticker, use_cache=False)
-        income_stmt = stock.quarterly_income_stmt
-        balance_sheet = stock.quarterly_balance_sheet
-        cash_flow = stock.quarterly_cashflow
+        income_stmt = get_yf_frame(stock, "quarterly_income_stmt")
+        balance_sheet = get_yf_frame(stock, "quarterly_balance_sheet")
+        cash_flow = get_yf_frame(stock, "quarterly_cashflow")
         quarterly_cash_flow = cash_flow.copy()
         return income_stmt, balance_sheet, cash_flow, quarterly_cash_flow, "Yahoo Finance", warning_message
     except Exception as e:
@@ -1676,22 +1676,8 @@ def analyze_quarterly_trends(ticker_symbol: str, num_quarters: int = 8, end_date
         company_name = ticker_symbol
         try:
             stock = get_yf_ticker(ticker_symbol)
-            stock_info = {}
-            fast_info = {}
-
-            try:
-                maybe_info = stock.info
-                if isinstance(maybe_info, dict):
-                    stock_info = maybe_info
-            except Exception:
-                stock_info = {}
-
-            try:
-                maybe_fast_info = stock.fast_info
-                if maybe_fast_info:
-                    fast_info = dict(maybe_fast_info)
-            except Exception:
-                fast_info = {}
+            stock_info = get_yf_info(stock)
+            fast_info = get_yf_fast_info(stock)
 
             current_price = (
                 stock_info.get('currentPrice')
@@ -2153,15 +2139,7 @@ def fetch_consensus_estimates(
     """
     try:
         stock = get_yf_ticker(ticker_symbol, use_cache=False)
-        try:
-            info = stock.info
-        except Exception:
-            info = {}
-        if not isinstance(info, dict):
-            info = {}
-
-        def _safe_frame(value) -> pd.DataFrame:
-            return value if isinstance(value, pd.DataFrame) else pd.DataFrame()
+        info = get_yf_info(stock)
 
         def _has_value(value) -> bool:
             return value is not None and pd.notna(value)
@@ -2185,15 +2163,15 @@ def fetch_consensus_estimates(
         earnings_est = pd.DataFrame()
         revenue_est = pd.DataFrame()
         try:
-            earnings_est = _safe_frame(stock.earnings_estimate)
-            revenue_est = _safe_frame(stock.revenue_estimate)
+            earnings_est = get_yf_frame(stock, "earnings_estimate")
+            revenue_est = get_yf_frame(stock, "revenue_estimate")
         except:
             pass
         
         # Get recommendations summary (buy/hold/sell)
         rec_summary = pd.DataFrame()
         try:
-            rec_summary = _safe_frame(stock.recommendations_summary)
+            rec_summary = get_yf_frame(stock, "recommendations_summary")
         except:
             pass
         
@@ -2450,7 +2428,7 @@ def generate_independent_forecast(quarterly_analysis: dict, company_name: str = 
     cash_flow_context = ""
     try:
         stock = get_yf_ticker(ticker, use_cache=False)
-        qcf = stock.quarterly_cashflow
+        qcf = get_yf_frame(stock, "quarterly_cashflow")
         
         if qcf is not None and not qcf.empty:
             def get_series(df, key):
