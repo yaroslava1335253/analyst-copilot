@@ -12,6 +12,7 @@ import os
 import re
 import html
 import math
+import hashlib
 import smtplib
 import ssl
 from collections.abc import Mapping
@@ -65,6 +66,7 @@ WACC_SLIDER_MIN_PCT = 0.5
 WACC_SLIDER_MAX_PCT = 20.0
 SNAPSHOT_SUGGESTION_VERSION = "v4_wacc_source_sync"
 DEFAULT_INITIAL_QUARTERS = 7
+AI_OUTLOOK_CACHE_VERSION = "v2"
 EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 URL_REGEX = re.compile(r"(?:https?://|www\.)[^\s<>()\[\]\"']+")
 EMOJI_SYMBOL_REGEX = re.compile(r"[\U0001F300-\U0001FAFF\u2600-\u27BF\uFE0E\uFE0F\u200D]+")
@@ -209,6 +211,16 @@ def _json_safe(value):
         except Exception:
             pass
     return str(value)
+
+
+def _build_ai_outlook_cache_key(quarterly_analysis: dict | None, dcf_data: dict | None) -> str:
+    payload = {
+        "version": AI_OUTLOOK_CACHE_VERSION,
+        "quarterly_analysis": _json_safe(quarterly_analysis or {}),
+        "dcf_data": _json_safe(dcf_data or {}),
+    }
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
 def _sanitize_ai_valuation_language(text: str) -> str:
@@ -1458,13 +1470,20 @@ def cached_available_dates(ticker: str, history_source_version: str = HISTORY_SO
     return result if isinstance(result, list) else []
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def cached_independent_forecast(ticker: str, quarterly_data_hash: str, company_name: str, dcf_data: dict = None) -> dict:
+def cached_independent_forecast(
+    ticker: str,
+    end_date: str,
+    num_quarters: int,
+    outlook_cache_key: str,
+    company_name: str,
+    dcf_data: dict = None,
+) -> dict:
     """
     Cached version of generate_independent_forecast.
-    quarterly_data_hash is used to bust cache if underlying data changes.
+    outlook_cache_key is used to bust cache if underlying analysis or DCF inputs change.
     """
-    # We need to re-fetch the analysis since we can't cache complex dicts as keys
-    analysis = cached_quarterly_analysis(ticker)
+    _ = outlook_cache_key  # cache-key salt when AI synthesis inputs change
+    analysis = cached_quarterly_analysis(ticker, num_quarters, end_date)
     return generate_independent_forecast(analysis, company_name, dcf_data)
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -6254,17 +6273,24 @@ if st.session_state.quarterly_analysis:
 
     has_existing_forecast = bool(st.session_state.get("independent_forecast"))
     outlook_button_label = "Regenerate Multi-Horizon Outlook" if has_existing_forecast else "Generate Multi-Horizon Outlook"
-    if st.button(outlook_button_label, type="primary", key="generate_outlook"):
+    if st.button(
+        outlook_button_label,
+        type="primary",
+        key="generate_outlook",
+        help="Reuses the cached outlook when the ticker, report date, quarterly context, and DCF inputs have not changed.",
+    ):
         with st.spinner("Analyzing data and generating multi-horizon outlook..."):
-            dcf_hash = str(hash(str(dcf_data_for_forecast.get("price_per_share", 0)))) if dcf_data_for_forecast else ""
-            # If a forecast already exists, include a nonce so rerun doesn't get stuck on a cached response.
-            rerun_nonce = str(datetime.utcnow().timestamp()) if has_existing_forecast else ""
-            data_hash = str(hash(str(st.session_state.quarterly_analysis.get("analysis_date", "")) + dcf_hash + rerun_nonce))
+            outlook_cache_key = _build_ai_outlook_cache_key(
+                st.session_state.get("quarterly_analysis"),
+                dcf_data_for_forecast,
+            )
             forecast = cached_independent_forecast(
                 ticker,
-                data_hash,
-                company_name=ticker,
-                dcf_data=dcf_data_for_forecast
+                st.session_state.get("end_date") or st.session_state.get("selected_end_date"),
+                int(st.session_state.get("num_quarters") or DEFAULT_INITIAL_QUARTERS),
+                outlook_cache_key,
+                company_name=_company_name_display,
+                dcf_data=dcf_data_for_forecast,
             )
             if isinstance(forecast, dict) and forecast.get("error"):
                 st.session_state.ai_outlook_error = str(forecast.get("error"))
