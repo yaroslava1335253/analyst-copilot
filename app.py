@@ -26,6 +26,14 @@ from urllib.parse import quote, urlparse
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
+# --- App Configuration ---
+st.set_page_config(
+    page_title="Analyst Co-Pilot",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
 # Load API keys from .env file (if exists)
 load_dotenv()
 try:
@@ -47,6 +55,23 @@ from dcf_ui_adapter import DCFUIAdapter
 from pdf_export import build_summary_pdf
 from sources import SOURCE_CATALOG
 from yf_cache import get_yf_info, get_yf_ticker
+
+_BOOT_DEBUG_ENABLED = os.getenv("ACP_BOOT_DEBUG") == "1"
+
+
+def _write_boot_log(message: str) -> None:
+    if not _BOOT_DEBUG_ENABLED:
+        return
+    log_line = f"[BOOT] {datetime.now().isoformat()} {message}\n"
+    try:
+        with Path("/tmp/acp_boot.log").open("a", encoding="utf-8") as log_file:
+            log_file.write(log_line)
+    except Exception:
+        pass
+    print(log_line.rstrip(), flush=True)
+
+
+_write_boot_log("imports_complete")
 
 UI_CACHE_VERSION = 2
 REPORT_DATES_CACHE_VERSION = "v5"
@@ -119,6 +144,7 @@ def _initial_contact_email() -> str:
 
 
 CONTACT_EMAIL_TO = _initial_contact_email()
+_write_boot_log("contact_email_ready")
 
 
 def _default_ui_cache() -> dict:
@@ -471,11 +497,80 @@ def build_context_key(ticker: str, end_date: str, num_quarters: int) -> str:
     return f"{_normalize_ticker(ticker)}|{end_date}|{int(num_quarters)}"
 
 
+ANALYSIS_VIEWS = {
+    "dashboard": {
+        "label": "Dashboard",
+        "summary": "Primary call, key growth signals, and a fast read on the setup.",
+    },
+    "deep_dive": {
+        "label": "Deep Dive",
+        "summary": "Model levers, assumptions, and operating momentum in one place.",
+    },
+    "compare": {
+        "label": "Compare",
+        "summary": "Cross-check your DCF against Street expectations and positioning.",
+    },
+    "reports": {
+        "label": "Reports",
+        "summary": "AI write-up, export actions, and supporting methodology.",
+    },
+}
+DEFAULT_ANALYSIS_VIEW = "dashboard"
+
+
+def _query_param_scalar(name: str) -> str | None:
+    try:
+        value = st.query_params.get(name)
+    except Exception:
+        return None
+
+    if isinstance(value, list):
+        value = value[0] if value else None
+
+    if value is None:
+        return None
+
+    text = str(value).strip()
+    return text or None
+
+
+def _normalize_analysis_view(value: str | None) -> str:
+    candidate = re.sub(r"[^a-z0-9_-]+", "-", str(value or "").strip().lower())
+    return candidate if candidate in ANALYSIS_VIEWS else DEFAULT_ANALYSIS_VIEW
+
+
+def _render_analysis_topbar(timestamp_text: str) -> None:
+    safe_timestamp_text = html.escape(str(timestamp_text))
+
+    st.markdown(
+        f"""
+<div id="analysis-topbar-anchor"></div>
+<div class="app-topbar">
+  <div class="app-topbar-brand">
+    <span class="app-wordmark">Analyst Co-Pilot</span>
+    <span class="app-version">Beta</span>
+  </div>
+  <div class="app-topbar-right">
+    <div class="app-topbar-time">{safe_timestamp_text}</div>
+  </div>
+</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def _clear_view_query_param() -> None:
     try:
         del st.query_params["view"]
     except Exception:
         pass
+
+
+def _widget_value_kwargs(key: str, fallback_value):
+    """Only pass an explicit widget default when Session State does not already own it."""
+    if key in st.session_state:
+        return {}
+    return {"value": fallback_value}
 
 
 def _queue_scroll_to_section(section_id: str) -> None:
@@ -3000,8 +3095,8 @@ def _show_user_guide_page():
   <div class="guide-card-title">How to Use It</div>
   <div class="guide-onboarding-grid">
     <div class="guide-onboarding-step"><span class="guide-onboarding-num">1</span><div><div class="guide-step-name">Select ticker and load data</div><div class="guide-step-desc">Choose symbol, ending report, then click <code>Load Data</code>.</div></div></div>
-    <div class="guide-onboarding-step"><span class="guide-onboarding-num">2</span><div><div class="guide-step-name">Set assumptions and run DCF</div><div class="guide-step-desc">In Step 02, adjust inputs and run <code>Run DCF Analysis</code>.</div></div></div>
-    <div class="guide-onboarding-step"><span class="guide-onboarding-num">3</span><div><div class="guide-step-name">Review valuation and diagnostics</div><div class="guide-step-desc">Check verdict, data quality, TV dominance, and method consistency.</div></div></div>
+    <div class="guide-onboarding-step"><span class="guide-onboarding-num">2</span><div><div class="guide-step-name">Read the dashboard first</div><div class="guide-step-desc">Use Dashboard for the general stock picture, momentum, and DuPont context.</div></div></div>
+    <div class="guide-onboarding-step"><span class="guide-onboarding-num">3</span><div><div class="guide-step-name">Set assumptions and run DCF</div><div class="guide-step-desc">In Deep Dive, adjust inputs, run <code>Run DCF Analysis</code>, and read the verdict at the top.</div></div></div>
     <div class="guide-onboarding-step"><span class="guide-onboarding-num">4</span><div><div class="guide-step-name">Generate AI synthesis last</div><div class="guide-step-desc">Use Step 05 only after DCF and diagnostics are complete.</div></div></div>
   </div>
 </div>
@@ -3029,9 +3124,9 @@ def _show_user_guide_page():
 <div class="guide-card">
   <div class="guide-card-title">What Each App Step Means</div>
   <ul class="guide-list">
-    <li><strong>Step 01:</strong> verdict from current assumptions.</li>
-    <li><strong>Step 02:</strong> controls and core valuation outputs.</li>
-    <li><strong>Step 03:</strong> historical operating context.</li>
+    <li><strong>Step 01:</strong> business momentum and DuPont context on Dashboard.</li>
+    <li><strong>Verdict:</strong> live valuation result at the top of Deep Dive after a rerun.</li>
+    <li><strong>Step 03:</strong> DCF controls and core valuation outputs.</li>
     <li><strong>Step 04:</strong> analyst expectations.</li>
     <li><strong>Step 05:</strong> AI interpretation.</li>
     <li><strong>Step 06:</strong> sources and method notes.</li>
@@ -3193,12 +3288,11 @@ def _show_contact_page():
     else:
         st.info("Contact email is not configured for this deployment.")
 # --- App Configuration ---
-st.set_page_config(
-    page_title="Analyst Co-Pilot",
-    page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="collapsed"  # Start collapsed for expanded view
-)
+_write_boot_log("page_config_set")
+
+
+def _boot_log(message: str) -> None:
+    _write_boot_log(message)
 
 # --- Design System CSS ---
 st.markdown("""
@@ -3240,6 +3334,10 @@ st.markdown("""
     /* QW-1: Global background */
     .stApp {
         background: var(--clr-bg) !important;
+    }
+    .main .block-container {
+        padding-top: 0.9rem !important;
+        padding-bottom: 1rem !important;
     }
 
     /* QW-2: Dark navy sidebar */
@@ -3362,7 +3460,7 @@ st.markdown("""
     hr {
         border: none !important;
         border-top: 2px solid var(--clr-border) !important;
-        margin: 2rem 0 !important;
+        margin: 1.15rem 0 !important;
     }
 
     /* QW-5: Typography hierarchy */
@@ -3504,7 +3602,7 @@ st.markdown("""
     /* Section header with step badge */
     .section-header {
         display: flex; align-items: center; gap: 12px;
-        margin-bottom: 1.25rem; padding: 0.5rem 0;
+        margin-bottom: 0.7rem; padding: 0.2rem 0;
     }
     .step-badge {
         font-size: .65rem; font-weight: 700; text-transform: uppercase;
@@ -3616,39 +3714,121 @@ st.markdown("""
 
     /* App top bar */
     .app-topbar {
-        display: flex; align-items: flex-start; justify-content: space-between;
-        padding: 6px 0 12px 0; border-bottom: 2px solid var(--clr-border); margin-bottom: 1.5rem;
+        display: grid;
+        grid-template-columns: auto minmax(0, 1fr) auto;
+        align-items: center;
+        gap: 18px;
+        padding: 12px 16px;
+        margin-bottom: 1rem;
+        background: rgba(255,255,255,0.88);
+        border: 1px solid rgba(203, 213, 225, 0.95);
+        border-radius: 18px;
+        box-shadow: var(--shadow-sm);
+        backdrop-filter: blur(10px);
+    }
+    .app-topbar-brand {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        min-width: 0;
+    }
+    .app-topbar-center {
+        min-width: 0;
+    }
+    .app-topbar-nav {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex-wrap: wrap;
+        gap: 10px;
     }
     .app-topbar-right {
         display: flex;
         flex-direction: column;
         align-items: flex-end;
-        gap: 2px;
-        margin-top: -4px;
+        gap: 4px;
+        min-width: 0;
     }
     .app-wordmark {
         font-size: 1.1rem; font-weight: 700; color: var(--clr-text-primary); letter-spacing: -.01em;
+        white-space: nowrap;
     }
     .app-version {
         font-size: .6rem; font-weight: 700; text-transform: uppercase; letter-spacing: .08em;
         color: var(--clr-accent); background: #eff6ff; border: 1px solid #bfdbfe;
-        padding: 2px 6px; border-radius: 3px; margin-left: 8px; vertical-align: middle;
+        padding: 2px 6px; border-radius: 999px; vertical-align: middle;
     }
-    .app-tagline { font-size: .78rem; color: var(--clr-text-muted); }
-    .app-top-links {
-        display: flex;
-        gap: 18px;
-        margin-bottom: 1px;
-    }
-    .app-top-links a {
-        font-size: .86rem;
-        color: #64748b;
+    .app-topnav-link {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 40px;
+        padding: 0 16px;
+        border-radius: 999px;
+        border: 1px solid transparent;
+        background: transparent;
+        color: #334155;
+        font-size: 1rem;
+        font-weight: 600;
+        letter-spacing: -.01em;
         text-decoration: none;
-        transition: color .15s ease;
+        transition: background .15s ease, border-color .15s ease, color .15s ease, box-shadow .15s ease;
     }
-    .app-top-links a:hover {
+    .app-topnav-link:hover {
         color: var(--clr-accent);
-        text-decoration: underline;
+        background: #eff6ff;
+        border-color: #bfdbfe;
+    }
+    .app-topnav-link.is-active {
+        color: var(--clr-accent);
+        background: #dbeafe;
+        border-color: #60a5fa;
+        box-shadow: inset 0 0 0 1px #93c5fd;
+    }
+    .app-topbar-note {
+        margin-top: 7px;
+        text-align: center;
+        font-size: .74rem;
+        color: var(--clr-text-muted);
+        line-height: 1.35;
+    }
+    .app-topbar-time {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: .88rem;
+        color: var(--clr-text-primary);
+        text-align: right;
+        white-space: nowrap;
+    }
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 12px;
+        margin-bottom: 1rem;
+        padding: 0 4px 8px;
+    }
+    .stTabs [data-baseweb="tab"] {
+        min-height: 40px;
+        padding: 0 18px;
+        border-radius: 999px;
+        border: 1px solid transparent;
+        background: transparent;
+        color: #334155;
+        font-size: 1rem;
+        font-weight: 600;
+        letter-spacing: -.01em;
+        transition: background .15s ease, border-color .15s ease, color .15s ease, box-shadow .15s ease;
+    }
+    .stTabs [data-baseweb="tab"]:hover {
+        color: var(--clr-accent);
+        background: #eff6ff;
+        border-color: #bfdbfe;
+    }
+    .stTabs [aria-selected="true"] {
+        color: var(--clr-accent);
+        background: #dbeafe;
+        border-color: #60a5fa;
+        box-shadow: inset 0 0 0 1px #93c5fd;
+    }
+    .stTabs [data-baseweb="tab-highlight"] {
+        display: none;
     }
     .stButton > button[kind="tertiary"] {
         background: transparent !important;
@@ -3670,8 +3850,8 @@ st.markdown("""
     /* Hero KPI strip */
     .hero-strip {
         background: var(--clr-surface); border: 1px solid var(--clr-border);
-        border-radius: var(--radius-lg); padding: 16px 24px;
-        display: flex; align-items: center; margin-bottom: 1.25rem;
+        border-radius: var(--radius-lg); padding: 14px 20px;
+        display: flex; align-items: center; margin-bottom: 0.9rem;
         box-shadow: var(--shadow-sm);
     }
     .hero-item { flex: 1; padding: 0 20px; border-right: 1px solid var(--clr-border); }
@@ -3841,6 +4021,46 @@ st.markdown("""
         font-size: 1.02rem;
         letter-spacing: .02em;
         box-shadow: 0 2px 10px rgba(29, 78, 216, 0.25);
+    }
+    .analysis-view-boundary {
+        display: none !important;
+    }
+
+    @media (max-width: 1100px) {
+        .app-topbar {
+            grid-template-columns: 1fr;
+            gap: 12px;
+        }
+        .app-topbar-brand,
+        .app-topbar-right {
+            justify-content: space-between;
+            align-items: flex-start;
+        }
+        .app-topbar-nav,
+        .app-topbar-note {
+            justify-content: flex-start;
+            text-align: left;
+        }
+        .app-topbar-time {
+            text-align: left;
+        }
+        .hero-strip {
+            flex-wrap: wrap;
+            gap: 14px;
+        }
+        .hero-divider {
+            display: none;
+        }
+        .hero-ticker {
+            width: 100%;
+            text-align: left;
+        }
+    }
+
+    @media (max-width: 820px) {
+        .decision-grid {
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
     }
 
     /* User guide page */
@@ -4191,6 +4411,7 @@ st.markdown("""
     }
 </style>
 """, unsafe_allow_html=True)
+_boot_log("css_loaded")
 
 # --- Initialize Session State ---
 if 'financials' not in st.session_state:
@@ -4259,6 +4480,7 @@ if 'pending_momentum_display_quarters' not in st.session_state:
     st.session_state.pending_momentum_display_quarters = None
 if 'pending_scroll_section' not in st.session_state:
     st.session_state.pending_scroll_section = None
+_boot_log("session_state_ready")
 
 # --- Helper Functions ---
 def reset_analysis():
@@ -4368,6 +4590,118 @@ def get_valuation_verdict(upside_pct: float):
     if upside_pct < -10:
         return "Modestly Overvalued", "badge-fail", "DCF 10-25% below market"
     return "Fairly Valued", "badge-neutral-plain", "DCF within +/-10% of market"
+
+
+def _render_valuation_verdict_section(ticker: str, dcf_ui_data: dict | None, empty_message: str) -> None:
+    """Render the top-line DCF call for the active ticker."""
+    if dcf_ui_data:
+        if not dcf_ui_data.get("success"):
+            st.error("DCF analysis failed. Review assumptions and rerun.")
+            for err in dcf_ui_data.get("errors", []):
+                st.error(f"• {err}")
+            return
+
+        current_price = dcf_ui_data.get("current_price", 0)
+        intrinsic = dcf_ui_data.get("price_per_share", 0)
+        data_quality = dcf_ui_data.get("data_quality_score", 0)
+        assumptions = dcf_ui_data.get("assumptions", {})
+        tv_dominance = assumptions.get("tv_dominance_pct", 0)
+        terminal_method = assumptions.get("terminal_value_method", "gordon_growth")
+        high_growth_profile = bool(assumptions.get("high_growth_company", False))
+        cashflow_regime = assumptions.get("cashflow_regime")
+        cashflow_confidence = assumptions.get("cashflow_confidence")
+        discount_rate_used = assumptions.get("discount_rate_used")
+        discount_rate_input = assumptions.get("discount_rate_input")
+        discount_rate_label = assumptions.get("discount_rate_label")
+
+        upside_downside = None
+        verdict_label = "Pending"
+        verdict_badge = "badge-neutral-plain"
+        verdict_hint = "Run DCF to generate a valuation verdict."
+        if current_price and current_price > 0 and intrinsic and intrinsic > 0:
+            upside_downside = ((intrinsic - current_price) / current_price * 100)
+            verdict_label, verdict_badge, verdict_hint = get_valuation_verdict(upside_downside)
+
+        terminal_method_label = "Exit Multiple" if terminal_method == "exit_multiple" else "Gordon Growth"
+        if terminal_method == "exit_multiple" and high_growth_profile:
+            terminal_method_context = "High-Growth Adaptive"
+        elif terminal_method == "exit_multiple":
+            terminal_method_context = "Adaptive Fallback"
+        else:
+            terminal_method_context = "Default"
+
+        cashflow_regime_label = "FCFF"
+        if cashflow_regime == "approx_unlevered":
+            cashflow_regime_label = "Approx FCFF Proxy"
+        elif cashflow_regime == "levered_proxy":
+            cashflow_regime_label = "Levered Proxy"
+        confidence_label = (cashflow_confidence or "n/a").capitalize()
+        if discount_rate_used is not None:
+            if discount_rate_input is not None and abs(discount_rate_used - discount_rate_input) > 1e-9:
+                discount_rate_text = (
+                    f"{discount_rate_label or 'Discount rate'}: {discount_rate_used*100:.1f}% "
+                    f"(input {discount_rate_input*100:.1f}%)"
+                )
+            else:
+                discount_rate_text = f"{discount_rate_label or 'Discount rate'}: {discount_rate_used*100:.1f}%"
+        else:
+            discount_rate_text = discount_rate_label or "Discount rate: N/A"
+
+        current_price_text = f"${current_price:.2f}" if current_price else "—"
+        intrinsic_text = f"${intrinsic:.2f}" if intrinsic else "—"
+        upside_text = f"{upside_downside:+.1f}%" if upside_downside is not None else "—"
+        safe_ticker = html.escape(str(ticker))
+        safe_current_price_text = html.escape(current_price_text)
+        safe_intrinsic_text = html.escape(intrinsic_text)
+        safe_upside_text = html.escape(upside_text)
+        safe_verdict_label = html.escape(str(verdict_label))
+        safe_terminal_method_label = html.escape(str(terminal_method_label))
+        safe_terminal_method_context = html.escape(str(terminal_method_context))
+        safe_cashflow_regime_label = html.escape(str(cashflow_regime_label))
+        safe_confidence_label = html.escape(str(confidence_label))
+        safe_discount_rate_text = html.escape(str(discount_rate_text))
+
+        st.markdown(
+            f"""
+<div class="decision-strip">
+  <div class="decision-grid">
+    <div><div class="decision-tile-label">Ticker</div><div class="decision-tile-value">{safe_ticker}</div></div>
+    <div><div class="decision-tile-label">Current Price</div><div class="decision-tile-value">{safe_current_price_text}</div></div>
+    <div>
+      <div class="decision-tile-label">Intrinsic Value</div>
+      <div class="decision-tile-value">{safe_intrinsic_text}</div>
+    </div>
+    <div><div class="decision-tile-label">Upside/Downside</div><div class="decision-tile-value">{safe_upside_text}</div></div>
+    <div><div class="decision-tile-label">Verdict</div><span class="badge {verdict_badge}">{safe_verdict_label}</span></div>
+  </div>
+</div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        st.markdown(
+            f"""
+<div class="confidence-strip">
+  <span class="confidence-pill">Data Quality: {data_quality:.0f}/100</span>
+  <span class="confidence-pill">TV Dominance: {tv_dominance:.0f}%</span>
+  <span class="confidence-pill">Terminal Method: {safe_terminal_method_label} ({safe_terminal_method_context})</span>
+  <span class="confidence-pill">Cash Flow Regime: {safe_cashflow_regime_label} ({safe_confidence_label})</span>
+  <span class="confidence-pill">{safe_discount_rate_text}</span>
+</div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.caption(verdict_hint)
+        if cashflow_regime in {"approx_unlevered", "levered_proxy"}:
+            st.warning(
+                "Proxy cash-flow mode is active. Intrinsic value is still produced, but should be treated as lower-confidence "
+                "than a clean FCFF run."
+            )
+        if not dcf_ui_data.get("data_sufficient"):
+            st.warning("Insufficient data quality: interpretation confidence is reduced.")
+        return
+
+    st.info(empty_message)
 
 
 def _format_summary_currency(value, decimals: int = 2) -> str:
@@ -4713,6 +5047,7 @@ def _build_summary_pdf_bytes(
 # --- Sidebar Toggle State ---
 if "sidebar_visible" not in st.session_state:
     st.session_state.sidebar_visible = True
+_boot_log("sidebar_toggle_ready")
 
 # Floating button to open sidebar when closed
 if not st.session_state.sidebar_visible:
@@ -4728,6 +5063,7 @@ if not st.session_state.sidebar_visible:
         st.rerun()
 
 # --- Sidebar ---
+_boot_log("sidebar_enter")
 with st.sidebar:
     # Close button at top of sidebar
     col1, col2 = st.columns([4, 1])
@@ -4783,6 +5119,7 @@ with st.sidebar:
     )
 
     ticker = _normalize_ticker(selected_ticker)
+    _boot_log(f"sidebar_ticker_selected:{ticker or 'NONE'}")
     if ticker and _is_valid_ticker_format(ticker) and ticker not in ticker_options:
         _upsert_ticker_in_library(ticker)
         st.session_state.pending_ticker_dropdown = ticker
@@ -4804,24 +5141,23 @@ with st.sidebar:
         persisted_dates = _get_persisted_report_dates(ticker)
         if persisted_dates:
             dates = persisted_dates
-        else:
-            with st.spinner(f"Loading available reports for {ticker}..."):
-                dates = _load_report_dates_for_ticker(ticker)
-        st.session_state.available_dates = dates
-        if st.session_state.available_dates:
-            st.session_state.selected_end_date = st.session_state.available_dates[0]["value"]
+            persisted_values = [d.get("value") for d in dates if isinstance(d, dict)]
+            if st.session_state.selected_end_date not in persisted_values:
+                st.session_state.selected_end_date = dates[0]["value"]
             st.session_state.report_dates_hint = ""
         else:
+            dates = []
             st.session_state.selected_end_date = None
             st.session_state.report_dates_hint = (
-                f"No report dates returned within {AVAILABLE_DATES_TIMEOUT_SECONDS}s. "
-                "Use Refresh Available Dates to try again."
+                "Report dates are not loaded yet. Click Load Data or Refresh Available Dates to fetch them."
             )
+        st.session_state.available_dates = dates
     elif not ticker_valid:
         st.session_state.available_dates_ticker = None
         st.session_state.available_dates = []
         st.session_state.selected_end_date = None
         st.session_state.report_dates_hint = ""
+    _boot_log("sidebar_dates_ready")
 
     available_dates = st.session_state.available_dates
     selected_end_date = st.session_state.selected_end_date
@@ -5063,10 +5399,17 @@ with st.sidebar:
 
     st.divider()
     st.markdown('<div class="sidebar-section-label">Help</div>', unsafe_allow_html=True)
-    if st.button("Open User Guide", use_container_width=True, key="open_user_guide_sidebar"):
-        st.session_state.show_user_guide = True
-        st.session_state.show_contact_panel = False
-        st.rerun()
+    help_col1, help_col2 = st.columns(2)
+    with help_col1:
+        if st.button("User Guide", use_container_width=True, key="open_user_guide_sidebar"):
+            st.session_state.show_user_guide = True
+            st.session_state.show_contact_panel = False
+            st.rerun()
+    with help_col2:
+        if st.button("Contact", use_container_width=True, key="open_contact_sidebar"):
+            st.session_state.show_user_guide = False
+            st.session_state.show_contact_panel = True
+            st.rerun()
     
     # Clear cache button
     st.divider()
@@ -5074,36 +5417,11 @@ with st.sidebar:
         st.cache_data.clear()
         reset_analysis()
         st.success("Cache cleared! Click 'Load Data' to fetch fresh data.")
+_boot_log("sidebar_exit")
 
 
 
 # --- Main Interface ---
-_nav_spacer, _nav_guide_col, _nav_contact_col = st.columns([8, 1, 1])
-with _nav_guide_col:
-    if st.button("User Guide", key="open_user_guide_top_text", type="tertiary", use_container_width=True):
-        st.session_state.show_user_guide = True
-        st.session_state.show_contact_panel = False
-        _clear_view_query_param()
-        st.rerun()
-with _nav_contact_col:
-    if st.button("Contact", key="open_contact_top_text", type="tertiary", use_container_width=True):
-        st.session_state.show_user_guide = False
-        st.session_state.show_contact_panel = True
-        _clear_view_query_param()
-        st.rerun()
-
-st.markdown("""
-<div class="app-topbar">
-    <div>
-        <span class="app-wordmark">Analyst Co-Pilot</span>
-        <span class="app-version">Beta</span>
-    </div>
-    <div class="app-topbar-right">
-        <div class="app-tagline">AI-powered equity research assistant</div>
-    </div>
-</div>
-""", unsafe_allow_html=True)
-
 if st.session_state.get("show_contact_panel"):
     st.session_state.show_user_guide = False
 if st.session_state.get("show_user_guide"):
@@ -5113,7 +5431,16 @@ if st.session_state.get("show_contact_panel"):
     _show_contact_page()
     st.stop()
 
+topbar_timestamp = datetime.now().astimezone().strftime("%m/%d/%Y %H:%M %Z")
+_render_analysis_topbar(topbar_timestamp)
+_boot_log("topbar_ready")
+
+dashboard_tab, deep_dive_tab, compare_tab, reports_tab = st.tabs(
+    [view_meta["label"] for view_meta in ANALYSIS_VIEWS.values()]
+)
+
 if st.session_state.quarterly_analysis:
+    _boot_log("analysis_branch_start")
     analysis = st.session_state.quarterly_analysis
     ticker = st.session_state.ticker
     most_recent = analysis.get("historical_trends", {}).get("most_recent_quarter", {})
@@ -5130,6 +5457,10 @@ if st.session_state.quarterly_analysis:
     consensus = analysis.get("consensus_estimates", {})
     next_forecast_label = next_forecast.get("label", "Next Quarter")
     dcf_ui = st.session_state.get("dcf_ui_adapter")
+    dcf_ui_data = dcf_ui.get_ui_data() if dcf_ui else None
+    consensus_next_q = consensus.get("next_quarter", {}) if isinstance(consensus, dict) else {}
+    consensus_coverage = consensus.get("analyst_coverage", {}) if isinstance(consensus, dict) else {}
+    consensus_targets = consensus.get("price_targets", {}) if isinstance(consensus, dict) else {}
 
     st.markdown("""
 <div class="disclaimer-banner">
@@ -5223,7 +5554,7 @@ if st.session_state.quarterly_analysis:
     safe_ticker = html.escape(str(ticker))
     safe_company_name = html.escape(str(_company_name_display))
 
-    st.markdown(f"""
+    hero_strip_html = f"""
 <div class="hero-strip">
   {_hero_items_html}
   <div class="hero-divider"></div>
@@ -5232,590 +5563,260 @@ if st.session_state.quarterly_analysis:
     <span class="hero-ticker-source">{safe_company_name}</span>
   </div>
 </div>
-    """, unsafe_allow_html=True)
-
-    st.markdown("""
-<div id="report-nav-primary" class="report-nav">
-  <a href="#verdict">Verdict</a>
-  <a href="#valuation">Valuation Drivers</a>
-  <a href="#momentum">Business Momentum</a>
-  <a href="#consensus">Street Context</a>
-  <a href="#outlook">AI Synthesis</a>
-  <a href="#sources">Sources</a>
-</div>
-    """, unsafe_allow_html=True)
-
-    st.markdown("""
-<div id="floating-toc-wrap" class="floating-toc-wrap" aria-label="Quick navigation">
-  <button id="floating-toc-toggle" class="floating-toc-toggle" type="button" aria-label="Toggle quick nav" aria-expanded="false" aria-controls="floating-toc">☰</button>
-  <div id="floating-toc" class="floating-toc" aria-label="Report table of contents">
-    <div class="floating-toc-title">Quick Nav</div>
-    <a href="#verdict">Verdict</a>
-    <a href="#valuation">Valuation</a>
-    <a href="#momentum">Momentum</a>
-    <a href="#consensus">Street</a>
-    <a href="#outlook">AI View</a>
-    <a href="#sources">Sources</a>
-  </div>
-</div>
-    """, unsafe_allow_html=True)
-
-    components.html(
-        """
-<script>
-(function () {
-  const p = window.parent;
-  const d = p.document;
-  const bindingKey = "__acpTocBindings";
-  const sectionIds = ["verdict", "valuation", "momentum", "consensus", "outlook", "sources"];
-  const navIds = ["report-nav-primary", "floating-toc"];
-
-  const cleanup = () => {
-    const prev = p[bindingKey];
-    if (!prev) return;
-
-    if (prev.scrollTargets && prev.onScroll) {
-      prev.scrollTargets.forEach((target) => {
-        try { target.removeEventListener("scroll", prev.onScroll); } catch (_) {}
-      });
-    } else if (prev.scroller && prev.onScroll) {
-      try { prev.scroller.removeEventListener("scroll", prev.onScroll); } catch (_) {}
-    }
-
-    if (prev.onResize) {
-      try { p.removeEventListener("resize", prev.onResize); } catch (_) {}
-    }
-    if (prev.toggleButton && prev.onToggle) {
-      try { prev.toggleButton.removeEventListener("click", prev.onToggle); } catch (_) {}
-    }
-    if (prev.navLinks && prev.onLinkClick) {
-      prev.navLinks.forEach((link) => {
-        try { link.removeEventListener("click", prev.onLinkClick); } catch (_) {}
-      });
-    }
-    if (prev.observer) {
-      try { prev.observer.disconnect(); } catch (_) {}
-    }
-    if (prev.timer) {
-      try { p.clearTimeout(prev.timer); } catch (_) {}
-    }
-    if (prev.rafId) {
-      try { p.cancelAnimationFrame(prev.rafId); } catch (_) {}
-    }
-  };
-
-  cleanup();
-
-  const setActive = (sectionId) => {
-    navIds.forEach((navId) => {
-      const nav = d.getElementById(navId);
-      if (!nav) return;
-      const links = nav.querySelectorAll('a[href^="#"]');
-      links.forEach((link) => {
-        const target = link.getAttribute("href");
-        const isActive = target === "#" + sectionId;
-        link.classList.toggle("is-active", isActive);
-        if (isActive) {
-          link.setAttribute("aria-current", "true");
-        } else {
-          link.removeAttribute("aria-current");
-        }
-      });
-    });
-  };
-
-  const getActiveSection = () => {
-    const threshold = 160;
-    let active = sectionIds[0];
-    for (const id of sectionIds) {
-      const el = d.getElementById(id);
-      if (!el) continue;
-      if (el.getBoundingClientRect().top <= threshold) {
-        active = id;
-      } else {
-        break;
-      }
-    }
-    return active;
-  };
-
-  const getScroller = () => {
-    return (
-      d.querySelector('[data-testid="stAppViewContainer"]') ||
-      d.querySelector("section.main") ||
-      p
-    );
-  };
-
-  const init = (attempt) => {
-    const primary = d.getElementById("report-nav-primary");
-    const floatingWrap = d.getElementById("floating-toc-wrap");
-    const floating = d.getElementById("floating-toc");
-    const floatingToggle = d.getElementById("floating-toc-toggle");
-    if (!primary || !floatingWrap || !floating || !floatingToggle) {
-      if (attempt < 40) {
-        const timer = p.setTimeout(() => init(attempt + 1), 80);
-        p[bindingKey] = { ...(p[bindingKey] || {}), timer };
-      }
-      return;
-    }
-
-    const scroller = getScroller();
-    let rafId = null;
-
-    const setExpanded = (expanded) => {
-      floatingWrap.classList.toggle("is-expanded", expanded);
-      floatingToggle.setAttribute("aria-expanded", expanded ? "true" : "false");
-    };
-
-    const update = () => {
-      const rect = primary.getBoundingClientRect();
-      const shouldShow = rect.bottom <= 0;
-      floatingWrap.classList.toggle("is-visible", shouldShow);
-      if (!shouldShow) {
-        setExpanded(false);
-      }
-      setActive(getActiveSection());
-    };
-
-    const scheduleUpdate = () => {
-      if (rafId !== null) return;
-      rafId = p.requestAnimationFrame(() => {
-        rafId = null;
-        update();
-      });
-      if (p[bindingKey]) {
-        p[bindingKey].rafId = rafId;
-      }
-    };
-
-    const onScroll = () => scheduleUpdate();
-    const onResize = () => scheduleUpdate();
-    const onToggle = () => {
-      const isExpanded = floatingWrap.classList.contains("is-expanded");
-      setExpanded(!isExpanded);
-    };
-    const onLinkClick = () => setExpanded(false);
-    const navLinks = Array.from(floating.querySelectorAll('a[href^="#"]'));
-
-    const scrollTargets = Array.from(new Set([scroller, p]));
-    scrollTargets.forEach((target) => {
-      target.addEventListener("scroll", onScroll, { passive: true });
-    });
-    p.addEventListener("resize", onResize);
-    floatingToggle.addEventListener("click", onToggle);
-    navLinks.forEach((link) => {
-      link.addEventListener("click", onLinkClick);
-    });
-
-    let observer = null;
-    if ("IntersectionObserver" in p) {
-      observer = new p.IntersectionObserver(
-        () => scheduleUpdate(),
-        {
-          root: scroller === p ? null : scroller,
-          threshold: [0],
-        }
-      );
-      observer.observe(primary);
-    }
-
-    p[bindingKey] = {
-      scroller,
-      scrollTargets,
-      onScroll,
-      onResize,
-      toggleButton: floatingToggle,
-      onToggle,
-      navLinks,
-      onLinkClick,
-      observer,
-      rafId: null,
-      timer: null,
-    };
-
-    update();
-  };
-
-  init(0);
-})();
-</script>
-        """,
-        height=0,
-        width=0,
-    )
+    """
 
     # Show DCF Details page if requested
     if st.session_state.get("show_dcf_details") and dcf_ui:
         _show_dcf_details_page()
         st.stop()
 
-    # SECTION A: Investment Verdict
-    st.markdown('<div id="verdict"></div>', unsafe_allow_html=True)
-    st.markdown("---")
-    st.markdown('<div class="section-header"><span class="step-badge">Step 01</span><span class="section-title">Investment Verdict</span></div>', unsafe_allow_html=True)
-    st.caption("Primary call first, then supporting evidence.")
+    with dashboard_tab:
+        st.markdown(hero_strip_html, unsafe_allow_html=True)
 
-    dcf_ui_data = dcf_ui.get_ui_data() if dcf_ui else None
-    if dcf_ui_data:
-        if not dcf_ui_data.get("success"):
-            st.error("DCF analysis failed. Review assumptions and rerun.")
-            for err in dcf_ui_data.get("errors", []):
-                st.error(f"• {err}")
+    with deep_dive_tab:
+        # SECTION B: Investment Verdict
+        st.markdown('<div id="verdict"></div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-header"><span class="step-badge">Verdict</span><span class="section-title">Investment Verdict</span></div>', unsafe_allow_html=True)
+        st.caption("This verdict updates after you rerun the valuation with the assumptions below.")
+        _render_valuation_verdict_section(
+            ticker,
+            dcf_ui_data,
+            empty_message="Run DCF Analysis below to generate the investment verdict.",
+        )
+
+        # SECTION C: Valuation Drivers
+        st.markdown('<div id="valuation"></div>', unsafe_allow_html=True)
+        _render_pending_scroll_to_section("valuation")
+        st.markdown("---")
+        st.markdown('<div class="section-header"><span class="step-badge">Step 03</span><span class="section-title">Valuation Drivers</span></div>', unsafe_allow_html=True)
+        st.caption("Adjust assumptions, rerun the model, and review the valuation outputs below.")
+        snapshot_for_suggestions = None
+        _active_dcf_snapshot = st.session_state.get("dcf_snapshot")
+        _active_dcf_ticker = _normalize_ticker(getattr(_active_dcf_snapshot, "ticker", "")) if _active_dcf_snapshot is not None else ""
+        if _active_dcf_snapshot is not None and _active_dcf_ticker == ticker:
+            snapshot_for_suggestions = _active_dcf_snapshot
         else:
-            current_price = dcf_ui_data.get("current_price", 0)
-            intrinsic = dcf_ui_data.get("price_per_share", 0)
-            data_quality = dcf_ui_data.get("data_quality_score", 0)
-            assumptions = dcf_ui_data.get("assumptions", {})
-            tv_dominance = assumptions.get("tv_dominance_pct", 0)
-            price_exit = assumptions.get("price_exit_multiple")
-            price_gordon = assumptions.get("price_gordon_growth")
-            terminal_method = assumptions.get("terminal_value_method", "gordon_growth")
-            high_growth_profile = bool(assumptions.get("high_growth_company", False))
-            cashflow_regime = assumptions.get("cashflow_regime")
-            cashflow_confidence = assumptions.get("cashflow_confidence")
-            discount_rate_used = assumptions.get("discount_rate_used")
-            discount_rate_input = assumptions.get("discount_rate_input")
-            discount_rate_label = assumptions.get("discount_rate_label")
+            snapshot_for_suggestions = cached_financial_snapshot(
+                ticker,
+                suggestion_algo_version=SNAPSHOT_SUGGESTION_VERSION,
+            )
+        st.caption("Suggested assumptions are auto-loaded for the active ticker.")
 
-            upside_downside = None
-            verdict_label = "Pending"
-            verdict_badge = "badge-neutral-plain"
-            verdict_hint = "Run DCF to generate a valuation verdict."
-            if current_price and current_price > 0 and intrinsic and intrinsic > 0:
-                upside_downside = ((intrinsic - current_price) / current_price * 100)
-                verdict_label, verdict_badge, verdict_hint = get_valuation_verdict(upside_downside)
+        suggested_wacc = 9.0
+        suggested_fcf_growth = 8.0
+        suggested_fcf_reliability = None
+        suggested_fcf_period_type = None
+        raw_suggested_wacc = None
+        wacc_was_bounded = False
+        wacc_bound_reason = ""
+        wacc_source_summary = ""
+        if snapshot_for_suggestions:
+            if snapshot_for_suggestions.suggested_wacc.value:
+                suggested_wacc = round(snapshot_for_suggestions.suggested_wacc.value * 100, 1)
+                wacc_components = getattr(snapshot_for_suggestions, "wacc_components", {}) or {}
+                raw_val = wacc_components.get("raw_suggested_wacc")
+                if raw_val is not None:
+                    try:
+                        raw_suggested_wacc = float(raw_val) * 100.0
+                    except Exception:
+                        raw_suggested_wacc = None
+                wacc_was_bounded = bool(wacc_components.get("wacc_was_bounded", False))
+                wacc_bound_reason = str(wacc_components.get("wacc_bound_reason", "") or "")
+                rf_source = str(wacc_components.get("rf_source") or getattr(snapshot_for_suggestions, "rf_source", "") or "").strip()
+                damodaran_date = str(wacc_components.get("damodaran_date", "") or "").strip()
+                beta_source_path = str(getattr(snapshot_for_suggestions.beta, "source_path", "") or "").lower()
+                rf_label = ""
+                if rf_source.startswith("^TNX live"):
+                    rf_label = rf_source.replace(" live", "")
+                elif rf_source:
+                    rf_label = rf_source
+                beta_label = "beta Yahoo Finance" if "yf.ticker.info['beta']" in beta_source_path else "beta source"
+                source_parts = []
+                if rf_label:
+                    source_parts.append(f"Rf {rf_label}")
+                source_parts.append(f"ERP Damodaran ({damodaran_date or 'latest'})")
+                if getattr(snapshot_for_suggestions.beta, "value", None):
+                    source_parts.append(beta_label)
+                wacc_source_summary = " · ".join(source_parts)
+            if snapshot_for_suggestions.suggested_fcf_growth.value is not None:
+                suggested_fcf_growth = round(snapshot_for_suggestions.suggested_fcf_growth.value * 100, 1)
+                suggested_fcf_reliability = snapshot_for_suggestions.suggested_fcf_growth.reliability_score
+                suggested_fcf_period_type = snapshot_for_suggestions.suggested_fcf_growth.period_type
 
-            terminal_method_label = "Exit Multiple" if terminal_method == "exit_multiple" else "Gordon Growth"
-            if terminal_method == "exit_multiple" and high_growth_profile:
-                terminal_method_context = "High-Growth Adaptive"
-            elif terminal_method == "exit_multiple":
-                terminal_method_context = "Adaptive Fallback"
-            else:
-                terminal_method_context = "Default"
+        # Seed sliders from suggestions once per loaded valuation context (ticker + selected end date + quarters).
+        valuation_end_date = st.session_state.get("end_date") or st.session_state.get("selected_end_date") or "latest"
+        valuation_num_quarters = (
+            st.session_state.get("num_quarters")
+            or st.session_state.get("config_num_quarters")
+            or DEFAULT_INITIAL_QUARTERS
+        )
+        valuation_context_key = build_context_key(ticker, valuation_end_date, int(valuation_num_quarters))
+        wacc_slider_key = f"wacc_slider_{ticker}"
+        fcf_slider_key = f"fcf_growth_slider_{ticker}"
+        terminal_growth_key = f"terminal_growth_slider_{ticker}"
 
-            cashflow_regime_label = "FCFF"
-            if cashflow_regime == "approx_unlevered":
-                cashflow_regime_label = "Approx FCFF Proxy"
-            elif cashflow_regime == "levered_proxy":
-                cashflow_regime_label = "Levered Proxy"
-            confidence_label = (cashflow_confidence or "n/a").capitalize()
-            if discount_rate_used is not None:
-                if discount_rate_input is not None and abs(discount_rate_used - discount_rate_input) > 1e-9:
-                    discount_rate_text = (
-                        f"{discount_rate_label or 'Discount rate'}: {discount_rate_used*100:.1f}% "
-                        f"(input {discount_rate_input*100:.1f}%)"
+        if st.session_state.get("valuation_inputs_seeded_context") != valuation_context_key:
+            seeded_fcf_growth = suggested_fcf_growth
+            if suggested_fcf_reliability is not None and suggested_fcf_reliability < 65:
+                seeded_fcf_growth = 8.0
+            st.session_state[wacc_slider_key] = float(min(WACC_SLIDER_MAX_PCT, max(WACC_SLIDER_MIN_PCT, suggested_wacc)))
+            st.session_state[fcf_slider_key] = float(min(25.0, max(0.0, seeded_fcf_growth)))
+            st.session_state[terminal_growth_key] = 3.0
+            st.session_state.valuation_inputs_seeded_context = valuation_context_key
+
+        default_wacc = float(st.session_state.get(wacc_slider_key, suggested_wacc))
+        default_wacc = max(WACC_SLIDER_MIN_PCT, min(WACC_SLIDER_MAX_PCT, default_wacc))
+        default_fcf_growth = float(st.session_state.get(fcf_slider_key, suggested_fcf_growth))
+        default_fcf_growth = max(0.0, min(25.0, default_fcf_growth))
+        default_terminal_growth = float(st.session_state.get(terminal_growth_key, 3.0))
+
+        col_wacc, col_growth, col_terminal = st.columns(3)
+        with col_wacc:
+            user_wacc = st.slider(
+                "WACC / Discount Rate (%)",
+                min_value=WACC_SLIDER_MIN_PCT,
+                max_value=WACC_SLIDER_MAX_PCT,
+                step=0.1,
+                format="%.1f",
+                key=wacc_slider_key,
+                help=(
+                    "Forward discount-rate assumption used in DCF. "
+                    "View DCF Details to see full component trace (Re, Rd, weights, and sources)."
+                ),
+                **_widget_value_kwargs(wacc_slider_key, default_wacc),
+            )
+            if snapshot_for_suggestions and snapshot_for_suggestions.suggested_wacc.value:
+                beta_val = snapshot_for_suggestions.beta.value
+                rf_source = getattr(snapshot_for_suggestions, "rf_source", "^TNX")
+                wacc_components = getattr(snapshot_for_suggestions, "wacc_components", {}) or {}
+                we = wacc_components.get("equity_weight")
+                wd = wacc_components.get("debt_weight")
+                cost_of_equity_rate = wacc_components.get("cost_of_equity")
+                rd = wacc_components.get("cost_of_debt_pre_tax")
+                tax_rate = wacc_components.get("tax_rate")
+                beta_text = f", beta {beta_val:.2f}" if beta_val else ""
+                if all(v is not None for v in [we, wd, cost_of_equity_rate, rd, tax_rate]):
+                    inputs_line = (
+                        f"We {we*100:.0f}% / Wd {wd*100:.0f}% | "
+                        f"Re {cost_of_equity_rate*100:.1f}% / Rd {rd*100:.1f}% / T {tax_rate*100:.1f}%"
                     )
                 else:
-                    discount_rate_text = f"{discount_rate_label or 'Discount rate'}: {discount_rate_used*100:.1f}%"
-            else:
-                discount_rate_text = discount_rate_label or "Discount rate: N/A"
-
-            current_price_text = f"${current_price:.2f}" if current_price else "—"
-            intrinsic_text = f"${intrinsic:.2f}" if intrinsic else "—"
-            upside_text = f"{upside_downside:+.1f}%" if upside_downside is not None else "—"
-            safe_ticker = html.escape(str(ticker))
-            safe_current_price_text = html.escape(current_price_text)
-            safe_intrinsic_text = html.escape(intrinsic_text)
-            safe_upside_text = html.escape(upside_text)
-            safe_verdict_label = html.escape(str(verdict_label))
-            safe_terminal_method_label = html.escape(str(terminal_method_label))
-            safe_terminal_method_context = html.escape(str(terminal_method_context))
-            safe_cashflow_regime_label = html.escape(str(cashflow_regime_label))
-            safe_confidence_label = html.escape(str(confidence_label))
-            safe_discount_rate_text = html.escape(str(discount_rate_text))
-            st.markdown(f"""
-<div class="decision-strip">
-  <div class="decision-grid">
-    <div><div class="decision-tile-label">Ticker</div><div class="decision-tile-value">{safe_ticker}</div></div>
-    <div><div class="decision-tile-label">Current Price</div><div class="decision-tile-value">{safe_current_price_text}</div></div>
-    <div>
-      <div class="decision-tile-label">Intrinsic Value</div>
-      <div class="decision-tile-value">{safe_intrinsic_text}</div>
-    </div>
-    <div><div class="decision-tile-label">Upside/Downside</div><div class="decision-tile-value">{safe_upside_text}</div></div>
-    <div><div class="decision-tile-label">Verdict</div><span class="badge {verdict_badge}">{safe_verdict_label}</span></div>
-  </div>
-</div>
-            """, unsafe_allow_html=True)
-
-            st.markdown(f"""
-<div class="confidence-strip">
-  <span class="confidence-pill">Data Quality: {data_quality:.0f}/100</span>
-  <span class="confidence-pill">TV Dominance: {tv_dominance:.0f}%</span>
-  <span class="confidence-pill">Terminal Method: {safe_terminal_method_label} ({safe_terminal_method_context})</span>
-  <span class="confidence-pill">Cash Flow Regime: {safe_cashflow_regime_label} ({safe_confidence_label})</span>
-  <span class="confidence-pill">{safe_discount_rate_text}</span>
-</div>
-            """, unsafe_allow_html=True)
-            st.caption(verdict_hint)
-            if cashflow_regime in {"approx_unlevered", "levered_proxy"}:
-                st.warning(
-                    "Proxy cash-flow mode is active. Intrinsic value is still produced, but should be treated as lower-confidence "
-                    "than a clean FCFF run."
-                )
-            if not dcf_ui_data.get("data_sufficient"):
-                st.warning("Insufficient data quality: interpretation confidence is reduced.")
-    else:
-        st.info("Run DCF Analysis in Step 02 to generate the investment verdict.")
-
-    # SECTION B: Valuation Drivers
-    st.markdown('<div id="valuation"></div>', unsafe_allow_html=True)
-    _render_pending_scroll_to_section("valuation")
-    st.markdown("---")
-    st.markdown('<div class="section-header"><span class="step-badge">Step 02</span><span class="section-title">Valuation Drivers</span></div>', unsafe_allow_html=True)
-    st.caption("Tune assumptions, rerun the model, and review core valuation outputs.")
-
-    snapshot_for_suggestions = None
-    _active_dcf_snapshot = st.session_state.get("dcf_snapshot")
-    _active_dcf_ticker = _normalize_ticker(getattr(_active_dcf_snapshot, "ticker", "")) if _active_dcf_snapshot is not None else ""
-    if _active_dcf_snapshot is not None and _active_dcf_ticker == ticker:
-        snapshot_for_suggestions = _active_dcf_snapshot
-    else:
-        snapshot_for_suggestions = cached_financial_snapshot(
-            ticker,
-            suggestion_algo_version=SNAPSHOT_SUGGESTION_VERSION,
-        )
-    st.caption("Suggested assumptions are auto-loaded for the active ticker.")
-
-    suggested_wacc = 9.0
-    suggested_fcf_growth = 8.0
-    suggested_fcf_reliability = None
-    suggested_fcf_period_type = None
-    raw_suggested_wacc = None
-    wacc_was_bounded = False
-    wacc_bound_reason = ""
-    wacc_source_summary = ""
-    if snapshot_for_suggestions:
-        if snapshot_for_suggestions.suggested_wacc.value:
-            suggested_wacc = round(snapshot_for_suggestions.suggested_wacc.value * 100, 1)
-            wacc_components = getattr(snapshot_for_suggestions, "wacc_components", {}) or {}
-            raw_val = wacc_components.get("raw_suggested_wacc")
-            if raw_val is not None:
-                try:
-                    raw_suggested_wacc = float(raw_val) * 100.0
-                except Exception:
-                    raw_suggested_wacc = None
-            wacc_was_bounded = bool(wacc_components.get("wacc_was_bounded", False))
-            wacc_bound_reason = str(wacc_components.get("wacc_bound_reason", "") or "")
-            rf_source = str(wacc_components.get("rf_source") or getattr(snapshot_for_suggestions, "rf_source", "") or "").strip()
-            damodaran_date = str(wacc_components.get("damodaran_date", "") or "").strip()
-            beta_source_path = str(getattr(snapshot_for_suggestions.beta, "source_path", "") or "").lower()
-            rf_label = ""
-            if rf_source.startswith("^TNX live"):
-                rf_label = rf_source.replace(" live", "")
-            elif rf_source:
-                rf_label = rf_source
-            beta_label = "beta Yahoo Finance" if "yf.ticker.info['beta']" in beta_source_path else "beta source"
-            source_parts = []
-            if rf_label:
-                source_parts.append(f"Rf {rf_label}")
-            source_parts.append(f"ERP Damodaran ({damodaran_date or 'latest'})")
-            if getattr(snapshot_for_suggestions.beta, "value", None):
-                source_parts.append(beta_label)
-            wacc_source_summary = " · ".join(source_parts)
-        if snapshot_for_suggestions.suggested_fcf_growth.value is not None:
-            suggested_fcf_growth = round(snapshot_for_suggestions.suggested_fcf_growth.value * 100, 1)
-            suggested_fcf_reliability = snapshot_for_suggestions.suggested_fcf_growth.reliability_score
-            suggested_fcf_period_type = snapshot_for_suggestions.suggested_fcf_growth.period_type
-
-    # Seed sliders from suggestions once per loaded valuation context (ticker + selected end date + quarters).
-    valuation_end_date = st.session_state.get("end_date") or st.session_state.get("selected_end_date") or "latest"
-    valuation_num_quarters = (
-        st.session_state.get("num_quarters")
-        or st.session_state.get("config_num_quarters")
-        or DEFAULT_INITIAL_QUARTERS
-    )
-    valuation_context_key = build_context_key(ticker, valuation_end_date, int(valuation_num_quarters))
-    wacc_slider_key = f"wacc_slider_{ticker}"
-    fcf_slider_key = f"fcf_growth_slider_{ticker}"
-    terminal_growth_key = f"terminal_growth_slider_{ticker}"
-
-    if st.session_state.get("valuation_inputs_seeded_context") != valuation_context_key:
-        seeded_fcf_growth = suggested_fcf_growth
-        if suggested_fcf_reliability is not None and suggested_fcf_reliability < 65:
-            seeded_fcf_growth = 8.0
-        st.session_state[wacc_slider_key] = float(min(WACC_SLIDER_MAX_PCT, max(WACC_SLIDER_MIN_PCT, suggested_wacc)))
-        st.session_state[fcf_slider_key] = float(min(25.0, max(0.0, seeded_fcf_growth)))
-        st.session_state[terminal_growth_key] = 3.0
-        st.session_state.valuation_inputs_seeded_context = valuation_context_key
-
-    default_wacc = float(st.session_state.get(wacc_slider_key, suggested_wacc))
-    default_wacc = max(WACC_SLIDER_MIN_PCT, min(WACC_SLIDER_MAX_PCT, default_wacc))
-    default_fcf_growth = float(st.session_state.get(fcf_slider_key, suggested_fcf_growth))
-    default_fcf_growth = max(0.0, min(25.0, default_fcf_growth))
-    default_terminal_growth = float(st.session_state.get(terminal_growth_key, 3.0))
-
-    col_wacc, col_growth, col_terminal = st.columns(3)
-    with col_wacc:
-        user_wacc = st.slider(
-            "WACC / Discount Rate (%)",
-            min_value=WACC_SLIDER_MIN_PCT,
-            max_value=WACC_SLIDER_MAX_PCT,
-            value=default_wacc,
-            step=0.1,
-            format="%.1f",
-            key=wacc_slider_key,
-            help=(
-                "Forward discount-rate assumption used in DCF. "
-                "View DCF Details to see full component trace (Re, Rd, weights, and sources)."
-            )
-        )
-        if snapshot_for_suggestions and snapshot_for_suggestions.suggested_wacc.value:
-            beta_val = snapshot_for_suggestions.beta.value
-            rf_source = getattr(snapshot_for_suggestions, "rf_source", "^TNX")
-            wacc_components = getattr(snapshot_for_suggestions, "wacc_components", {}) or {}
-            we = wacc_components.get("equity_weight")
-            wd = wacc_components.get("debt_weight")
-            cost_of_equity_rate = wacc_components.get("cost_of_equity")
-            rd = wacc_components.get("cost_of_debt_pre_tax")
-            tax_rate = wacc_components.get("tax_rate")
-            beta_text = f", beta {beta_val:.2f}" if beta_val else ""
-            if all(v is not None for v in [we, wd, cost_of_equity_rate, rd, tax_rate]):
-                inputs_line = (
-                    f"We {we*100:.0f}% / Wd {wd*100:.0f}% | "
-                    f"Re {cost_of_equity_rate*100:.1f}% / Rd {rd*100:.1f}% / T {tax_rate*100:.1f}%"
-                )
-            else:
-                inputs_line = f"Rf {rf_source}{beta_text}"
-            suggested_text = f"Suggested WACC: {suggested_wacc:.1f}%"
-            if raw_suggested_wacc is not None:
+                    inputs_line = f"Rf {rf_source}{beta_text}"
                 suggested_text = f"Suggested WACC: {suggested_wacc:.1f}%"
-            st.caption(f"{suggested_text} | {inputs_line}")
-            if wacc_source_summary:
-                st.caption(f"Sources: {wacc_source_summary}")
-            if wacc_was_bounded and wacc_bound_reason:
-                st.caption(f"Guardrail applied: {wacc_bound_reason}")
-            if we is not None and wd is not None and we <= 0.01 and wd >= 0.99:
-                st.caption("Capital structure signal: equity weight is near 0% (often means market cap/equity data is missing for this run).")
+                if raw_suggested_wacc is not None:
+                    suggested_text = f"Suggested WACC: {suggested_wacc:.1f}%"
+                st.caption(f"{suggested_text} | {inputs_line}")
+                if wacc_source_summary:
+                    st.caption(f"Sources: {wacc_source_summary}")
+                if wacc_was_bounded and wacc_bound_reason:
+                    st.caption(f"Guardrail applied: {wacc_bound_reason}")
+                if we is not None and wd is not None and we <= 0.01 and wd >= 0.99:
+                    st.caption("Capital structure signal: equity weight is near 0% (often means market cap/equity data is missing for this run).")
 
-    with col_growth:
-        user_fcf_growth = st.slider(
-            "FCF Growth Rate (%)",
-            min_value=0.0,
-            max_value=25.0,
-            value=default_fcf_growth,
-            step=0.1,
-            format="%.1f",
-            key=fcf_slider_key,
-            help="Annual free-cash-flow growth for projection period."
-        )
-        if snapshot_for_suggestions and snapshot_for_suggestions.suggested_fcf_growth.value is not None:
-            source_label = "fallback"
-            if suggested_fcf_period_type == "forward_analyst_consensus":
-                source_label = "analyst consensus"
-            elif suggested_fcf_period_type == "forward_analyst_long_term":
-                source_label = "analyst LT only"
-            elif suggested_fcf_period_type == "trailing_historical":
-                source_label = "trailing historical"
-            elif suggested_fcf_period_type == "calculated_fallback":
-                source_label = "historical fallback"
-
-            quality_text = f", quality {suggested_fcf_reliability}/100" if suggested_fcf_reliability is not None else ""
-            st.caption(f"Suggested: {suggested_fcf_growth:.1f}% ({source_label}{quality_text})")
-            if suggested_fcf_reliability is not None and suggested_fcf_reliability < 65:
-                st.caption("Default set to 8.0% because suggestion quality is low.")
-
-    with col_terminal:
-        terminal_growth_min = 0.0
-        terminal_growth_max = max(0.5, min(6.0, round(user_wacc - 0.5, 1)))
-        if terminal_growth_key in st.session_state:
-            st.session_state[terminal_growth_key] = min(
-                max(st.session_state[terminal_growth_key], terminal_growth_min),
-                terminal_growth_max
+        with col_growth:
+            user_fcf_growth = st.slider(
+                "FCF Growth Rate (%)",
+                min_value=0.0,
+                max_value=25.0,
+                step=0.1,
+                format="%.1f",
+                key=fcf_slider_key,
+                help="Annual free-cash-flow growth for projection period.",
+                **_widget_value_kwargs(fcf_slider_key, default_fcf_growth),
             )
-        terminal_growth_default = min(max(default_terminal_growth, terminal_growth_min), terminal_growth_max)
-        user_terminal_growth = st.slider(
-            "Terminal Growth g (%)",
-            min_value=terminal_growth_min,
-            max_value=terminal_growth_max,
-            value=terminal_growth_default,
-            step=0.1,
-            key=terminal_growth_key,
-            help="Perpetual growth rate used in Gordon Growth terminal value."
-        )
-        st.caption("Fallback/default: 3.0% (if not set)")
+            if snapshot_for_suggestions and snapshot_for_suggestions.suggested_fcf_growth.value is not None:
+                source_label = "fallback"
+                if suggested_fcf_period_type == "forward_analyst_consensus":
+                    source_label = "analyst consensus"
+                elif suggested_fcf_period_type == "forward_analyst_long_term":
+                    source_label = "analyst LT only"
+                elif suggested_fcf_period_type == "trailing_historical":
+                    source_label = "trailing historical"
+                elif suggested_fcf_period_type == "calculated_fallback":
+                    source_label = "historical fallback"
 
-    col_run, col_details = st.columns([1, 1])
-    with col_run:
-        if st.button("Run DCF Analysis", type="primary", key="run_dcf"):
-            with st.spinner("Running DCF analysis with full verification..."):
-                st.session_state.dcf_wacc = user_wacc
-                st.session_state.dcf_fcf_growth = user_fcf_growth
-                st.session_state.dcf_terminal_growth = user_terminal_growth
-                st.session_state.dcf_terminal_scenario = "current"
-                st.session_state.dcf_custom_multiple = None
-                ui_adapter_result, engine_result, snapshot = run_dcf_analysis(
-                    ticker,
-                    user_wacc,
-                    user_fcf_growth,
-                    terminal_growth=user_terminal_growth,
-                    terminal_scenario="current",
-                    custom_multiple=None,
+                quality_text = f", quality {suggested_fcf_reliability}/100" if suggested_fcf_reliability is not None else ""
+                st.caption(f"Suggested: {suggested_fcf_growth:.1f}% ({source_label}{quality_text})")
+                if suggested_fcf_reliability is not None and suggested_fcf_reliability < 65:
+                    st.caption("Default set to 8.0% because suggestion quality is low.")
+
+        with col_terminal:
+            terminal_growth_min = 0.0
+            terminal_growth_max = max(0.5, min(6.0, round(user_wacc - 0.5, 1)))
+            if terminal_growth_key in st.session_state:
+                st.session_state[terminal_growth_key] = min(
+                    max(st.session_state[terminal_growth_key], terminal_growth_min),
+                    terminal_growth_max
                 )
-                st.session_state.dcf_ui_adapter = ui_adapter_result
-                st.session_state.dcf_engine_result = engine_result
-                st.session_state.dcf_snapshot = snapshot
-                _persist_dcf_result_for_context(
-                    ticker=ticker,
-                    end_date=st.session_state.get("end_date") or st.session_state.get("selected_end_date"),
-                    num_quarters=st.session_state.get("num_quarters"),
-                )
-                st.rerun()
+            terminal_growth_default = min(max(default_terminal_growth, terminal_growth_min), terminal_growth_max)
+            user_terminal_growth = st.slider(
+                "Terminal Growth g (%)",
+                min_value=terminal_growth_min,
+                max_value=terminal_growth_max,
+                step=0.1,
+                key=terminal_growth_key,
+                help="Perpetual growth rate used in Gordon Growth terminal value.",
+                **_widget_value_kwargs(terminal_growth_key, terminal_growth_default),
+            )
+            st.caption("Fallback/default: 3.0% (if not set)")
 
-    with col_details:
-        if st.session_state.get("dcf_ui_adapter"):
-            if st.button("View DCF Details →", key="view_details"):
-                st.session_state.show_dcf_details = True
-                st.rerun()
+        col_run, col_details = st.columns([1, 1])
+        with col_run:
+            if st.button("Run DCF Analysis", type="primary", key="run_dcf"):
+                with st.spinner("Running DCF analysis with full verification..."):
+                    st.session_state.dcf_wacc = user_wacc
+                    st.session_state.dcf_fcf_growth = user_fcf_growth
+                    st.session_state.dcf_terminal_growth = user_terminal_growth
+                    st.session_state.dcf_terminal_scenario = "current"
+                    st.session_state.dcf_custom_multiple = None
+                    ui_adapter_result, engine_result, snapshot = run_dcf_analysis(
+                        ticker,
+                        user_wacc,
+                        user_fcf_growth,
+                        terminal_growth=user_terminal_growth,
+                        terminal_scenario="current",
+                        custom_multiple=None,
+                    )
+                    st.session_state.dcf_ui_adapter = ui_adapter_result
+                    st.session_state.dcf_engine_result = engine_result
+                    st.session_state.dcf_snapshot = snapshot
+                    _persist_dcf_result_for_context(
+                        ticker=ticker,
+                        end_date=st.session_state.get("end_date") or st.session_state.get("selected_end_date"),
+                        num_quarters=st.session_state.get("num_quarters"),
+                    )
+                    st.rerun()
 
-    dcf_ui = st.session_state.get("dcf_ui_adapter")
-    dcf_ui_data = dcf_ui.get_ui_data() if dcf_ui else None
-    if dcf_ui_data:
-        if not dcf_ui_data.get("success"):
-            st.error("DCF analysis failed.")
-            for err in dcf_ui_data.get("errors", []):
-                st.error(f"• {err}")
-        else:
-            current_price = dcf_ui_data.get("current_price", 0)
-            intrinsic = dcf_ui_data.get("price_per_share", 0)
-            upside_downside = ((intrinsic - current_price) / current_price * 100) if (current_price and current_price > 0 and intrinsic and intrinsic > 0) else None
+        with col_details:
+            if st.session_state.get("dcf_ui_adapter"):
+                if st.button("View DCF Details →", key="view_details"):
+                    st.session_state.show_dcf_details = True
+                    st.rerun()
 
-            col_ev, col_equity, col_intrinsic, col_quality = st.columns(4)
-            with col_ev:
-                ev = dcf_ui_data.get("enterprise_value", 0)
-                st.metric("Enterprise Value", f"${ev/1e9:.1f}B" if ev >= 1e9 else (f"${ev/1e6:.1f}M" if ev >= 1e6 else "—"))
-            with col_equity:
-                equity = dcf_ui_data.get("equity_value", 0)
-                st.metric("Equity Value", f"${equity/1e9:.1f}B" if equity >= 1e9 else (f"${equity/1e6:.1f}M" if equity >= 1e6 else "—"))
-            with col_intrinsic:
-                st.metric("Intrinsic Value/Share", f"${intrinsic:.2f}" if intrinsic else "—", delta=f"{upside_downside:+.1f}%" if upside_downside is not None else None)
-            with col_quality:
-                st.metric("Data Quality", f"{dcf_ui_data.get('data_quality_score', 0):.0f}/100")
-
-            st.markdown("**Valuation Bridge**")
-            st.dataframe(pd.DataFrame(dcf_ui.format_bridge_table()), use_container_width=True, hide_index=True)
-
-            st.markdown("**Key Assumptions**")
-            st.dataframe(pd.DataFrame(dcf_ui.format_assumptions_table()), use_container_width=True, hide_index=True)
-
-            assumptions = dcf_ui_data.get("assumptions", {})
-            price_exit = assumptions.get("price_exit_multiple")
-            price_gordon = assumptions.get("price_gordon_growth")
-            terminal_method = assumptions.get("terminal_value_method", "gordon_growth")
-            high_growth_profile = bool(assumptions.get("high_growth_company", False))
-            if terminal_method == "exit_multiple":
-                if high_growth_profile:
-                    st.caption("Terminal method in use: Exit Multiple (adaptive method for high-growth profiles).")
-                else:
-                    st.caption("Terminal method in use: Exit Multiple (adaptive fallback when Gordon is overly punitive).")
+        dcf_ui = st.session_state.get("dcf_ui_adapter")
+        dcf_ui_data = dcf_ui.get_ui_data() if dcf_ui else None
+        if dcf_ui_data:
+            if not dcf_ui_data.get("success"):
+                st.error("DCF analysis failed.")
+                for err in dcf_ui_data.get("errors", []):
+                    st.error(f"• {err}")
             else:
-                st.caption("Terminal method in use: Gordon Growth (default for mature and steady-state valuation).")
+                current_price = dcf_ui_data.get("current_price", 0)
+                intrinsic = dcf_ui_data.get("price_per_share", 0)
+                upside_downside = ((intrinsic - current_price) / current_price * 100) if (current_price and current_price > 0 and intrinsic and intrinsic > 0) else None
 
-            if price_exit and price_gordon:
-                st.caption(f"Method outputs: Exit Multiple ${price_exit:.2f} | Gordon Growth ${price_gordon:.2f}.")
+                col_ev, col_equity, col_intrinsic, col_quality = st.columns(4)
+                with col_ev:
+                    ev = dcf_ui_data.get("enterprise_value", 0)
+                    st.metric("Enterprise Value", f"${ev/1e9:.1f}B" if ev >= 1e9 else (f"${ev/1e6:.1f}M" if ev >= 1e6 else "—"))
+                with col_equity:
+                    equity = dcf_ui_data.get("equity_value", 0)
+                    st.metric("Equity Value", f"${equity/1e9:.1f}B" if equity >= 1e9 else (f"${equity/1e6:.1f}M" if equity >= 1e6 else "—"))
+                with col_intrinsic:
+                    st.metric("Intrinsic Value/Share", f"${intrinsic:.2f}" if intrinsic else "—", delta=f"{upside_downside:+.1f}%" if upside_downside is not None else None)
+                with col_quality:
+                    st.metric("Data Quality", f"{dcf_ui_data.get('data_quality_score', 0):.0f}/100")
 
-            with st.expander("Deep DCF Detail", expanded=False, icon="🧮"):
                 st.caption("For full traceability use 'View DCF Details'.")
                 st.markdown("**Current Financial Position (TTM)**")
                 col_d1, col_d2, col_d3 = st.columns(3)
@@ -5854,616 +5855,700 @@ if st.session_state.quarterly_analysis:
                             "PV(FCF)": f"${proj.get('pv', 0)/1e9:.1f}B"
                         })
                     st.dataframe(pd.DataFrame(proj_table), use_container_width=True, hide_index=True)
-    else:
-        st.info("No DCF output yet. Set assumptions and run the model.")
 
-    # SECTION C: Business Momentum
-    st.markdown('<div id="momentum"></div>', unsafe_allow_html=True)
-    st.markdown("---")
-    st.markdown('<div class="section-header"><span class="step-badge">Step 03</span><span class="section-title">Business Momentum</span></div>', unsafe_allow_html=True)
-    st.caption(f"Source: {data_source}")
+                st.markdown("**Valuation Bridge**")
+                st.dataframe(pd.DataFrame(dcf_ui.format_bridge_table()), use_container_width=True, hide_index=True)
 
-    displayed_quarters_metric = None
-    if hist_data:
-        loaded_quarters_for_metric = len(hist_data)
-        requested_quarters_for_metric = st.session_state.get(
-            "momentum_display_quarters",
-            loaded_quarters_for_metric,
-        )
-        if not isinstance(requested_quarters_for_metric, int):
-            requested_quarters_for_metric = loaded_quarters_for_metric
-        displayed_quarters_metric = min(
-            loaded_quarters_for_metric,
-            max(1, int(requested_quarters_for_metric)),
-        )
-
-    col_h1, col_h2, col_h3, col_h4 = st.columns(4)
-    with col_h1:
-        avg_rev = growth_summary.get("avg_revenue_yoy")
-        st.metric("Avg Revenue Growth (YoY)", f"{avg_rev:.1f}%" if avg_rev is not None else "N/A")
-    with col_h2:
-        avg_eps = growth_summary.get("avg_eps_yoy")
-        st.metric("Avg EPS Growth (YoY)", f"{avg_eps:.1f}%" if avg_eps is not None else "N/A")
-    with col_h3:
-        quarters_with_revenue = growth_summary.get("quarters_with_revenue")
-        quarters_with_eps = growth_summary.get("quarters_with_eps")
-        quarters_plotted = displayed_quarters_metric if displayed_quarters_metric is not None else 0
-        if not quarters_plotted:
-            if isinstance(quarters_with_revenue, int):
-                quarters_plotted = max(quarters_plotted, quarters_with_revenue)
-            if isinstance(quarters_with_eps, int):
-                quarters_plotted = max(quarters_plotted, quarters_with_eps)
-            if not quarters_plotted:
-                fallback_samples = growth_summary.get("samples_used")
-                quarters_plotted = fallback_samples if isinstance(fallback_samples, int) else 0
-        st.metric("Quarters Plotted", quarters_plotted if quarters_plotted else "N/A")
-    with col_h4:
-        seasonality = seasonality_info.get("pattern", "N/A")
-        st.metric("Seasonality Pattern", seasonality)
-
-    total_quarters = growth_summary.get("samples_used")
-    revenue_yoy_pairs = growth_summary.get("revenue_yoy_pairs")
-    eps_yoy_pairs = growth_summary.get("eps_yoy_pairs")
-    coverage_parts = []
-    if isinstance(quarters_with_revenue, int) and isinstance(total_quarters, int):
-        coverage_parts.append(f"Revenue points: {quarters_with_revenue}/{total_quarters}")
-    if isinstance(quarters_with_eps, int) and isinstance(total_quarters, int):
-        coverage_parts.append(f"EPS points: {quarters_with_eps}/{total_quarters}")
-    if isinstance(revenue_yoy_pairs, int):
-        coverage_parts.append(f"Revenue YoY pairs: {revenue_yoy_pairs}")
-    if isinstance(eps_yoy_pairs, int):
-        coverage_parts.append(f"EPS YoY pairs: {eps_yoy_pairs}")
-    mismatch_points = source_diagnostics.get("mismatch_points")
-    if isinstance(mismatch_points, int) and mismatch_points > 0:
-        coverage_parts.append(f"Cross-source mismatches: {mismatch_points} (Yahoo-priority)")
-    yahoo_collisions = source_diagnostics.get("yahoo_date_collisions_collapsed")
-    sec_collisions = source_diagnostics.get("sec_date_collisions_collapsed")
-    collision_total = 0
-    if isinstance(yahoo_collisions, int):
-        collision_total += yahoo_collisions
-    if isinstance(sec_collisions, int):
-        collision_total += sec_collisions
-    if collision_total > 0:
-        coverage_parts.append(f"Quarter-date collisions normalized: {collision_total}")
-    sec_error = source_diagnostics.get("sec_error")
-    if isinstance(sec_error, str) and sec_error.strip():
-        sec_error_preview = sec_error.strip()
-        if len(sec_error_preview) > 120:
-            sec_error_preview = sec_error_preview[:117] + "..."
-        coverage_parts.append(f"SEC unavailable: {sec_error_preview}")
-    sec_q4_backfilled = source_diagnostics.get("sec_q4_backfilled", {})
-    if isinstance(sec_q4_backfilled, dict):
-        total_q4_derived = sec_q4_backfilled.get("total_q4_derived")
-        if isinstance(total_q4_derived, int) and total_q4_derived > 0:
-            derived_quarters = sec_q4_backfilled.get("quarters", []) if isinstance(sec_q4_backfilled.get("quarters", []), list) else []
-            preview = ", ".join(derived_quarters[:3]) if derived_quarters else ""
-            if len(derived_quarters) > 3:
-                preview += ", ..."
-            coverage_parts.append(
-                f"SEC Q4 backfilled: {total_q4_derived}" + (f" ({preview})" if preview else "")
-            )
-    missing_revenue_quarters = data_coverage.get("missing_revenue_quarters", [])
-    missing_eps_quarters = data_coverage.get("missing_eps_quarters", [])
-    missing_report_quarters = data_coverage.get("missing_report_quarters", [])
-    if missing_report_quarters:
-        missing_report_display = ", ".join(missing_report_quarters[:3])
-        if len(missing_report_quarters) > 3:
-            missing_report_display += ", ..."
-        coverage_parts.append(f"Missing report quarters: {missing_report_display}")
-    if missing_revenue_quarters:
-        missing_rev_display = ", ".join(missing_revenue_quarters[:3])
-        if len(missing_revenue_quarters) > 3:
-            missing_rev_display += ", ..."
-        coverage_parts.append(f"Missing revenue: {missing_rev_display}")
-    if missing_eps_quarters:
-        missing_eps_display = ", ".join(missing_eps_quarters[:3])
-        if len(missing_eps_quarters) > 3:
-            missing_eps_display += ", ..."
-        coverage_parts.append(f"Missing EPS: {missing_eps_display}")
-    if coverage_parts:
-        st.caption(" | ".join(coverage_parts))
-    seasonality_reason = seasonality_info.get("reason")
-    if seasonality_reason:
-        st.caption(f"Seasonality method: {seasonality_reason}")
-
-    if hist_data:
-        loaded_quarters = len(hist_data)
-        configured_quarters = st.session_state.get("num_quarters", loaded_quarters)
-        if not isinstance(configured_quarters, int):
-            configured_quarters = loaded_quarters
-        available_dates = st.session_state.get("available_dates", []) or []
-        selected_end_date = st.session_state.get("selected_end_date")
-        context_available_quarters = len(available_dates)
-        if available_dates and selected_end_date:
-            date_values = [d.get("value") for d in available_dates if isinstance(d, dict)]
-            if selected_end_date in date_values:
-                selected_idx = date_values.index(selected_end_date)
-                context_available_quarters = max(1, len(date_values) - selected_idx)
-
-        source_total_quarters = 0
-        if isinstance(source_diagnostics, dict):
-            source_total_quarters = (
-                source_diagnostics.get("merged_quarters")
-                or source_diagnostics.get("yahoo_quarters")
-                or source_diagnostics.get("sec_quarters")
-                or 0
-            )
-        if not isinstance(source_total_quarters, int):
-            source_total_quarters = 0
-
-        if source_total_quarters > 0:
-            max_context_quarters = source_total_quarters
+                st.markdown("**Key Assumptions**")
+                st.dataframe(pd.DataFrame(dcf_ui.format_assumptions_table()), use_container_width=True, hide_index=True)
         else:
-            max_context_quarters = context_available_quarters
-        max_available_quarters = min(20, max(loaded_quarters, max_context_quarters or loaded_quarters))
-        min_display_quarters = 4 if max_available_quarters >= 4 else 1
+            st.info("No DCF output yet. Set assumptions and run the model.")
 
-        pending_display_quarters = st.session_state.get("pending_momentum_display_quarters")
-        if isinstance(pending_display_quarters, int):
-            clamped_pending = min(
-                max_available_quarters,
-                max(min_display_quarters, pending_display_quarters),
+    with dashboard_tab:
+        # SECTION A: Business Momentum
+        st.markdown('<div id="momentum"></div>', unsafe_allow_html=True)
+        st.markdown("---")
+        st.markdown('<div class="section-header"><span class="step-badge">Step 01</span><span class="section-title">Business Momentum</span></div>', unsafe_allow_html=True)
+        source_caption = str(data_source or "").replace(" (Yahoo-priority)", "").strip()
+        st.caption(f"Source: {source_caption}")
+
+        latest_quarter_snapshot = hist_data[0] if hist_data else {}
+        latest_revenue_value = _positive_float(latest_quarter_snapshot.get("revenue")) if isinstance(latest_quarter_snapshot, dict) else None
+        latest_eps_value = None
+        if isinstance(latest_quarter_snapshot, dict):
+            try:
+                latest_eps_candidate = latest_quarter_snapshot.get("eps")
+                if latest_eps_candidate is not None:
+                    latest_eps_value = float(latest_eps_candidate)
+            except Exception:
+                latest_eps_value = None
+
+        displayed_quarters_metric = None
+        if hist_data:
+            loaded_quarters_for_metric = len(hist_data)
+            requested_quarters_for_metric = st.session_state.get(
+                "momentum_display_quarters",
+                loaded_quarters_for_metric,
             )
-            st.session_state.momentum_display_quarters = clamped_pending
-        st.session_state.pending_momentum_display_quarters = None
+            if not isinstance(requested_quarters_for_metric, int):
+                requested_quarters_for_metric = loaded_quarters_for_metric
+            displayed_quarters_metric = min(
+                loaded_quarters_for_metric,
+                max(1, int(requested_quarters_for_metric)),
+            )
 
-        current_display_quarters = st.session_state.get("momentum_display_quarters", configured_quarters)
-        if not isinstance(current_display_quarters, int):
-            current_display_quarters = configured_quarters
-        current_display_quarters = min(max_available_quarters, max(min_display_quarters, current_display_quarters))
-        st.session_state.momentum_display_quarters = current_display_quarters
+        col_h1, col_h2, col_h3, col_h4 = st.columns(4)
+        with col_h1:
+            if latest_revenue_value is not None:
+                latest_revenue_text = f"${latest_revenue_value/1e9:.1f}B" if latest_revenue_value >= 1e9 else f"${latest_revenue_value/1e6:.1f}M"
+            else:
+                latest_revenue_text = "N/A"
+            st.metric("Latest Revenue", latest_revenue_text)
+        with col_h2:
+            st.metric("Latest EPS", f"${latest_eps_value:.2f}" if latest_eps_value is not None else "N/A")
+        with col_h3:
+            quarters_with_revenue = growth_summary.get("quarters_with_revenue")
+            quarters_with_eps = growth_summary.get("quarters_with_eps")
+            quarters_plotted = displayed_quarters_metric if displayed_quarters_metric is not None else 0
+            if not quarters_plotted:
+                if isinstance(quarters_with_revenue, int):
+                    quarters_plotted = max(quarters_plotted, quarters_with_revenue)
+                if isinstance(quarters_with_eps, int):
+                    quarters_plotted = max(quarters_plotted, quarters_with_eps)
+                if not quarters_plotted:
+                    fallback_samples = growth_summary.get("samples_used")
+                    quarters_plotted = fallback_samples if isinstance(fallback_samples, int) else 0
+            st.metric("Quarters Plotted", quarters_plotted if quarters_plotted else "N/A")
+        with col_h4:
+            seasonality = seasonality_info.get("pattern", "N/A")
+            if str(seasonality).strip() == "N/A" and str(seasonality_info.get("reason", "")).strip():
+                seasonality = "Need More Data"
+            st.metric("Seasonality Pattern", seasonality)
 
-        trend_col, rail_col = st.columns([6, 1], gap="medium")
+        total_quarters = growth_summary.get("samples_used")
+        revenue_yoy_pairs = growth_summary.get("revenue_yoy_pairs")
+        eps_yoy_pairs = growth_summary.get("eps_yoy_pairs")
+        coverage_parts = []
+        if isinstance(quarters_with_revenue, int) and isinstance(total_quarters, int):
+            coverage_parts.append(f"Revenue points: {quarters_with_revenue}/{total_quarters}")
+        if isinstance(quarters_with_eps, int) and isinstance(total_quarters, int):
+            coverage_parts.append(f"EPS points: {quarters_with_eps}/{total_quarters}")
+        if isinstance(revenue_yoy_pairs, int):
+            coverage_parts.append(f"Revenue YoY pairs: {revenue_yoy_pairs}")
+        if isinstance(eps_yoy_pairs, int):
+            coverage_parts.append(f"EPS YoY pairs: {eps_yoy_pairs}")
+        mismatch_points = source_diagnostics.get("mismatch_points")
+        if isinstance(mismatch_points, int) and mismatch_points > 0:
+            coverage_parts.append(f"Cross-source mismatches: {mismatch_points} (Yahoo-priority)")
+        yahoo_collisions = source_diagnostics.get("yahoo_date_collisions_collapsed")
+        sec_collisions = source_diagnostics.get("sec_date_collisions_collapsed")
+        collision_total = 0
+        if isinstance(yahoo_collisions, int):
+            collision_total += yahoo_collisions
+        if isinstance(sec_collisions, int):
+            collision_total += sec_collisions
+        if collision_total > 0:
+            coverage_parts.append(f"Quarter-date collisions normalized: {collision_total}")
+        sec_error = source_diagnostics.get("sec_error")
+        if isinstance(sec_error, str) and sec_error.strip():
+            sec_error_preview = sec_error.strip()
+            if len(sec_error_preview) > 120:
+                sec_error_preview = sec_error_preview[:117] + "..."
+            coverage_parts.append(f"SEC unavailable: {sec_error_preview}")
+        sec_q4_backfilled = source_diagnostics.get("sec_q4_backfilled", {})
+        if isinstance(sec_q4_backfilled, dict):
+            total_q4_derived = sec_q4_backfilled.get("total_q4_derived")
+            if isinstance(total_q4_derived, int) and total_q4_derived > 0:
+                derived_quarters = sec_q4_backfilled.get("quarters", []) if isinstance(sec_q4_backfilled.get("quarters", []), list) else []
+                preview = ", ".join(derived_quarters[:3]) if derived_quarters else ""
+                if len(derived_quarters) > 3:
+                    preview += ", ..."
+                coverage_parts.append(
+                    f"SEC Q4 backfilled: {total_q4_derived}" + (f" ({preview})" if preview else "")
+                )
+        missing_revenue_quarters = data_coverage.get("missing_revenue_quarters", [])
+        missing_eps_quarters = data_coverage.get("missing_eps_quarters", [])
+        missing_report_quarters = data_coverage.get("missing_report_quarters", [])
+        if missing_report_quarters:
+            missing_report_display = ", ".join(missing_report_quarters[:3])
+            if len(missing_report_quarters) > 3:
+                missing_report_display += ", ..."
+            coverage_parts.append(f"Missing report quarters: {missing_report_display}")
+        if missing_revenue_quarters:
+            missing_rev_display = ", ".join(missing_revenue_quarters[:3])
+            if len(missing_revenue_quarters) > 3:
+                missing_rev_display += ", ..."
+            coverage_parts.append(f"Missing revenue: {missing_rev_display}")
+        if missing_eps_quarters:
+            missing_eps_display = ", ".join(missing_eps_quarters[:3])
+            if len(missing_eps_quarters) > 3:
+                missing_eps_display += ", ..."
+            coverage_parts.append(f"Missing EPS: {missing_eps_display}")
+        if coverage_parts:
+            st.caption(" | ".join(coverage_parts))
+        seasonality_reason = seasonality_info.get("reason")
+        if seasonality_reason:
+            st.caption(f"Seasonality method: {seasonality_reason}")
 
-        requested_quarters = current_display_quarters
-        with rail_col:
-            st.markdown("**Quarter Rail**")
-            st.caption(f"Loaded: {loaded_quarters} | Max: {max_available_quarters}")
+        if hist_data:
+            loaded_quarters = len(hist_data)
+            configured_quarters = st.session_state.get("num_quarters", loaded_quarters)
+            if not isinstance(configured_quarters, int):
+                configured_quarters = loaded_quarters
+            available_dates = st.session_state.get("available_dates", []) or []
+            selected_end_date = st.session_state.get("selected_end_date")
+            context_available_quarters = len(available_dates)
             if available_dates and selected_end_date:
                 date_values = [d.get("value") for d in available_dates if isinstance(d, dict)]
                 if selected_end_date in date_values:
                     selected_idx = date_values.index(selected_end_date)
-                    if selected_idx > 0:
-                        st.caption(
-                            f"Yahoo reports from this anchor: {context_available_quarters} quarter(s). "
-                            "SEC-adjusted history may extend further."
-                        )
-            st.slider(
-                "Display quarters",
-                min_value=min_display_quarters,
-                max_value=max_available_quarters,
-                key="momentum_display_quarters",
-                label_visibility="collapsed",
-                help="Move the rail to request more history. If you move above loaded data, additional quarters are fetched automatically.",
-            )
-            requested_quarters = int(st.session_state.get("momentum_display_quarters", current_display_quarters))
-            requested_quarters = min(max_available_quarters, max(min_display_quarters, requested_quarters))
-            if requested_quarters > loaded_quarters:
-                st.caption(f"Auto-loading +{requested_quarters - loaded_quarters} quarter(s)")
-            else:
-                st.caption("Using currently loaded history.")
+                    context_available_quarters = max(1, len(date_values) - selected_idx)
 
-        if requested_quarters > loaded_quarters:
-            end_date_for_reload = st.session_state.get("end_date") or st.session_state.get("selected_end_date")
-            with st.spinner(f"Loading up to {requested_quarters} quarters for {ticker}..."):
-                expanded_analysis = cached_quarterly_analysis(ticker, requested_quarters, end_date_for_reload)
-            expanded_hist_data = expanded_analysis.get("historical_trends", {}).get("quarterly_data", [])
-            if len(expanded_hist_data) > loaded_quarters:
-                st.session_state.quarterly_analysis = expanded_analysis
-                st.session_state.num_quarters = requested_quarters
-                st.session_state.pending_config_num_quarters = requested_quarters
-                st.session_state.pending_momentum_display_quarters = min(requested_quarters, len(expanded_hist_data))
-
-                financials = st.session_state.get("financials", {}) if isinstance(st.session_state.get("financials", {}), dict) else {}
-                inc = financials.get("income", pd.DataFrame())
-                bal = financials.get("balance", pd.DataFrame())
-                cf = financials.get("cashflow", pd.DataFrame())
-                qcf = financials.get("quarterly_cashflow", pd.DataFrame())
-                st.session_state.comprehensive_analysis = calculate_comprehensive_analysis(
-                    inc,
-                    bal,
-                    expanded_hist_data,
-                    ticker,
-                    cf,
-                    qcf
+            source_total_quarters = 0
+            if isinstance(source_diagnostics, dict):
+                source_total_quarters = (
+                    source_diagnostics.get("merged_quarters")
+                    or source_diagnostics.get("yahoo_quarters")
+                    or source_diagnostics.get("sec_quarters")
+                    or 0
                 )
+            if not isinstance(source_total_quarters, int):
+                source_total_quarters = 0
+
+            if source_total_quarters > 0:
+                max_context_quarters = source_total_quarters
+            else:
+                max_context_quarters = context_available_quarters
+            max_available_quarters = min(20, max(loaded_quarters, max_context_quarters or loaded_quarters))
+            min_display_quarters = 4 if max_available_quarters >= 4 else 1
+
+            pending_display_quarters = st.session_state.get("pending_momentum_display_quarters")
+            if isinstance(pending_display_quarters, int):
+                clamped_pending = min(
+                    max_available_quarters,
+                    max(min_display_quarters, pending_display_quarters),
+                )
+                st.session_state.momentum_display_quarters = clamped_pending
+            st.session_state.pending_momentum_display_quarters = None
+
+            current_display_quarters = st.session_state.get("momentum_display_quarters", configured_quarters)
+            if not isinstance(current_display_quarters, int):
+                current_display_quarters = configured_quarters
+            current_display_quarters = min(max_available_quarters, max(min_display_quarters, current_display_quarters))
+            st.session_state.momentum_display_quarters = current_display_quarters
+
+            trend_col, rail_col = st.columns([6, 1], gap="medium")
+
+            requested_quarters = current_display_quarters
+            with rail_col:
+                st.markdown("**Quarter Rail**")
+                st.caption(f"Loaded: {loaded_quarters} | Max: {max_available_quarters}")
+                if available_dates and selected_end_date:
+                    date_values = [d.get("value") for d in available_dates if isinstance(d, dict)]
+                    if selected_end_date in date_values:
+                        selected_idx = date_values.index(selected_end_date)
+                        if selected_idx > 0:
+                            st.caption(
+                                f"Yahoo reports from this anchor: {context_available_quarters} quarter(s). "
+                                "SEC-adjusted history may extend further."
+                            )
+                st.slider(
+                    "Display quarters",
+                    min_value=min_display_quarters,
+                    max_value=max_available_quarters,
+                    key="momentum_display_quarters",
+                    label_visibility="collapsed",
+                    help="Move the rail to request more history. If you move above loaded data, additional quarters are fetched automatically.",
+                )
+                requested_quarters = int(st.session_state.get("momentum_display_quarters", current_display_quarters))
+                requested_quarters = min(max_available_quarters, max(min_display_quarters, requested_quarters))
+                if requested_quarters > loaded_quarters:
+                    st.caption(f"Auto-loading +{requested_quarters - loaded_quarters} quarter(s)")
+                else:
+                    st.caption("Using currently loaded history.")
+
+            if requested_quarters > loaded_quarters:
+                end_date_for_reload = st.session_state.get("end_date") or st.session_state.get("selected_end_date")
+                with st.spinner(f"Loading up to {requested_quarters} quarters for {ticker}..."):
+                    expanded_analysis = cached_quarterly_analysis(ticker, requested_quarters, end_date_for_reload)
+                expanded_hist_data = expanded_analysis.get("historical_trends", {}).get("quarterly_data", [])
+                if len(expanded_hist_data) > loaded_quarters:
+                    st.session_state.quarterly_analysis = expanded_analysis
+                    st.session_state.num_quarters = requested_quarters
+                    st.session_state.pending_config_num_quarters = requested_quarters
+                    st.session_state.pending_momentum_display_quarters = min(requested_quarters, len(expanded_hist_data))
+
+                    financials = st.session_state.get("financials", {}) if isinstance(st.session_state.get("financials", {}), dict) else {}
+                    inc = financials.get("income", pd.DataFrame())
+                    bal = financials.get("balance", pd.DataFrame())
+                    cf = financials.get("cashflow", pd.DataFrame())
+                    qcf = financials.get("quarterly_cashflow", pd.DataFrame())
+                    st.session_state.comprehensive_analysis = calculate_comprehensive_analysis(
+                        inc,
+                        bal,
+                        expanded_hist_data,
+                        ticker,
+                        cf,
+                        qcf
+                    )
+                    st.rerun()
+
+                st.session_state.pending_config_num_quarters = max(4, loaded_quarters)
+                st.session_state.pending_momentum_display_quarters = loaded_quarters
+                st.info("No additional quarters were returned for this ticker and selected ending report.")
                 st.rerun()
 
-            st.session_state.pending_config_num_quarters = max(4, loaded_quarters)
-            st.session_state.pending_momentum_display_quarters = loaded_quarters
-            st.info("No additional quarters were returned for this ticker and selected ending report.")
-            st.rerun()
+            display_quarters = min(requested_quarters, loaded_quarters)
+            hist_window = hist_data[:display_quarters]
+            df_hist = pd.DataFrame(hist_window)
+            quarter_order = list(reversed(df_hist["quarter"].tolist())) if not df_hist.empty and "quarter" in df_hist.columns else []
+            if not df_hist.empty:
+                df_hist = df_hist.iloc[::-1].reset_index(drop=True)
 
-        display_quarters = min(requested_quarters, loaded_quarters)
-        hist_window = hist_data[:display_quarters]
-        df_hist = pd.DataFrame(hist_window)
-        quarter_order = list(reversed(df_hist["quarter"].tolist())) if not df_hist.empty and "quarter" in df_hist.columns else []
-        if not df_hist.empty:
-            df_hist = df_hist.iloc[::-1].reset_index(drop=True)
+            def render_trend_chart(chart_source: pd.DataFrame, value_col: str, y_title: str, color: str):
+                chart_data = chart_source[["quarter", value_col]].copy()
+                if chart_data.empty or not chart_data[value_col].notna().any():
+                    st.caption("No data available for this trend.")
+                    return
 
-        def render_trend_chart(chart_source: pd.DataFrame, value_col: str, y_title: str, color: str):
-            chart_data = chart_source[["quarter", value_col]].copy()
-            if chart_data.empty or not chart_data[value_col].notna().any():
-                st.caption("No data available for this trend.")
-                return
+                line = (
+                    alt.Chart(chart_data)
+                    .mark_line(point=True, strokeWidth=3, color=color)
+                    .encode(
+                        x=alt.X(
+                            "quarter:N",
+                            sort=quarter_order if quarter_order else None,
+                            axis=alt.Axis(title=None, labelAngle=-45, labelOverlap=False),
+                        ),
+                        y=alt.Y(f"{value_col}:Q", title=y_title),
+                        tooltip=[
+                            alt.Tooltip("quarter:N", title="Quarter"),
+                            alt.Tooltip(f"{value_col}:Q", title=y_title, format=",.2f"),
+                        ],
+                    )
+                )
+                st.altair_chart(line, use_container_width=True)
 
-            line = (
-                alt.Chart(chart_data)
-                .mark_line(point=True, strokeWidth=3, color=color)
+            with trend_col:
+                col_chart1, col_chart2 = st.columns(2)
+                with col_chart1:
+                    st.caption("Revenue Trend")
+                    render_trend_chart(df_hist, "revenue", "Revenue (USD)", "#1f77b4")
+                with col_chart2:
+                    st.caption("EPS Trend")
+                    render_trend_chart(df_hist, "eps", "EPS", "#1f77b4")
+
+        col_growth_avg1, col_growth_avg2 = st.columns(2)
+        with col_growth_avg1:
+            avg_rev = growth_summary.get("avg_revenue_yoy")
+            st.metric("Avg Revenue Growth (YoY)", f"{avg_rev:.1f}%" if avg_rev is not None else "N/A")
+        with col_growth_avg2:
+            avg_eps = growth_summary.get("avg_eps_yoy")
+            st.metric("Avg EPS Growth (YoY)", f"{avg_eps:.1f}%" if avg_eps is not None else "N/A")
+
+        st.markdown("**Fundamental Drivers (DuPont)**")
+        dupont = comp_analysis.get("dupont", {}) if comp_analysis else {}
+        if dupont:
+            col_d1, col_d2, col_d3, col_d4 = st.columns(4)
+            with col_d1:
+                st.metric("ROE", f"{dupont.get('roe', 0):.1f}%")
+            with col_d2:
+                st.metric("Profit Margin", f"{dupont.get('net_profit_margin', 0):.1f}%")
+            with col_d3:
+                st.metric("Asset Turnover", f"{dupont.get('asset_turnover', 0):.2f}x")
+            with col_d4:
+                st.metric("Leverage (EM)", f"{dupont.get('equity_multiplier', 0):.2f}x")
+        else:
+            st.info("DuPont data unavailable.")
+
+        with st.expander("Quarterly Raw Detail", expanded=False, icon="📋"):
+            if hist_data:
+                df_display = pd.DataFrame(hist_data).set_index("quarter")
+                if "revenue" in df_display.columns:
+                    df_display["Revenue"] = df_display["revenue"].apply(
+                        lambda x: f"${x/1e9:.2f}B" if x and x > 1e9 else (f"${x/1e6:.1f}M" if x else "N/A")
+                    )
+                if "eps" in df_display.columns:
+                    df_display["EPS"] = df_display["eps"].apply(lambda x: f"${x:.2f}" if x else "N/A")
+                cols_to_show = [c for c in ["Revenue", "EPS"] if c in df_display.columns]
+                if cols_to_show:
+                    st.dataframe(df_display[cols_to_show], use_container_width=True)
+
+            if growth_detail:
+                st.caption("Growth Rates")
+                df_growth = pd.DataFrame(growth_detail).set_index("quarter")
+                for col in df_growth.columns:
+                    df_growth[col] = df_growth[col].apply(lambda x: f"{x:.1f}%" if x is not None else "—")
+                st.dataframe(df_growth, use_container_width=True)
+
+    with compare_tab:
+        compare_current_price = _positive_float(_market_data.get("current_price"))
+        compare_dcf_value = None
+        compare_dcf_delta = None
+        if dcf_ui_data and dcf_ui_data.get("success"):
+            compare_dcf_value = _positive_float(dcf_ui_data.get("price_per_share"))
+            if compare_current_price and compare_dcf_value:
+                compare_dcf_delta = f"{((compare_dcf_value - compare_current_price) / compare_current_price) * 100:+.1f}%"
+
+        compare_avg_pt = parse_price_value(consensus_targets.get("average")) if consensus_targets else None
+        col_compare1, col_compare2 = st.columns(2)
+        with col_compare1:
+            st.metric("Current Price", f"${compare_current_price:,.2f}" if compare_current_price is not None else "N/A")
+        with col_compare2:
+            st.metric("DCF Value", f"${compare_dcf_value:,.2f}" if compare_dcf_value is not None else "N/A", delta=compare_dcf_delta)
+
+        compare_chart_rows = []
+        if compare_current_price is not None:
+            compare_chart_rows.append({"Series": "Current Price", "Price": compare_current_price})
+        if compare_dcf_value is not None:
+            compare_chart_rows.append({"Series": "DCF Implied", "Price": compare_dcf_value})
+        if compare_avg_pt is not None:
+            compare_chart_rows.append({"Series": "Street Avg PT", "Price": compare_avg_pt})
+
+        if compare_chart_rows:
+            compare_chart_df = pd.DataFrame(compare_chart_rows)
+            compare_price_chart = (
+                alt.Chart(compare_chart_df)
+                .mark_bar(size=72, cornerRadiusTopLeft=12, cornerRadiusTopRight=12)
                 .encode(
-                    x=alt.X(
-                        "quarter:N",
-                        sort=quarter_order if quarter_order else None,
-                        axis=alt.Axis(title=None, labelAngle=-45, labelOverlap=False),
+                    x=alt.X("Series:N", title=None, axis=alt.Axis(labelAngle=0)),
+                    y=alt.Y("Price:Q", title="Price (USD)"),
+                    color=alt.Color(
+                        "Series:N",
+                        legend=None,
+                        scale=alt.Scale(
+                            domain=["Current Price", "DCF Implied", "Street Avg PT"],
+                            range=["#111c3d", "#2563eb", "#6aa6ff"],
+                        ),
                     ),
-                    y=alt.Y(f"{value_col}:Q", title=y_title),
                     tooltip=[
-                        alt.Tooltip("quarter:N", title="Quarter"),
-                        alt.Tooltip(f"{value_col}:Q", title=y_title, format=",.2f"),
+                        alt.Tooltip("Series:N", title="Series"),
+                        alt.Tooltip("Price:Q", title="Price", format=",.2f"),
                     ],
                 )
             )
-            st.altair_chart(line, use_container_width=True)
+            compare_price_labels = compare_price_chart.mark_text(
+                dy=-10,
+                fontSize=12,
+                fontWeight=600,
+                color="#111c3d",
+            ).encode(text=alt.Text("Price:Q", format="$,.2f"))
+            st.markdown("**Price Comparison**")
+            st.altair_chart(
+                (compare_price_chart + compare_price_labels).properties(height=280),
+                use_container_width=True,
+            )
 
-        with trend_col:
-            col_chart1, col_chart2 = st.columns(2)
-            with col_chart1:
-                st.caption("Revenue Trend")
-                render_trend_chart(df_hist, "revenue", "Revenue (USD)", "#1f77b4")
-            with col_chart2:
-                st.caption("EPS Trend")
-                render_trend_chart(df_hist, "eps", "EPS", "#1f77b4")
+        # SECTION D: Street Context
+        st.markdown('<div id="consensus"></div>', unsafe_allow_html=True)
+        st.markdown("---")
+        st.markdown('<div class="section-header"><span class="step-badge">Step 04</span><span class="section-title">Street Context</span></div>', unsafe_allow_html=True)
 
-    st.markdown("**Fundamental Drivers (DuPont)**")
-    dupont = comp_analysis.get("dupont", {}) if comp_analysis else {}
-    if dupont:
-        col_d1, col_d2, col_d3, col_d4 = st.columns(4)
-        with col_d1:
-            st.metric("ROE", f"{dupont.get('roe', 0):.1f}%")
-        with col_d2:
-            st.metric("Profit Margin", f"{dupont.get('net_profit_margin', 0):.1f}%")
-        with col_d3:
-            st.metric("Asset Turnover", f"{dupont.get('asset_turnover', 0):.2f}x")
-        with col_d4:
-            st.metric("Leverage (EM)", f"{dupont.get('equity_multiplier', 0):.2f}x")
-    else:
-        st.info("DuPont data unavailable.")
+        consensus_citations = []
+        qual_sources = []
+        if consensus.get("error"):
+            st.error(consensus["error"])
+        elif consensus:
+            next_q = consensus.get("next_quarter", {})
+            coverage = consensus.get("analyst_coverage", {})
+            targets = consensus.get("price_targets", {})
+            consensus_citations = consensus.get("citations", [])
+            qual_sources = consensus.get("qualitative_sources", [])
+            consensus_warning = str(consensus.get("warning", "") or "").strip()
 
-    with st.expander("Quarterly Raw Detail", expanded=False, icon="📋"):
-        if hist_data:
-            df_display = pd.DataFrame(hist_data).set_index("quarter")
-            if "revenue" in df_display.columns:
-                df_display["Revenue"] = df_display["revenue"].apply(
-                    lambda x: f"${x/1e9:.2f}B" if x and x > 1e9 else (f"${x/1e6:.1f}M" if x else "N/A")
-                )
-            if "eps" in df_display.columns:
-                df_display["EPS"] = df_display["eps"].apply(lambda x: f"${x:.2f}" if x else "N/A")
-            cols_to_show = [c for c in ["Revenue", "EPS"] if c in df_display.columns]
-            if cols_to_show:
-                st.dataframe(df_display[cols_to_show], use_container_width=True)
+            has_next_estimate = any((next_q.get("revenue_estimate"), next_q.get("eps_estimate"))) and any(
+                value not in (None, "", "N/A") for value in (next_q.get("revenue_estimate"), next_q.get("eps_estimate"))
+            )
+            has_coverage = any((coverage.get("num_analysts"), coverage.get("buy_ratings"), coverage.get("hold_ratings"), coverage.get("sell_ratings")))
+            has_targets = any(value not in (None, "", "N/A") for value in (targets.get("low"), targets.get("average"), targets.get("high")))
 
-        if growth_detail:
-            st.caption("Growth Rates")
-            df_growth = pd.DataFrame(growth_detail).set_index("quarter")
-            for col in df_growth.columns:
-                df_growth[col] = df_growth[col].apply(lambda x: f"{x:.1f}%" if x is not None else "—")
-            st.dataframe(df_growth, use_container_width=True)
+            if consensus_warning and not (has_next_estimate or has_coverage or has_targets):
+                st.info(consensus_warning)
 
-    # SECTION D: Street Context
-    st.markdown('<div id="consensus"></div>', unsafe_allow_html=True)
-    st.markdown("---")
-    st.markdown('<div class="section-header"><span class="step-badge">Step 04</span><span class="section-title">Street Context</span></div>', unsafe_allow_html=True)
+            quarter_label = next_q.get("quarter_label") or next_forecast_label
+            st.markdown(f"**{quarter_label} Estimates**")
+            col_c1, col_c2, col_c3, col_c4 = st.columns(4)
+            with col_c1:
+                st.metric("Revenue", next_q.get("revenue_estimate") or "N/A")
+            with col_c2:
+                st.metric("EPS", next_q.get("eps_estimate") or "N/A")
+            with col_c3:
+                st.metric("Analysts", coverage.get("num_analysts") or "N/A")
+            with col_c4:
+                buy = coverage.get("buy_ratings", 0) or 0
+                hold = coverage.get("hold_ratings", 0) or 0
+                sell = coverage.get("sell_ratings", 0) or 0
+                total = buy + hold + sell
+                st.metric("Buy/Hold/Sell", f"{buy}/{hold}/{sell}" if total > 0 else "N/A")
 
-    consensus_citations = []
-    qual_sources = []
-    if consensus.get("error"):
-        st.error(consensus["error"])
-    elif consensus:
-        next_q = consensus.get("next_quarter", {})
-        coverage = consensus.get("analyst_coverage", {})
-        targets = consensus.get("price_targets", {})
-        consensus_citations = consensus.get("citations", [])
-        qual_sources = consensus.get("qualitative_sources", [])
-        consensus_warning = str(consensus.get("warning", "") or "").strip()
+            estimate_sources = []
+            if next_q.get("source"):
+                estimate_sources.append(next_q.get("source"))
+            if coverage.get("source") and coverage.get("source") not in estimate_sources:
+                estimate_sources.append(coverage.get("source"))
+            if estimate_sources:
+                st.caption(f"Source: {', '.join(estimate_sources)}")
 
-        has_next_estimate = any((next_q.get("revenue_estimate"), next_q.get("eps_estimate"))) and any(
-            value not in (None, "", "N/A") for value in (next_q.get("revenue_estimate"), next_q.get("eps_estimate"))
-        )
-        has_coverage = any((coverage.get("num_analysts"), coverage.get("buy_ratings"), coverage.get("hold_ratings"), coverage.get("sell_ratings")))
-        has_targets = any(value not in (None, "", "N/A") for value in (targets.get("low"), targets.get("average"), targets.get("high")))
+            if has_targets:
+                col_t1, col_t2, col_t3 = st.columns(3)
+                with col_t1:
+                    st.metric("Price Target (Low)", targets.get("low") or "N/A")
+                with col_t2:
+                    st.metric("Price Target (Avg)", targets.get("average") or "N/A")
+                with col_t3:
+                    st.metric("Price Target (High)", targets.get("high") or "N/A")
+                if targets.get("source"):
+                    st.caption(f"Price target source: {targets.get('source')}")
 
-        if consensus_warning and not (has_next_estimate or has_coverage or has_targets):
-            st.info(consensus_warning)
+            market_data = analysis.get("market_data", {})
+            shares_outstanding = market_data.get("shares_outstanding")
+            current_market_cap = market_data.get("market_cap")
+            if has_targets and shares_outstanding:
+                avg_pt = parse_price_value(targets.get("average"))
+                high_pt = parse_price_value(targets.get("high"))
+                low_pt = parse_price_value(targets.get("low"))
 
-        quarter_label = next_q.get("quarter_label") or next_forecast_label
-        st.markdown(f"**{quarter_label} Estimates**")
-        col_c1, col_c2, col_c3, col_c4 = st.columns(4)
-        with col_c1:
-            st.metric("Revenue", next_q.get("revenue_estimate") or "N/A")
-        with col_c2:
-            st.metric("EPS", next_q.get("eps_estimate") or "N/A")
-        with col_c3:
-            st.metric("Analysts", coverage.get("num_analysts") or "N/A")
-        with col_c4:
-            buy = coverage.get("buy_ratings", 0) or 0
-            hold = coverage.get("hold_ratings", 0) or 0
-            sell = coverage.get("sell_ratings", 0) or 0
-            total = buy + hold + sell
-            st.metric("Buy/Hold/Sell", f"{buy}/{hold}/{sell}" if total > 0 else "N/A")
+                def format_mcap(value):
+                    if value is None:
+                        return "N/A"
+                    return f"${value/1e9:.1f}B"
 
-        estimate_sources = []
-        if next_q.get("source"):
-            estimate_sources.append(next_q.get("source"))
-        if coverage.get("source") and coverage.get("source") not in estimate_sources:
-            estimate_sources.append(coverage.get("source"))
-        if estimate_sources:
-            st.caption(f"Source: {', '.join(estimate_sources)}")
+                def format_delta(value):
+                    if value is None or not current_market_cap:
+                        return None
+                    delta_pct = (value - current_market_cap) / current_market_cap * 100
+                    return f"{delta_pct:+.0f}%"
 
-        if has_targets:
-            col_t1, col_t2, col_t3 = st.columns(3)
-            with col_t1:
-                st.metric("Price Target (Low)", targets.get("low") or "N/A")
-            with col_t2:
-                st.metric("Price Target (Avg)", targets.get("average") or "N/A")
-            with col_t3:
-                st.metric("Price Target (High)", targets.get("high") or "N/A")
-            if targets.get("source"):
-                st.caption(f"Price target source: {targets.get('source')}")
+                col_i1, col_i2, col_i3 = st.columns(3)
+                with col_i1:
+                    implied_low = low_pt * shares_outstanding if low_pt is not None else None
+                    st.metric("Implied Value (Low PT)", format_mcap(implied_low), delta=format_delta(implied_low))
+                with col_i2:
+                    implied_avg = avg_pt * shares_outstanding if avg_pt is not None else None
+                    st.metric("Implied Value (Avg PT)", format_mcap(implied_avg), delta=format_delta(implied_avg))
+                with col_i3:
+                    implied_high = high_pt * shares_outstanding if high_pt is not None else None
+                    st.metric("Implied Value (High PT)", format_mcap(implied_high), delta=format_delta(implied_high))
+            elif has_targets and not shares_outstanding:
+                st.caption("Implied total value unavailable (shares outstanding missing).")
 
-        market_data = analysis.get("market_data", {})
-        shares_outstanding = market_data.get("shares_outstanding")
-        current_market_cap = market_data.get("market_cap")
-        if has_targets and shares_outstanding:
-            avg_pt = parse_price_value(targets.get("average"))
-            high_pt = parse_price_value(targets.get("high"))
-            low_pt = parse_price_value(targets.get("low"))
-
-            def format_mcap(value):
-                if value is None:
-                    return "N/A"
-                return f"${value/1e9:.1f}B"
-
-            def format_delta(value):
-                if value is None or not current_market_cap:
-                    return None
-                delta_pct = (value - current_market_cap) / current_market_cap * 100
-                return f"{delta_pct:+.0f}%"
-
-            col_i1, col_i2, col_i3 = st.columns(3)
-            with col_i1:
-                implied_low = low_pt * shares_outstanding if low_pt is not None else None
-                st.metric("Implied Value (Low PT)", format_mcap(implied_low), delta=format_delta(implied_low))
-            with col_i2:
-                implied_avg = avg_pt * shares_outstanding if avg_pt is not None else None
-                st.metric("Implied Value (Avg PT)", format_mcap(implied_avg), delta=format_delta(implied_avg))
-            with col_i3:
-                implied_high = high_pt * shares_outstanding if high_pt is not None else None
-                st.metric("Implied Value (High PT)", format_mcap(implied_high), delta=format_delta(implied_high))
-        elif has_targets and not shares_outstanding:
-            st.caption("Implied total value unavailable (shares outstanding missing).")
-
-        qualitative = consensus.get("qualitative_summary")
-        if qualitative:
-            st.markdown(f"**Analyst View:** {qualitative}")
         else:
-            buy = coverage.get("buy_ratings", 0) or 0
-            sell = coverage.get("sell_ratings", 0) or 0
-            total = (coverage.get("buy_ratings", 0) or 0) + (coverage.get("hold_ratings", 0) or 0) + (coverage.get("sell_ratings", 0) or 0)
-            if total > 0 and targets:
-                avg_pt_val = parse_price_value(targets.get("average"))
-                current_price = market_data.get("current_price", 0)
-                if avg_pt_val and current_price:
-                    upside = ((avg_pt_val - current_price) / current_price) * 100
-                    direction = "bullish" if upside > 5 else ("neutral" if upside > -5 else "cautious")
-                    st.markdown(f"**Analyst View:** Consensus is {direction} with {buy} buy ratings vs {sell} sell, targeting {upside:+.0f}% from current levels.")
-    else:
-        st.info("No consensus data available.")
+            st.info("No consensus data available.")
 
-    # SECTION E: AI Synthesis
-    st.markdown('<div id="outlook"></div>', unsafe_allow_html=True)
-    st.markdown("---")
-    st.markdown('<div class="section-header"><span class="step-badge">Step 05</span><span class="section-title">AI Synthesis</span></div>', unsafe_allow_html=True)
+    with reports_tab:
+        # SECTION E: AI Synthesis
+        st.markdown('<div id="outlook"></div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-header"><span class="step-badge">Step 05</span><span class="section-title">AI Synthesis</span></div>', unsafe_allow_html=True)
 
-    dcf_ui = st.session_state.get("dcf_ui_adapter")
-    dcf_data_for_forecast = dcf_ui.get_ui_data() if dcf_ui else None
+        dcf_ui = st.session_state.get("dcf_ui_adapter")
+        dcf_data_for_forecast = dcf_ui.get_ui_data() if dcf_ui else None
 
-    if not dcf_ui:
-        st.warning("Run DCF Analysis first for a more complete synthesis.")
-    st.caption("Combines valuation, consensus, and historical momentum into a multi-horizon view.")
+        if not dcf_ui:
+            st.warning("Run DCF Analysis first for a more complete synthesis.")
+        st.caption("Combines valuation, consensus, and historical momentum into a multi-horizon view.")
 
-    has_existing_forecast = bool(st.session_state.get("independent_forecast"))
-    outlook_button_label = "Regenerate Multi-Horizon Outlook" if has_existing_forecast else "Generate Multi-Horizon Outlook"
-    if st.button(
-        outlook_button_label,
-        type="primary",
-        key="generate_outlook",
-        help="Reuses the cached outlook when the ticker, report date, quarterly context, and DCF inputs have not changed.",
-    ):
-        with st.spinner("Analyzing data and generating multi-horizon outlook..."):
-            outlook_cache_key = _build_ai_outlook_cache_key(
-                st.session_state.get("quarterly_analysis"),
-                dcf_data_for_forecast,
-            )
-            forecast = cached_independent_forecast(
-                ticker,
-                st.session_state.get("end_date") or st.session_state.get("selected_end_date"),
-                int(st.session_state.get("num_quarters") or DEFAULT_INITIAL_QUARTERS),
-                outlook_cache_key,
-                company_name=_company_name_display,
-                dcf_data=dcf_data_for_forecast,
-            )
-            if isinstance(forecast, dict) and forecast.get("error"):
-                st.session_state.ai_outlook_error = str(forecast.get("error"))
-                if not st.session_state.get("independent_forecast"):
-                    st.session_state.independent_forecast = forecast
-                st.session_state.forecast_just_generated = False
-            else:
-                st.session_state.ai_outlook_error = None
-                st.session_state.independent_forecast = forecast
-                st.session_state.forecast_just_generated = True
-                _persist_ai_result_for_context(
-                    ticker=ticker,
-                    end_date=st.session_state.get("end_date") or st.session_state.get("selected_end_date"),
-                    num_quarters=st.session_state.get("num_quarters"),
+        has_existing_forecast = bool(st.session_state.get("independent_forecast"))
+        outlook_button_label = "Regenerate Multi-Horizon Outlook" if has_existing_forecast else "Generate Multi-Horizon Outlook"
+        if st.button(
+            outlook_button_label,
+            type="primary",
+            key="generate_outlook",
+            help="Reuses the cached outlook when the ticker, report date, quarterly context, and DCF inputs have not changed.",
+        ):
+            with st.spinner("Analyzing data and generating multi-horizon outlook..."):
+                outlook_cache_key = _build_ai_outlook_cache_key(
+                    st.session_state.get("quarterly_analysis"),
+                    dcf_data_for_forecast,
                 )
-            st.rerun()
-
-    ai_outlook_error = st.session_state.get("ai_outlook_error")
-    if ai_outlook_error:
-        if is_quota_or_rate_limit_error(ai_outlook_error):
-            retry_text = estimate_api_retry_time(ai_outlook_error)
-            st.warning(
-                "AI Synthesis is temporarily unavailable because API request quota is exhausted.\n\n"
-                f"Estimated retry/reset time: {retry_text}"
-            )
-        else:
-            st.warning("AI Synthesis is temporarily unavailable. Please try again shortly.")
-        with st.expander("AI Synthesis Error Details", expanded=False):
-            st.code(str(ai_outlook_error))
-
-    pdf_outlook_view_model = {}
-    forecast_for_citations = st.session_state.get("independent_forecast")
-    merged_citations = _merge_citations_for_step6(consensus_citations, forecast_for_citations, qual_sources)
-    numbered_citations = _number_citations(merged_citations)
-
-    if st.session_state.independent_forecast:
-        forecast = st.session_state.independent_forecast
-        if forecast.get("error"):
-            if not ai_outlook_error:
-                if is_quota_or_rate_limit_error(forecast["error"]):
-                    retry_text = estimate_api_retry_time(forecast["error"])
-                    st.warning(
-                        "AI Synthesis is temporarily unavailable because API request quota is exhausted.\n\n"
-                        f"Estimated retry/reset time: {retry_text}"
-                    )
+                forecast = cached_independent_forecast(
+                    ticker,
+                    st.session_state.get("end_date") or st.session_state.get("selected_end_date"),
+                    int(st.session_state.get("num_quarters") or DEFAULT_INITIAL_QUARTERS),
+                    outlook_cache_key,
+                    company_name=_company_name_display,
+                    dcf_data=dcf_data_for_forecast,
+                )
+                if isinstance(forecast, dict) and forecast.get("error"):
+                    st.session_state.ai_outlook_error = str(forecast.get("error"))
+                    if not st.session_state.get("independent_forecast"):
+                        st.session_state.independent_forecast = forecast
+                    st.session_state.forecast_just_generated = False
                 else:
-                    st.warning("AI Synthesis is temporarily unavailable. Please try again shortly.")
-                with st.expander("AI Synthesis Error Details", expanded=False):
-                    st.code(str(forecast["error"]))
-        else:
-            extracted = forecast.get("extracted_forecast") or {}
-            full_analysis = _sanitize_ai_valuation_language(forecast.get("full_analysis", "") or "")
-            full_analysis = _apply_inline_numeric_citations(full_analysis, numbered_citations)
-            full_analysis = full_analysis.replace("$", "\\$")
-            expanded_default = bool(st.session_state.get("forecast_just_generated", False))
-            view_model = _build_outlook_view_model(extracted, full_analysis)
-            summary_text = str(view_model.get("summary", "") or "").strip()
-            pdf_outlook_view_model = view_model
-            if summary_text:
-                st.markdown(
-                    f"""
+                    st.session_state.ai_outlook_error = None
+                    st.session_state.independent_forecast = forecast
+                    st.session_state.forecast_just_generated = True
+                    _persist_ai_result_for_context(
+                        ticker=ticker,
+                        end_date=st.session_state.get("end_date") or st.session_state.get("selected_end_date"),
+                        num_quarters=st.session_state.get("num_quarters"),
+                    )
+                st.rerun()
+
+        ai_outlook_error = st.session_state.get("ai_outlook_error")
+        if ai_outlook_error:
+            if is_quota_or_rate_limit_error(ai_outlook_error):
+                retry_text = estimate_api_retry_time(ai_outlook_error)
+                st.warning(
+                    "AI Synthesis is temporarily unavailable because API request quota is exhausted.\n\n"
+                    f"Estimated retry/reset time: {retry_text}"
+                )
+            else:
+                st.warning("AI Synthesis is temporarily unavailable. Please try again shortly.")
+            with st.expander("AI Synthesis Error Details", expanded=False):
+                st.code(str(ai_outlook_error))
+
+        pdf_outlook_view_model = {}
+        forecast_for_citations = st.session_state.get("independent_forecast")
+        merged_citations = _merge_citations_for_step6(consensus_citations, forecast_for_citations, qual_sources)
+        numbered_citations = _number_citations(merged_citations)
+
+        if st.session_state.independent_forecast:
+            forecast = st.session_state.independent_forecast
+            if forecast.get("error"):
+                if not ai_outlook_error:
+                    if is_quota_or_rate_limit_error(forecast["error"]):
+                        retry_text = estimate_api_retry_time(forecast["error"])
+                        st.warning(
+                            "AI Synthesis is temporarily unavailable because API request quota is exhausted.\n\n"
+                            f"Estimated retry/reset time: {retry_text}"
+                        )
+                    else:
+                        st.warning("AI Synthesis is temporarily unavailable. Please try again shortly.")
+                    with st.expander("AI Synthesis Error Details", expanded=False):
+                        st.code(str(forecast["error"]))
+            else:
+                extracted = forecast.get("extracted_forecast") or {}
+                full_analysis = _sanitize_ai_valuation_language(forecast.get("full_analysis", "") or "")
+                full_analysis = _apply_inline_numeric_citations(full_analysis, numbered_citations)
+                full_analysis = full_analysis.replace("$", "\\$")
+                expanded_default = bool(st.session_state.get("forecast_just_generated", False))
+                view_model = _build_outlook_view_model(extracted, full_analysis)
+                summary_text = str(view_model.get("summary", "") or "").strip()
+                pdf_outlook_view_model = view_model
+                if summary_text:
+                    st.markdown(
+                        f"""
 <div class="final-verdict-card">
   <div class="final-verdict-title">Final Assessment Summary</div>
   <div class="final-verdict-meta">{html.escape(summary_text)}</div>
 </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-            has_extracted = extracted and (extracted.get("short_term_stance") or extracted.get("fundamental_outlook"))
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                has_extracted = extracted and (extracted.get("short_term_stance") or extracted.get("fundamental_outlook"))
 
-            if has_extracted:
-                short_stance = _pick_keyword(str(extracted.get("short_term_stance", "Neutral") or "Neutral"), ["Bullish", "Neutral", "Bearish"], "Neutral")
-                fund_outlook = _pick_keyword(str(extracted.get("fundamental_outlook", "Stable") or "Stable"), ["Strong", "Stable", "Weakening"], "Stable")
-                stock_outlook = _pick_keyword(str(extracted.get("stock_outlook", "Neutral") or "Neutral"), ["Bullish", "Neutral", "Bearish"], "Neutral")
-                stock_conviction = _pick_keyword(str(extracted.get("stock_conviction", extracted.get("fundamental_conviction", "Medium")) or "Medium"), ["High", "Medium", "Low"], "Medium")
+                if has_extracted:
+                    short_stance = _pick_keyword(str(extracted.get("short_term_stance", "Neutral") or "Neutral"), ["Bullish", "Neutral", "Bearish"], "Neutral")
+                    fund_outlook = _pick_keyword(str(extracted.get("fundamental_outlook", "Stable") or "Stable"), ["Strong", "Stable", "Weakening"], "Stable")
+                    stock_outlook = _pick_keyword(str(extracted.get("stock_outlook", "Neutral") or "Neutral"), ["Bullish", "Neutral", "Bearish"], "Neutral")
+                    stock_conviction = _pick_keyword(str(extracted.get("stock_conviction", extracted.get("fundamental_conviction", "Medium")) or "Medium"), ["High", "Medium", "Low"], "Medium")
 
-                col_s1, col_s2, col_s3 = st.columns(3)
-                with col_s1:
-                    _sc1 = "stance-card-bull" if short_stance == "Bullish" else "stance-card-bear" if short_stance == "Bearish" else "stance-card-neut"
-                    st.markdown(f"""
+                    col_s1, col_s2, col_s3 = st.columns(3)
+                    with col_s1:
+                        _sc1 = "stance-card-bull" if short_stance == "Bullish" else "stance-card-bear" if short_stance == "Bearish" else "stance-card-neut"
+                        st.markdown(f"""
 <div class="stance-card {_sc1}">
   <div style="font-size:11px; color:var(--clr-text-muted);">SHORT-TERM (0-12m)</div>
   <div style="font-size:18px; font-weight:600;">{html.escape(short_stance)}</div>
 </div>
-                    """, unsafe_allow_html=True)
-                with col_s2:
-                    _sc2 = "stance-card-bull" if fund_outlook == "Strong" else "stance-card-neut" if fund_outlook == "Stable" else "stance-card-bear"
-                    st.markdown(f"""
+                        """, unsafe_allow_html=True)
+                    with col_s2:
+                        _sc2 = "stance-card-bull" if fund_outlook == "Strong" else "stance-card-neut" if fund_outlook == "Stable" else "stance-card-bear"
+                        st.markdown(f"""
 <div class="stance-card {_sc2}">
   <div style="font-size:11px; color:var(--clr-text-muted);">FUNDAMENTALS</div>
   <div style="font-size:18px; font-weight:600;">{html.escape(fund_outlook)}</div>
 </div>
-                    """, unsafe_allow_html=True)
-                with col_s3:
-                    _sc3 = "stance-card-bull" if stock_outlook == "Bullish" else "stance-card-bear" if stock_outlook == "Bearish" else "stance-card-neut"
-                    st.markdown(f"""
+                        """, unsafe_allow_html=True)
+                    with col_s3:
+                        _sc3 = "stance-card-bull" if stock_outlook == "Bullish" else "stance-card-bear" if stock_outlook == "Bearish" else "stance-card-neut"
+                        st.markdown(f"""
 <div class="stance-card {_sc3}">
   <div style="font-size:11px; color:var(--clr-text-muted);">STOCK OUTLOOK (CONVICTION: {html.escape(stock_conviction.upper())})</div>
   <div style="font-size:18px; font-weight:600;">{html.escape(stock_outlook)}</div>
 </div>
-                    """, unsafe_allow_html=True)
+                        """, unsafe_allow_html=True)
 
-                key_conditional = _sanitize_ai_valuation_language(extracted.get("key_conditional", ""))
-                if key_conditional and "null" not in str(key_conditional).lower():
-                    st.info(f"**Key Conditional:** {key_conditional}")
+                    key_conditional = _sanitize_ai_valuation_language(extracted.get("key_conditional", ""))
+                    if key_conditional and "null" not in str(key_conditional).lower():
+                        st.info(f"**Key Conditional:** {key_conditional}")
 
-                evidence_gaps = extracted.get("evidence_gaps", [])
-                if evidence_gaps:
-                    sanitized_gaps = [
-                        _sanitize_ai_valuation_language(g) for g in evidence_gaps
-                        if g and "null" not in str(g).lower()
-                    ]
-                    gaps_text = " • ".join(sanitized_gaps)
-                    if gaps_text:
-                        st.caption(f"Evidence gaps: {gaps_text}")
+                    evidence_gaps = extracted.get("evidence_gaps", [])
+                    if evidence_gaps:
+                        sanitized_gaps = [
+                            _sanitize_ai_valuation_language(g) for g in evidence_gaps
+                            if g and "null" not in str(g).lower()
+                        ]
+                        gaps_text = " • ".join(sanitized_gaps)
+                        if gaps_text:
+                            st.caption(f"Evidence gaps: {gaps_text}")
 
-                if full_analysis:
-                    with st.expander("Full Analysis & Final Assessment", expanded=expanded_default):
-                        st.markdown(full_analysis.strip())
-            else:
-                if full_analysis:
-                    with st.expander("Full Analysis & Final Assessment", expanded=expanded_default):
-                        st.markdown(full_analysis.strip())
+                    if full_analysis:
+                        with st.expander("Full Analysis & Final Assessment", expanded=expanded_default):
+                            st.markdown(full_analysis.strip())
                 else:
-                    st.warning("No analysis generated. Please try again.")
+                    if full_analysis:
+                        with st.expander("Full Analysis & Final Assessment", expanded=expanded_default):
+                            st.markdown(full_analysis.strip())
+                    else:
+                        st.warning("No analysis generated. Please try again.")
 
-            st.caption(f"Generated: {forecast.get('forecast_date', 'Unknown')}")
-            st.session_state.forecast_just_generated = False
+                st.caption(f"Generated: {forecast.get('forecast_date', 'Unknown')}")
+                st.session_state.forecast_just_generated = False
 
-    # SECTION F: Sources & Methodology
-    st.markdown('<div id="sources"></div>', unsafe_allow_html=True)
-    st.markdown("---")
-    st.markdown('<div class="section-header"><span class="step-badge">Step 06</span><span class="section-title">Sources & Methodology</span></div>', unsafe_allow_html=True)
-    st.caption("Reference material and citations for all report sections.")
+        # SECTION F: Sources & Methodology
+        st.markdown('<div id="sources"></div>', unsafe_allow_html=True)
+        st.markdown("---")
+        st.markdown('<div class="section-header"><span class="step-badge">Step 06</span><span class="section-title">Sources & Methodology</span></div>', unsafe_allow_html=True)
+        st.caption("Reference material and citations for all report sections.")
 
-    summary_pdf_bytes = _build_summary_pdf_bytes(
-        ticker=ticker,
-        company_name=_company_name_display,
-        as_of_label=most_recent.get("label", ""),
-        data_source=data_source,
-        dcf_ui_data=dcf_ui_data,
-        consensus=consensus,
-        next_forecast_label=next_forecast_label,
-        view_model=pdf_outlook_view_model,
-        wacc_source_summary=wacc_source_summary,
-        hist_data=hist_data,
-        growth_summary=growth_summary,
-    )
-    if summary_pdf_bytes:
-        st.download_button(
-            "Download Summary PDF",
-            data=summary_pdf_bytes,
-            file_name=f"{ticker.lower()}_summary_report.pdf",
-            mime="application/pdf",
-            help="Analyst-style PDF with price comparison, revenue trend, outlook, key drivers, risks, and sources.",
+        summary_pdf_bytes = _build_summary_pdf_bytes(
+            ticker=ticker,
+            company_name=_company_name_display,
+            as_of_label=most_recent.get("label", ""),
+            data_source=data_source,
+            dcf_ui_data=dcf_ui_data,
+            consensus=consensus,
+            next_forecast_label=next_forecast_label,
+            view_model=pdf_outlook_view_model,
+            wacc_source_summary=wacc_source_summary,
+            hist_data=hist_data,
+            growth_summary=growth_summary,
         )
-
-    with st.expander("Methodology", expanded=False, icon="📚"):
-        st.markdown("Core data sources and method notes used in this report:")
-        ticker_for_url = st.session_state.get("ticker", "{ticker}")
-        for src in SOURCE_CATALOG.values():
-            url = src["url"].replace("{ticker}", ticker_for_url)
-            st.markdown(
-                f"**[{src['id']}] {src['label']}** — {src['description']}  \n"
-                f"*Method: {src['method']}*  \n"
-                f"[{url}]({url})"
+        if summary_pdf_bytes:
+            st.download_button(
+                "Download Summary PDF",
+                data=summary_pdf_bytes,
+                file_name=f"{ticker.lower()}_summary_report.pdf",
+                mime="application/pdf",
+                help="Analyst-style PDF with price comparison, revenue trend, outlook, key drivers, risks, and sources.",
             )
 
-    with st.expander("Citations", expanded=False, icon="🔗"):
-        if numbered_citations:
-            st.markdown(_format_numbered_citations_markdown(numbered_citations))
-        else:
-            st.markdown(f"- **[C1]** [Yahoo Finance](https://finance.yahoo.com/quote/{ticker}/analysis) — EPS & Revenue estimates, analyst ratings")
+        with st.expander("Methodology", expanded=False, icon="📚"):
+            st.markdown("Core data sources and method notes used in this report:")
+            ticker_for_url = st.session_state.get("ticker", "{ticker}")
+            for src in SOURCE_CATALOG.values():
+                url = src["url"].replace("{ticker}", ticker_for_url)
+                st.markdown(
+                    f"**[{src['id']}] {src['label']}** — {src['description']}  \n"
+                    f"*Method: {src['method']}*  \n"
+                    f"[{url}]({url})"
+                )
+
+        with st.expander("Citations", expanded=False, icon="🔗"):
+            if numbered_citations:
+                st.markdown(_format_numbered_citations_markdown(numbered_citations))
+            else:
+                st.markdown(f"- **[C1]** [Yahoo Finance](https://finance.yahoo.com/quote/{ticker}/analysis) — EPS & Revenue estimates, analyst ratings")
 
 else:
-    st.info("Enter a ticker and click 'Load Data' to begin analysis.")
+    _boot_log("empty_state_branch")
+    with dashboard_tab:
+        st.info("Use the left sidebar to choose a ticker, select a report date, and click Load Data.")
+    with deep_dive_tab:
+        st.info("Deep Dive unlocks after loading a ticker. You’ll get the valuation verdict, assumption controls, and DCF outputs here.")
+    with compare_tab:
+        st.info("Compare unlocks after loading a ticker. You’ll see DCF versus Street context here.")
+    with reports_tab:
+        st.info("Reports unlock after loading a ticker. AI synthesis, exports, and methodology live here.")
+_boot_log("render_complete")

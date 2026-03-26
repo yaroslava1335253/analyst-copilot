@@ -17,6 +17,8 @@ CARD_GAP = 24
 COLUMN_GAP = 24
 CARD_RADIUS = 26
 FOOTER_SPACE = 72
+OUTLOOK_SUMMARY_MAX_LINES = 12
+OUTLOOK_KEY_CONDITIONAL_MAX_LINES = 4
 
 COLORS = {
     "page": (248, 250, 252),
@@ -442,10 +444,22 @@ def _measure_outlook_panel(outlook: dict, width: int) -> int:
     text_width = width - 56
     total = 196
     if summary:
-        total += _measure_text_block(summary, font=_font(21, bold=False), max_width=text_width, line_padding=7, max_lines=6)
+        total += _measure_text_block(
+            summary,
+            font=_font(21, bold=False),
+            max_width=text_width,
+            line_padding=7,
+            max_lines=OUTLOOK_SUMMARY_MAX_LINES,
+        )
         total += 16
     if key_conditional:
-        total += _measure_text_block(key_conditional, font=_font(18, bold=False), max_width=text_width - 70, line_padding=5, max_lines=3)
+        total += _measure_text_block(
+            key_conditional,
+            font=_font(18, bold=False),
+            max_width=text_width - 70,
+            line_padding=5,
+            max_lines=OUTLOOK_KEY_CONDITIONAL_MAX_LINES,
+        )
         total += 18
     return max(total, 234)
 
@@ -511,7 +525,7 @@ def _draw_outlook_panel(
             fill=COLORS["ink"],
             max_width=width - 56,
             line_padding=7,
-            max_lines=6,
+            max_lines=OUTLOOK_SUMMARY_MAX_LINES,
         )
         body_y += 16
 
@@ -529,7 +543,7 @@ def _draw_outlook_panel(
             fill=COLORS["ink"],
             max_width=width - 56 - label_width - 10,
             line_padding=5,
-            max_lines=3,
+            max_lines=OUTLOOK_KEY_CONDITIONAL_MAX_LINES,
         )
 
 

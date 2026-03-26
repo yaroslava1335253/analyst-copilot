@@ -14,8 +14,6 @@ import requests
 import pandas as pd
 from pathlib import Path
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
 from industry_multiples import get_industry_multiple, DAMODARAN_SOURCE_URL, DAMODARAN_DATA_DATE
 from yf_cache import get_yf_fast_info, get_yf_frame, get_yf_info, get_yf_ticker
 
@@ -24,7 +22,9 @@ try:
 except ImportError:
     YQTicker = None
 
-_genai_client: "genai.Client | None" = None
+_genai_client = None
+_genai_module = None
+_genai_types_module = None
 _sec_ticker_cik_map_cache = None
 SEC_CIK_FALLBACK_MAP = {
     "AAPL": 320193,
@@ -80,10 +80,25 @@ def _redact_api_secrets(text: str, known_secret: str = "") -> str:
 
 def config_genai():
     """Configures the Gemini API client."""
-    global _genai_client
+    global _genai_client, _genai_module, _genai_types_module
     api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-    if api_key:
-        _genai_client = genai.Client(api_key=api_key)
+    if not api_key:
+        return api_key
+
+    if _genai_client is not None:
+        return api_key
+
+    try:
+        if _genai_module is None or _genai_types_module is None:
+            from google import genai as google_genai
+            from google.genai import types as google_genai_types
+
+            _genai_module = google_genai
+            _genai_types_module = google_genai_types
+
+        _genai_client = _genai_module.Client(api_key=api_key)
+    except Exception:
+        _genai_client = None
     return api_key
 
 def get_financials(ticker_symbol: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -539,6 +554,11 @@ def get_gemini_model() -> tuple:
     """Returns (client, model_name) for use with the google.genai SDK."""
     return _genai_client, _GEMINI_MODEL
 
+
+def get_gemini_types_module():
+    """Returns the lazily imported google.genai.types module."""
+    return _genai_types_module
+
 def run_structured_prompt(system_role: str, user_prompt: str, context_data: str) -> str:
     """
     Sends a structured prompt to Google Gemini.
@@ -558,6 +578,8 @@ def run_structured_prompt(system_role: str, user_prompt: str, context_data: str)
     
     try:
         client, model_name = get_gemini_model()
+        if client is None:
+            return "AI Error: Gemini client failed to initialize."
         response = client.models.generate_content(model=model_name, contents=full_prompt)
         return response.text
     except Exception as e:
@@ -573,23 +595,26 @@ def run_chat(chat_history: list, new_message: str, context_data: str) -> str:
 
     try:
         client, model_name = get_gemini_model()
+        genai_types = get_gemini_types_module()
+        if client is None or genai_types is None:
+            return "Error: Gemini client failed to initialize."
         
         # Construct history for Gemini (user/model)
         gemini_history = []
         
         # Seed context in the first message
-        gemini_history.append(types.Content(
+        gemini_history.append(genai_types.Content(
             role="user",
-            parts=[types.Part(text=f"You are a financial analyst. Use this data for all answers:\n\n{context_data}")]
+            parts=[genai_types.Part(text=f"You are a financial analyst. Use this data for all answers:\n\n{context_data}")]
         ))
-        gemini_history.append(types.Content(
+        gemini_history.append(genai_types.Content(
             role="model",
-            parts=[types.Part(text="Understood. I have analyzed the data you provided.")]
+            parts=[genai_types.Part(text="Understood. I have analyzed the data you provided.")]
         ))
             
         for msg in chat_history:
             role = "user" if msg["role"] == "user" else "model"
-            gemini_history.append(types.Content(role=role, parts=[types.Part(text=msg["content"])]))
+            gemini_history.append(genai_types.Content(role=role, parts=[genai_types.Part(text=msg["content"])]))
             
         chat = client.chats.create(model=model_name, history=gemini_history)
         response = chat.send_message(new_message)

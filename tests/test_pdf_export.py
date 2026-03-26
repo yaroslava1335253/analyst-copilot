@@ -1,4 +1,4 @@
-from pdf_export import _font, build_summary_pdf
+from pdf_export import _font, _measure_outlook_panel, build_summary_pdf
 
 
 def test_build_summary_pdf_returns_valid_pdf_bytes():
@@ -62,3 +62,28 @@ def test_pdf_export_uses_bundled_scalable_fonts():
 
     assert str(getattr(regular, "path", "")).endswith("assets/fonts/DejaVuSans.ttf")
     assert str(getattr(bold, "path", "")).endswith("assets/fonts/DejaVuSans-Bold.ttf")
+
+
+def test_measure_outlook_panel_grows_for_longer_summary():
+    short_height = _measure_outlook_panel(
+        {
+            "summary": "Demand remains strong and execution is steady.",
+            "key_conditional": "Watch next quarter guidance.",
+        },
+        1107,
+    )
+    long_height = _measure_outlook_panel(
+        {
+            "summary": (
+                "Microsoft maintains a Neutral to Cautiously Bullish short-term stance, largely driven by strong "
+                "Azure AI demand, Copilot integration, and market share gains, supported by robust free cash flow. "
+                "However, risks persist from a higher-for-longer rate backdrop and potential enterprise IT caution. "
+                "Mid-term, the company appears to maintain a strong growth and profitability path, and the current "
+                "DCF setup suggests assumptions that are reasonable to slightly aggressive."
+            ),
+            "key_conditional": "Watch whether enterprise bookings and Azure margins hold through the next cycle.",
+        },
+        1107,
+    )
+
+    assert long_height > short_height
