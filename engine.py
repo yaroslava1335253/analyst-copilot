@@ -1339,6 +1339,11 @@ def _merge_yahoo_sec_quarterly_income(
             sec_extension_applied = any(bucket not in yahoo_bucket_dates for bucket in active_buckets)
         else:
             active_buckets = _trim_buckets(yahoo_buckets)
+    sec_extended_quarters = [
+        f"{bucket[0]}-Q{bucket[1]}"
+        for bucket in active_buckets
+        if bucket not in yahoo_bucket_dates and bucket in sec_bucket_dates
+    ]
 
     merged_data = {}
     allow_sec_fill = not yahoo_bucket_dates or sec_validation_passed
@@ -1367,6 +1372,7 @@ def _merge_yahoo_sec_quarterly_income(
             "sec_overlap_points": overlap_points,
             "sec_validation_passed": sec_validation_passed,
             "sec_extension_applied": sec_extension_applied,
+            "sec_extended_quarters": sec_extended_quarters,
             "mismatch_points": 0,
             "mismatch_samples": [],
         }
@@ -1398,6 +1404,7 @@ def _merge_yahoo_sec_quarterly_income(
             "sec_overlap_points": overlap_points,
             "sec_validation_passed": sec_validation_passed,
             "sec_extension_applied": sec_extension_applied,
+            "sec_extended_quarters": sec_extended_quarters,
             "mismatch_points": len(mismatches),
             "mismatch_samples": mismatches[:5],
         }
@@ -1413,6 +1420,7 @@ def _merge_yahoo_sec_quarterly_income(
         "sec_overlap_points": overlap_points,
         "sec_validation_passed": sec_validation_passed,
         "sec_extension_applied": sec_extension_applied,
+        "sec_extended_quarters": sec_extended_quarters,
         "mismatch_points": len(mismatches),
         "mismatch_samples": mismatches[:5],
     }
@@ -1449,7 +1457,20 @@ def _get_quarterly_income_history(ticker_symbol: str, max_quarters: int = 20) ->
                 sec_annual_end_backfilled.get("total_q4_derived", 0),
             )
         ):
-            diagnostics["sec_annual_end_backfilled"] = sec_annual_end_backfilled
+            sec_extended_quarters = diagnostics.get("sec_extended_quarters", [])
+            if not isinstance(sec_extended_quarters, list):
+                sec_extended_quarters = []
+            filtered_quarters = [
+                quarter
+                for quarter in sec_annual_end_backfilled.get("quarters", [])
+                if isinstance(quarter, str) and quarter in set(sec_extended_quarters)
+            ]
+            if filtered_quarters:
+                filtered_payload = dict(sec_annual_end_backfilled)
+                filtered_payload["quarters"] = filtered_quarters
+                filtered_payload["total_annual_end_derived"] = len(filtered_quarters)
+                filtered_payload["total_q4_derived"] = len(filtered_quarters)
+                diagnostics["sec_annual_end_backfilled"] = filtered_payload
         if sec_error:
             diagnostics["sec_error"] = str(sec_error)
     if not merged_df.empty:

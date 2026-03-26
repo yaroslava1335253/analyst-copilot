@@ -282,6 +282,10 @@ def test_get_quarterly_income_history_labels_validated_extension(monkeypatch):
             }
         }
     )
+    sec_df.attrs["sec_annual_end_backfilled"] = {
+        "total_annual_end_derived": 3,
+        "quarters": ["2025-Q2", "2024-Q2", "2023-Q2"],
+    }
 
     monkeypatch.setattr("engine._get_quarterly_income_history_sec", lambda ticker_symbol, max_quarters=20: sec_df)
     monkeypatch.setattr("engine.get_yf_ticker", lambda ticker_symbol, use_cache=False: object())
@@ -296,3 +300,6 @@ def test_get_quarterly_income_history_labels_validated_extension(monkeypatch):
     ]
     assert source == "Yahoo + SEC (validated extension)"
     assert diagnostics["sec_extension_applied"] is True
+    assert diagnostics["sec_extended_quarters"] == ["2025-Q2"]
+    assert diagnostics["sec_annual_end_backfilled"]["total_annual_end_derived"] == 1
+    assert diagnostics["sec_annual_end_backfilled"]["quarters"] == ["2025-Q2"]
