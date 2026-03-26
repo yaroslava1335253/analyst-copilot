@@ -5901,6 +5901,12 @@ if st.session_state.quarterly_analysis:
         seasonality_pattern = str(seasonality_info.get("pattern", "N/A") or "N/A").strip()
         if seasonality_pattern == "N/A" and seasonality_reason:
             seasonality_pattern = "Need More Data"
+        seasonality_tip = ""
+        if (
+            isinstance(displayed_quarters_metric, int)
+            and displayed_quarters_metric < 12
+        ) or seasonality_confidence.lower() == "low":
+            seasonality_tip = "Tip: Load more quarters from the Quarter Rail to improve the seasonality read."
         seasonality_help_parts = [
             "Determined from repeated quarter-over-quarter revenue changes across the loaded history.",
             "The model looks for quarter-specific uplift or weakness patterns and needs at least 8 revenue quarters plus repeated comparable transitions.",
@@ -5921,6 +5927,8 @@ if st.session_state.quarterly_analysis:
             seasonality_help_parts.append(f"Confidence: {seasonality_confidence.title()}.")
         if seasonality_reason:
             seasonality_help_parts.append(f"Current run: {seasonality_reason}")
+        if seasonality_tip:
+            seasonality_help_parts.append(seasonality_tip)
         seasonality_help = " ".join(part for part in seasonality_help_parts if part)
 
         col_h1, col_h2, col_h3, col_h4 = st.columns(4)
@@ -6023,6 +6031,8 @@ if st.session_state.quarterly_analysis:
             st.caption(" | ".join(coverage_parts))
         if seasonality_reason:
             st.caption(f"Seasonality method: {seasonality_reason}")
+        if seasonality_tip:
+            st.caption(seasonality_tip)
 
         if hist_data:
             loaded_quarters = len(hist_data)
