@@ -30,7 +30,7 @@ def _utc_now_iso() -> str:
 class DataQualityMetadata:
     """Metadata for a single financial data point."""
     def __init__(self, value=None, units="USD", period_end=None, period_type=None,
-                 source_path=None, retrieved_at=None, reliability_score=100, notes=None,
+                 source_path=None, retrieved_at=None, reliability_score=None, notes=None,
                  is_estimated=False, fallback_reason=None):
         self.value = value
         self.units = units
@@ -38,7 +38,7 @@ class DataQualityMetadata:
         self.period_type = period_type  # "annual", "quarterly", "ttm"
         self.source_path = source_path  # e.g., "yf.Ticker.info['marketCap']"
         self.retrieved_at = retrieved_at
-        self.reliability_score = reliability_score  # 0-100
+        self.reliability_score = reliability_score  # None until assigned, otherwise 0-100
         self.notes = notes or ""
         self.is_estimated = is_estimated  # True if calculated/imputed
         self.fallback_reason = fallback_reason  # e.g., "No quarterly CFO; used annual"
@@ -133,7 +133,7 @@ class NormalizedFinancialSnapshot:
         self.errors = []
         
         # Overall quality score (0-100)
-        self.overall_quality_score = 100
+        self.overall_quality_score = 0
     
     def add_warning(self, code: str, message: str, severity="warn"):
         """Log a warning during data fetch."""
@@ -162,7 +162,11 @@ class NormalizedFinancialSnapshot:
             value = getattr(field, "value", None)
             has_value = value is not None and not pd.isna(value)
 
-            # Guard against untouched defaults (score=100 with no value/source).
+            # Treat uninitialized core scores as zero-quality until explicitly assigned.
+            if not has_value and score is None:
+                score = 0
+
+            # Backward-compatible guard against legacy untouched defaults.
             if not has_value and score == 100:
                 score = 0
 

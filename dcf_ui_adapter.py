@@ -445,7 +445,7 @@ class DCFUIAdapter:
                     "Units": metric.units,
                     "Period": metric.period_type,
                     "Source": metric.source_path or "—",
-                    "Reliability": f"{metric.reliability_score}/100" if metric.reliability_score else "—",
+                    "Reliability": f"{metric.reliability_score}/100" if metric.reliability_score is not None else "—",
                     "Notes": metric.notes or "—"
                 })
             else:
@@ -455,7 +455,7 @@ class DCFUIAdapter:
                     "Units": metric.units,
                     "Period": metric.period_type,
                     "Source": metric.source_path or "—",
-                    "Reliability": f"{metric.reliability_score}/100" if metric.reliability_score else "—",
+                    "Reliability": f"{metric.reliability_score}/100" if metric.reliability_score is not None else "—",
                     "Notes": metric.notes or "—"
                 })
         return rows

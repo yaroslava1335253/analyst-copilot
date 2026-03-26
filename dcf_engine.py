@@ -495,8 +495,9 @@ class DCFEngine:
             checks.append(False)
         
         # Warnings for low-quality data
-        if self.snapshot.ttm_fcf.reliability_score < 70:
-            self.warnings.append(f"TTM FCF reliability low ({self.snapshot.ttm_fcf.reliability_score}/100): {self.snapshot.ttm_fcf.fallback_reason}")
+        ttm_fcf_reliability = getattr(self.snapshot.ttm_fcf, "reliability_score", None)
+        if ttm_fcf_reliability is not None and ttm_fcf_reliability < 70:
+            self.warnings.append(f"TTM FCF reliability low ({ttm_fcf_reliability}/100): {self.snapshot.ttm_fcf.fallback_reason}")
         
         if self.snapshot.overall_quality_score < 60:
             self.warnings.append(f"Overall data quality low ({self.snapshot.overall_quality_score:.0f}/100)")

@@ -14,6 +14,10 @@ from dcf_engine import (
 
 class TestDataQualityMetadata:
     """Test metadata tracking."""
+
+    def test_metadata_default_reliability_is_unset(self):
+        meta = DataQualityMetadata()
+        assert meta.reliability_score is None
     
     def test_metadata_creation(self):
         meta = DataQualityMetadata(
@@ -39,7 +43,7 @@ class TestNormalizedFinancialSnapshot:
     def test_snapshot_initialization(self):
         snap = NormalizedFinancialSnapshot("AAPL")
         assert snap.ticker == "AAPL"
-        assert snap.overall_quality_score == 100
+        assert snap.overall_quality_score == 0
     
     def test_add_warning(self):
         snap = NormalizedFinancialSnapshot("MSFT")
