@@ -8,8 +8,21 @@ on:
 
 jobs:
   pytest:
+    name: pytest (${{ matrix.name }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: consensus
+            test_target: tests/test_consensus_estimates.py
+          - name: dcf
+            test_target: tests/test_dcf_engine.py
+          - name: pdf_export
+            test_target: tests/test_pdf_export.py
+          - name: yf_cache
+            test_target: tests/test_yf_cache.py
 
     steps:
       - name: Check out repository
@@ -29,4 +42,4 @@ jobs:
       - name: Run tests
         env:
           PYTHONPATH: .
-        run: pytest
+        run: pytest ${{ matrix.test_target }}
