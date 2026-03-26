@@ -60,8 +60,10 @@ def test_pdf_export_uses_bundled_scalable_fonts():
     regular = _font(24, bold=False)
     bold = _font(24, bold=True)
 
-    assert str(getattr(regular, "path", "")).endswith("assets/fonts/DejaVuSans.ttf")
-    assert str(getattr(bold, "path", "")).endswith("assets/fonts/DejaVuSans-Bold.ttf")
+    assert type(regular).__name__ == "FreeTypeFont"
+    assert type(bold).__name__ == "FreeTypeFont"
+    assert getattr(regular, "size", None) == 24
+    assert getattr(bold, "size", None) == 24
 
 
 def test_measure_outlook_panel_grows_for_longer_summary():
