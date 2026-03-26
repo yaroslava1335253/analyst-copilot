@@ -5955,16 +5955,28 @@ if st.session_state.quarterly_analysis:
             if len(sec_error_preview) > 120:
                 sec_error_preview = sec_error_preview[:117] + "..."
             coverage_parts.append(f"SEC unavailable: {sec_error_preview}")
-        sec_q4_backfilled = source_diagnostics.get("sec_q4_backfilled", {})
-        if isinstance(sec_q4_backfilled, dict):
-            total_q4_derived = sec_q4_backfilled.get("total_q4_derived")
-            if isinstance(total_q4_derived, int) and total_q4_derived > 0:
-                derived_quarters = sec_q4_backfilled.get("quarters", []) if isinstance(sec_q4_backfilled.get("quarters", []), list) else []
+        sec_annual_end_backfilled = {}
+        if isinstance(source_diagnostics, dict):
+            sec_annual_end_backfilled = (
+                source_diagnostics.get("sec_annual_end_backfilled")
+                or source_diagnostics.get("sec_q4_backfilled", {})
+            )
+        if isinstance(sec_annual_end_backfilled, dict):
+            total_annual_end_derived = sec_annual_end_backfilled.get("total_annual_end_derived")
+            if not isinstance(total_annual_end_derived, int):
+                total_annual_end_derived = sec_annual_end_backfilled.get("total_q4_derived")
+            if isinstance(total_annual_end_derived, int) and total_annual_end_derived > 0:
+                derived_quarters = (
+                    sec_annual_end_backfilled.get("quarters", [])
+                    if isinstance(sec_annual_end_backfilled.get("quarters", []), list)
+                    else []
+                )
                 preview = ", ".join(derived_quarters[:3]) if derived_quarters else ""
                 if len(derived_quarters) > 3:
                     preview += ", ..."
                 coverage_parts.append(
-                    f"SEC Q4 backfilled: {total_q4_derived}" + (f" ({preview})" if preview else "")
+                    f"SEC annual-end quarter backfilled: {total_annual_end_derived}"
+                    + (f" ({preview})" if preview else "")
                 )
         missing_revenue_quarters = data_coverage.get("missing_revenue_quarters", [])
         missing_eps_quarters = data_coverage.get("missing_eps_quarters", [])

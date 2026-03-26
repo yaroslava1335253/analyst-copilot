@@ -948,10 +948,15 @@ def _sec_extract_series(
     return {end: payload["val"] for end, payload in selected_entries.items()}
 
 
-def _sec_backfill_q4_from_annual(quarterly_series: dict, annual_series: dict) -> tuple[dict, list]:
+def _sec_backfill_annual_end_quarter_from_annual(quarterly_series: dict, annual_series: dict) -> tuple[dict, list]:
     """
-    For calendar-year reporters, derive missing Q4 values from:
-    FY total - (Q1 + Q2 + Q3).
+    Derive a missing fiscal-year-end quarter from:
+    FY total - (prior three reported quarters).
+
+    This works for both calendar-year reporters and issuers whose fiscal year
+    ends in another calendar quarter, while preserving the date-based quarter
+    buckets used elsewhere in the app.
+
     Applies only to additive metrics (e.g., revenue, operating income).
     """
     q_series = dict(quarterly_series or {})
@@ -970,9 +975,6 @@ def _sec_backfill_q4_from_annual(quarterly_series: dict, annual_series: dict) ->
     for annual_date, annual_value in annual.items():
         target_bucket = _quarter_bucket_from_date_key(annual_date)
         if target_bucket is None:
-            continue
-        # Keep this aligned with calendar-quarter labels used in the UI.
-        if target_bucket[1] != 4:
             continue
         if target_bucket in quarter_bucket_map:
             continue
@@ -1080,7 +1082,7 @@ def _get_quarterly_income_history_sec(ticker_symbol: str, max_quarters: int = 20
             ],
             unit_kind="USD",
         )
-        revenue_series, revenue_q4_derived = _sec_backfill_q4_from_annual(
+        revenue_series, revenue_annual_end_derived = _sec_backfill_annual_end_quarter_from_annual(
             revenue_quarterly_series,
             annual_revenue_series,
         )
@@ -1093,7 +1095,7 @@ def _get_quarterly_income_history_sec(ticker_symbol: str, max_quarters: int = 20
             concepts=["OperatingIncomeLoss"],
             unit_kind="USD",
         )
-        operating_income_series, operating_income_q4_derived = _sec_backfill_q4_from_annual(
+        operating_income_series, operating_income_annual_end_derived = _sec_backfill_annual_end_quarter_from_annual(
             operating_income_quarterly_series,
             annual_operating_income_series,
         )
@@ -1132,15 +1134,24 @@ def _get_quarterly_income_history_sec(ticker_symbol: str, max_quarters: int = 20
             return empty
 
         backfill_quarters = sorted(
-            set([r.get("quarter") for r in revenue_q4_derived + operating_income_q4_derived if r.get("quarter")]),
+            set(
+                [
+                    r.get("quarter")
+                    for r in revenue_annual_end_derived + operating_income_annual_end_derived
+                    if r.get("quarter")
+                ]
+            ),
             reverse=True,
         )
-        df.attrs["sec_q4_backfilled"] = {
-            "revenue_q4_derived": len(revenue_q4_derived),
-            "operating_income_q4_derived": len(operating_income_q4_derived),
-            "total_q4_derived": len(backfill_quarters),
+        backfill_payload = {
+            "revenue_annual_end_derived": len(revenue_annual_end_derived),
+            "operating_income_annual_end_derived": len(operating_income_annual_end_derived),
+            "total_annual_end_derived": len(backfill_quarters),
             "quarters": backfill_quarters,
         }
+        # Keep the legacy attr for compatibility with older cached diagnostics.
+        df.attrs["sec_annual_end_backfilled"] = backfill_payload
+        df.attrs["sec_q4_backfilled"] = backfill_payload
         return df
     except Exception as e:
         empty = pd.DataFrame()
@@ -1273,9 +1284,14 @@ def _merge_yahoo_sec_quarterly_income(
     sec_raw_dates = _extract_date_keys(sec_df)
     yahoo_bucket_dates = _extract_quarter_bucket_dates(yahoo_df)
     sec_bucket_dates = _extract_quarter_bucket_dates(sec_df)
+    yahoo_buckets = sorted(set(yahoo_bucket_dates), reverse=True)
+    sec_buckets = sorted(set(sec_bucket_dates), reverse=True)
     merged_buckets = sorted(set(yahoo_bucket_dates) | set(sec_bucket_dates), reverse=True)
-    if max_quarters and len(merged_buckets) > max_quarters:
-        merged_buckets = merged_buckets[:max_quarters]
+
+    def _trim_buckets(buckets: list[tuple[int, int]]) -> list[tuple[int, int]]:
+        if max_quarters and len(buckets) > max_quarters:
+            return buckets[:max_quarters]
+        return buckets
 
     metric_specs = [
         ("Total Revenue", ["Total Revenue", "Operating Revenue", "Revenue", "Revenues"], False),
@@ -1284,17 +1300,18 @@ def _merge_yahoo_sec_quarterly_income(
         ("Diluted EPS", ["Diluted EPS", "Basic EPS", "Normalized EPS", "EPS"], True),
     ]
 
-    merged_data = {}
     mismatches = []
+    overlap_points = 0
+    metric_maps = []
     for metric_name, keys, is_eps in metric_specs:
         y_map = _metric_map(yahoo_df, keys)
         s_map = _metric_map(sec_df, keys)
-        merged_vals = []
-        for bucket in merged_buckets:
+        metric_maps.append((metric_name, y_map, s_map, is_eps))
+        for bucket in sorted(set(y_map) & set(s_map), reverse=True):
             y_val = y_map.get(bucket)
             s_val = s_map.get(bucket)
-            chosen = None
             if y_val is not None and s_val is not None:
+                overlap_points += 1
                 if _values_conflict(y_val, s_val, is_eps=is_eps):
                     y_date = yahoo_bucket_dates.get(bucket)
                     s_date = sec_bucket_dates.get(bucket)
@@ -1306,16 +1323,39 @@ def _merge_yahoo_sec_quarterly_income(
                         "yahoo": y_val,
                         "sec": s_val,
                     })
-                # User requirement: prioritize Yahoo when sources differ.
+
+    sec_validation_passed = False
+    sec_extension_applied = False
+    if not yahoo_bucket_dates:
+        active_buckets = _trim_buckets(sec_buckets)
+        sec_validation_passed = bool(sec_bucket_dates)
+        sec_extension_applied = bool(sec_bucket_dates)
+    elif not sec_bucket_dates:
+        active_buckets = _trim_buckets(yahoo_buckets)
+    else:
+        sec_validation_passed = overlap_points > 0 and not mismatches
+        if sec_validation_passed:
+            active_buckets = _trim_buckets(merged_buckets)
+            sec_extension_applied = any(bucket not in yahoo_bucket_dates for bucket in active_buckets)
+        else:
+            active_buckets = _trim_buckets(yahoo_buckets)
+
+    merged_data = {}
+    allow_sec_fill = not yahoo_bucket_dates or sec_validation_passed
+    for metric_name, y_map, s_map, is_eps in metric_maps:
+        merged_vals = []
+        for bucket in active_buckets:
+            y_val = y_map.get(bucket)
+            s_val = s_map.get(bucket)
+            chosen = None
+            if y_val is not None:
                 chosen = y_val
-            elif y_val is not None:
-                chosen = y_val
-            elif s_val is not None:
+            elif allow_sec_fill and s_val is not None:
                 chosen = s_val
             merged_vals.append(chosen)
         merged_data[metric_name] = merged_vals
 
-    if not merged_buckets:
+    if not active_buckets:
         return pd.DataFrame(), {
             "yahoo_quarters": len(yahoo_bucket_dates),
             "sec_quarters": len(sec_bucket_dates),
@@ -1324,12 +1364,15 @@ def _merge_yahoo_sec_quarterly_income(
             "sec_raw_dates": len(sec_raw_dates),
             "yahoo_date_collisions_collapsed": max(0, len(yahoo_raw_dates) - len(yahoo_bucket_dates)),
             "sec_date_collisions_collapsed": max(0, len(sec_raw_dates) - len(sec_bucket_dates)),
+            "sec_overlap_points": overlap_points,
+            "sec_validation_passed": sec_validation_passed,
+            "sec_extension_applied": sec_extension_applied,
             "mismatch_points": 0,
             "mismatch_samples": [],
         }
 
     merged_date_keys = []
-    for bucket in merged_buckets:
+    for bucket in active_buckets:
         y_date = yahoo_bucket_dates.get(bucket)
         s_date = sec_bucket_dates.get(bucket)
         candidates = [d for d in [y_date, s_date] if d]
@@ -1352,6 +1395,9 @@ def _merge_yahoo_sec_quarterly_income(
             "sec_raw_dates": len(sec_raw_dates),
             "yahoo_date_collisions_collapsed": max(0, len(yahoo_raw_dates) - len(yahoo_bucket_dates)),
             "sec_date_collisions_collapsed": max(0, len(sec_raw_dates) - len(sec_bucket_dates)),
+            "sec_overlap_points": overlap_points,
+            "sec_validation_passed": sec_validation_passed,
+            "sec_extension_applied": sec_extension_applied,
             "mismatch_points": len(mismatches),
             "mismatch_samples": mismatches[:5],
         }
@@ -1359,11 +1405,14 @@ def _merge_yahoo_sec_quarterly_income(
     return merged_df, {
         "yahoo_quarters": len(yahoo_bucket_dates),
         "sec_quarters": len(sec_bucket_dates),
-        "merged_quarters": len(merged_buckets),
+        "merged_quarters": len(active_buckets),
         "yahoo_raw_dates": len(yahoo_raw_dates),
         "sec_raw_dates": len(sec_raw_dates),
         "yahoo_date_collisions_collapsed": max(0, len(yahoo_raw_dates) - len(yahoo_bucket_dates)),
         "sec_date_collisions_collapsed": max(0, len(sec_raw_dates) - len(sec_bucket_dates)),
+        "sec_overlap_points": overlap_points,
+        "sec_validation_passed": sec_validation_passed,
+        "sec_extension_applied": sec_extension_applied,
         "mismatch_points": len(mismatches),
         "mismatch_samples": mismatches[:5],
     }
@@ -1386,14 +1435,31 @@ def _get_quarterly_income_history(ticker_symbol: str, max_quarters: int = 20) ->
         max_quarters=max_quarters,
     )
     if isinstance(diagnostics, dict):
-        sec_q4_backfilled = sec_quarterly_income.attrs.get("sec_q4_backfilled") if hasattr(sec_quarterly_income, "attrs") else None
-        if isinstance(sec_q4_backfilled, dict) and sec_q4_backfilled.get("total_q4_derived", 0):
-            diagnostics["sec_q4_backfilled"] = sec_q4_backfilled
+        sec_annual_end_backfilled = None
+        if hasattr(sec_quarterly_income, "attrs"):
+            sec_annual_end_backfilled = (
+                sec_quarterly_income.attrs.get("sec_annual_end_backfilled")
+                or sec_quarterly_income.attrs.get("sec_q4_backfilled")
+            )
+        if (
+            diagnostics.get("sec_extension_applied")
+            and isinstance(sec_annual_end_backfilled, dict)
+            and sec_annual_end_backfilled.get(
+                "total_annual_end_derived",
+                sec_annual_end_backfilled.get("total_q4_derived", 0),
+            )
+        ):
+            diagnostics["sec_annual_end_backfilled"] = sec_annual_end_backfilled
         if sec_error:
             diagnostics["sec_error"] = str(sec_error)
     if not merged_df.empty:
         if not yahoo_quarterly_income.empty and not sec_quarterly_income.empty:
-            source = "Yahoo + SEC (Yahoo-priority)"
+            if diagnostics.get("sec_extension_applied"):
+                source = "Yahoo + SEC (validated extension)"
+            elif diagnostics.get("sec_overlap_points", 0):
+                source = "Yahoo Finance (SEC cross-check)"
+            else:
+                source = "Yahoo Finance"
         elif not yahoo_quarterly_income.empty:
             source = "Yahoo Finance"
         elif not sec_quarterly_income.empty:
@@ -1776,28 +1842,51 @@ def analyze_quarterly_trends(
         if not all_quarters:
             result["errors"].append("Quarterly history is present but no valid quarter columns were found")
             return result
-        if data_source.startswith("Yahoo + SEC"):
-            mismatch_points = source_diagnostics.get("mismatch_points", 0) if isinstance(source_diagnostics, dict) else 0
-            if mismatch_points:
-                result["warning"] = (
-                    f"Cross-source checks found {mismatch_points} metric mismatches between Yahoo and SEC. "
-                    "Yahoo values were prioritized where overlaps differed."
+        mismatch_points = source_diagnostics.get("mismatch_points", 0) if isinstance(source_diagnostics, dict) else 0
+        sec_overlap_points = source_diagnostics.get("sec_overlap_points", 0) if isinstance(source_diagnostics, dict) else 0
+        sec_extension_applied = (
+            bool(source_diagnostics.get("sec_extension_applied"))
+            if isinstance(source_diagnostics, dict)
+            else False
+        )
+        sec_quarters = source_diagnostics.get("sec_quarters", 0) if isinstance(source_diagnostics, dict) else 0
+        if mismatch_points:
+            result["warning"] = (
+                f"Cross-source checks found {mismatch_points} metric mismatches between Yahoo and SEC. "
+                "Yahoo values were kept, and older SEC-only quarters were not merged."
+            )
+        if sec_extension_applied:
+            sec_annual_end_backfilled = {}
+            if isinstance(source_diagnostics, dict):
+                sec_annual_end_backfilled = (
+                    source_diagnostics.get("sec_annual_end_backfilled")
+                    or source_diagnostics.get("sec_q4_backfilled", {})
                 )
-            sec_q4_backfilled = source_diagnostics.get("sec_q4_backfilled", {}) if isinstance(source_diagnostics, dict) else {}
-            if isinstance(sec_q4_backfilled, dict) and sec_q4_backfilled.get("total_q4_derived", 0):
-                derived_quarters = sec_q4_backfilled.get("quarters", []) if isinstance(sec_q4_backfilled.get("quarters", []), list) else []
+            total_annual_end_derived = (
+                sec_annual_end_backfilled.get("total_annual_end_derived")
+                if isinstance(sec_annual_end_backfilled, dict)
+                else 0
+            )
+            if not isinstance(total_annual_end_derived, int) and isinstance(sec_annual_end_backfilled, dict):
+                total_annual_end_derived = sec_annual_end_backfilled.get("total_q4_derived", 0)
+            if isinstance(sec_annual_end_backfilled, dict) and total_annual_end_derived:
+                derived_quarters = (
+                    sec_annual_end_backfilled.get("quarters", [])
+                    if isinstance(sec_annual_end_backfilled.get("quarters", []), list)
+                    else []
+                )
                 preview = ", ".join(derived_quarters[:3]) if derived_quarters else ""
                 if len(derived_quarters) > 3:
                     preview += ", ..."
                 backfill_note = (
-                    f"SEC annual-minus-Q1..Q3 backfill filled missing Q4 for {sec_q4_backfilled.get('total_q4_derived')} quarter(s)"
+                    f"SEC annual-minus-prior-three-quarter backfill filled {total_annual_end_derived} missing annual-end quarter(s)"
                     + (f" ({preview})." if preview else ".")
                 )
                 result["warning"] = ((result.get("warning") + " ") if result.get("warning") else "") + backfill_note
-            if len(all_quarters) < requested_quarters:
+            if data_source.startswith("Yahoo + SEC") and len(all_quarters) < requested_quarters:
                 result["warning"] = (
                     (result.get("warning") + " " if result.get("warning") else "")
-                    + f"Merged Yahoo+SEC history currently has {len(all_quarters)} quarters for {ticker_symbol}."
+                    + f"Validated Yahoo+SEC history currently has {len(all_quarters)} quarters for {ticker_symbol}."
                 )
         elif data_source.startswith("SEC Company Facts") and len(all_quarters) < requested_quarters:
             result["warning"] = (
@@ -1812,10 +1901,26 @@ def analyze_quarterly_trends(
                 if len(sec_error_text) > 180:
                     sec_error_text = sec_error_text[:177] + "..."
                 sec_error_note = f" SEC fetch issue: {sec_error_text}"
-            result["warning"] = (
-                f"Yahoo Finance returned {len(all_quarters)} quarterly reports for {ticker_symbol}. "
-                f"SEC data was unavailable for additional merge coverage.{sec_error_note}"
-            )
+            if sec_overlap_points > 0:
+                cross_check_note = (
+                    f"SEC cross-check found {mismatch_points} mismatched metric point(s), so older SEC-only quarters were not merged."
+                    if mismatch_points
+                    else "SEC cross-check matched overlapping quarters, but SEC did not add any older consecutive quarters."
+                )
+                result["warning"] = (
+                    f"Yahoo Finance returned {len(all_quarters)} quarterly reports for {ticker_symbol}. "
+                    + cross_check_note
+                )
+            elif sec_quarters:
+                result["warning"] = (
+                    f"Yahoo Finance returned {len(all_quarters)} quarterly reports for {ticker_symbol}. "
+                    "SEC data did not provide enough comparable overlapping quarters to validate an extension."
+                )
+            else:
+                result["warning"] = (
+                    f"Yahoo Finance returned {len(all_quarters)} quarterly reports for {ticker_symbol}. "
+                    f"SEC data was unavailable for additional merge coverage.{sec_error_note}"
+                )
         
         # Find the most recent quarter
         most_recent = all_quarters[0]
