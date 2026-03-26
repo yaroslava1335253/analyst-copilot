@@ -109,6 +109,7 @@ class FakeErrorResponse(FakeResponse):
 def test_fetch_consensus_estimates_handles_none_info(monkeypatch):
     monkeypatch.delenv("FMP_API_KEY", raising=False)
     monkeypatch.setattr("engine.get_yf_ticker", lambda ticker, use_cache=False: EmptyConsensusTicker())
+    monkeypatch.setattr("engine.YQTicker", None)
 
     result = fetch_consensus_estimates("MSFT", "FY2026 Q1")
 
@@ -122,6 +123,7 @@ def test_fetch_consensus_estimates_handles_none_info(monkeypatch):
 def test_fetch_consensus_estimates_uses_partial_data_without_error(monkeypatch):
     monkeypatch.delenv("FMP_API_KEY", raising=False)
     monkeypatch.setattr("engine.get_yf_ticker", lambda ticker, use_cache=False: PartialConsensusTicker())
+    monkeypatch.setattr("engine.YQTicker", None)
 
     result = fetch_consensus_estimates("MSFT", "FY2026 Q1")
 
@@ -135,6 +137,7 @@ def test_fetch_consensus_estimates_uses_partial_data_without_error(monkeypatch):
 def test_fetch_consensus_estimates_handles_info_property_error(monkeypatch):
     monkeypatch.delenv("FMP_API_KEY", raising=False)
     monkeypatch.setattr("engine.get_yf_ticker", lambda ticker, use_cache=False: ExplodingInfoTicker())
+    monkeypatch.setattr("engine.YQTicker", None)
 
     result = fetch_consensus_estimates("AAPL", "FY2026 Q1")
 
