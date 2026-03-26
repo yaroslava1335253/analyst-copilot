@@ -5896,6 +5896,32 @@ if st.session_state.quarterly_analysis:
                 loaded_quarters_for_metric,
                 max(1, int(requested_quarters_for_metric)),
             )
+        seasonality_reason = str(seasonality_info.get("reason", "") or "").strip()
+        seasonality_confidence = str(seasonality_info.get("confidence", "") or "").strip()
+        seasonality_pattern = str(seasonality_info.get("pattern", "N/A") or "N/A").strip()
+        if seasonality_pattern == "N/A" and seasonality_reason:
+            seasonality_pattern = "Need More Data"
+        seasonality_help_parts = [
+            "Determined from repeated quarter-over-quarter revenue changes across the loaded history.",
+            "The model looks for quarter-specific uplift or weakness patterns and needs at least 8 revenue quarters plus repeated comparable transitions.",
+        ]
+        if seasonality_pattern == "Mixed Seasonality":
+            seasonality_help_parts.append(
+                "Mixed Seasonality means some quarter effects exist, but no single quarter is consistently dominant."
+            )
+        elif seasonality_pattern == "Low Seasonality":
+            seasonality_help_parts.append(
+                "Low Seasonality means quarter-to-quarter revenue changes are relatively even across the year."
+            )
+        elif seasonality_pattern == "Need More Data":
+            seasonality_help_parts.append(
+                "Need More Data means there are not yet enough comparable quarters to score a reliable pattern."
+            )
+        if seasonality_confidence:
+            seasonality_help_parts.append(f"Confidence: {seasonality_confidence.title()}.")
+        if seasonality_reason:
+            seasonality_help_parts.append(f"Current run: {seasonality_reason}")
+        seasonality_help = " ".join(part for part in seasonality_help_parts if part)
 
         col_h1, col_h2, col_h3, col_h4 = st.columns(4)
         with col_h1:
@@ -5920,10 +5946,7 @@ if st.session_state.quarterly_analysis:
                     quarters_plotted = fallback_samples if isinstance(fallback_samples, int) else 0
             st.metric("Quarters Plotted", quarters_plotted if quarters_plotted else "N/A")
         with col_h4:
-            seasonality = seasonality_info.get("pattern", "N/A")
-            if str(seasonality).strip() == "N/A" and str(seasonality_info.get("reason", "")).strip():
-                seasonality = "Need More Data"
-            st.metric("Seasonality Pattern", seasonality)
+            st.metric("Seasonality Pattern", seasonality_pattern, help=seasonality_help)
 
         total_quarters = growth_summary.get("samples_used")
         revenue_yoy_pairs = growth_summary.get("revenue_yoy_pairs")
@@ -5998,7 +6021,6 @@ if st.session_state.quarterly_analysis:
             coverage_parts.append(f"Missing EPS: {missing_eps_display}")
         if coverage_parts:
             st.caption(" | ".join(coverage_parts))
-        seasonality_reason = seasonality_info.get("reason")
         if seasonality_reason:
             st.caption(f"Seasonality method: {seasonality_reason}")
 
