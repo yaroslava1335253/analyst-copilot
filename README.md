@@ -1,32 +1,45 @@
 # Analyst Co-Pilot
 
-Analyst Co-Pilot is a Streamlit app for equity research workflows. It combines historical business analysis, DCF-based valuation, street-consensus comparison, AI-generated written takeaways, and exportable PDF summaries in one interface.
+Analyst Co-Pilot is a Streamlit application for single-company equity research. It combines historical financial analysis, discounted cash flow valuation, market comparison, AI-assisted written output, and PDF export in one interface.
 
-The app is designed for fast single-name analysis:
+The project is designed to support a compact research workflow:
 
-- `Dashboard`: operating snapshot, business momentum, and quality-of-business context
-- `Deep Dive`: valuation verdict, DCF assumptions, and supporting model outputs
-- `Compare`: market price vs. DCF value vs. street targets
-- `Reports`: generated write-up and PDF export
+1. Load a public company by ticker.
+2. Review operating performance and financial trends.
+3. Run a DCF valuation with adjustable assumptions.
+4. Compare the model output with market pricing and analyst targets.
+5. Generate a written summary and export a report.
 
-## What It Does
+## Main Features
 
-- Pulls company financials and market data from Yahoo Finance, YahooQuery, and optional FMP fallbacks
-- Calculates operating metrics, growth trends, DuPont-style diagnostics, and valuation drivers
-- Runs a structured DCF engine with traceable assumptions and explicit fallback logic
-- Generates an AI-assisted equity outlook using the loaded company data
-- Exports a clean analyst-style PDF summary for sharing or review
+- Historical financial analysis and trend review
+- DCF valuation with editable assumptions
+- Comparison of intrinsic value, market price, and street consensus
+- AI-generated written summary based on loaded company data
+- PDF report export
 
-## Stack
+## Technology Stack
 
 - Python
 - Streamlit
-- Pandas
+- pandas
 - yfinance
 - yahooquery
 - google-genai
 
-## Quick Start
+## Key Files
+
+- `app.py`: main Streamlit application and user interface
+- `engine.py`: analysis logic, consensus lookup, and AI/report helpers
+- `dcf_engine.py`: core discounted cash flow model
+- `dcf_ui_adapter.py`: formatting layer for DCF outputs shown in the UI
+- `data_adapter.py`: financial data normalization and metadata handling
+- `pdf_export.py`: PDF report generation
+- `tests/`: automated tests
+- `docs/`: supporting documentation
+- `legacy/`: archived reference code not required for normal use
+
+## Setup
 
 1. Create and activate a virtual environment.
 
@@ -46,82 +59,37 @@ pip install -r requirements.txt
 ```dotenv
 GEMINI_API_KEY=your_key_here
 FMP_API_KEY=your_optional_fmp_key
-CONTACT_EMAIL_TO=your_email@example.com
+CONTACT_EMAIL_TO=your_optional_email@example.com
 ```
 
-Notes:
-
-- `GEMINI_API_KEY` is required for AI outlook generation.
-- `FMP_API_KEY` is optional but improves analyst-consensus coverage and fallbacks.
-- `CONTACT_EMAIL_TO` is optional and powers the in-app contact panel.
-
-4. Start the app.
+4. Start the application.
 
 ```bash
 streamlit run app.py
 ```
 
+## Environment Variables
+
+- `GEMINI_API_KEY`: required for AI-generated written output
+- `FMP_API_KEY`: optional; improves analyst-consensus coverage and fallback data access
+- `CONTACT_EMAIL_TO`: optional; used by the in-app contact feature
+
+## How to Use
+
+1. Launch the app and enter a ticker symbol.
+2. Use `Dashboard` to review the company snapshot and historical context.
+3. Use `Deep Dive` to adjust assumptions and run the DCF model.
+4. Use `Compare` to view valuation output against market and analyst benchmarks.
+5. Use `Reports` to generate written output and export a PDF summary.
+
 ## Testing
 
-Run the test suite with:
+Run the full test suite with:
 
 ```bash
 pytest
 ```
 
-Useful focused runs:
+## Data Sources
 
-```bash
-pytest tests/test_dcf_engine.py
-pytest tests/test_consensus_estimates.py
-pytest tests/test_pdf_export.py
-```
-
-## Project Structure
-
-```text
-.
-├── app.py                  # Streamlit UI entrypoint
-├── engine.py               # Analysis, consensus, AI, and data orchestration helpers
-├── dcf_engine.py           # Core DCF calculation engine
-├── dcf_integration.py      # Integration layer between valuation engine and app flows
-├── dcf_ui_adapter.py       # UI formatting helpers for valuation outputs
-├── data_adapter.py         # Financial data normalization and quality metadata
-├── pdf_export.py           # PDF summary renderer
-├── sources.py              # Source metadata and citations
-├── yf_cache.py             # Yahoo Finance caching helpers
-├── docs/                   # Architecture notes, migration docs, and verification writeups
-├── legacy/                 # Older reference implementations kept for comparison
-├── scripts/                # Local utilities and diagnostics
-├── tests/                  # Automated tests
-└── data/                   # Local runtime cache and artifacts
-```
-
-## Security Notes
-
-- Keep secrets in local `.env` files or deployment secret stores only.
-- `.env`, `.env.save`, and local cache artifacts are gitignored in [.gitignore](./.gitignore).
-- `data/user_ui_cache.json` is intended to remain local and should not be reintroduced to version control.
-
-## Documentation
-
-Additional project notes live in [`docs/`](./docs):
-
-- [`docs/DCF_ARCHITECTURE.md`](./docs/DCF_ARCHITECTURE.md)
-- [`docs/DCF_UI_USER_GUIDE.md`](./docs/DCF_UI_USER_GUIDE.md)
-- [`docs/REPO_ORGANIZATION.md`](./docs/REPO_ORGANIZATION.md)
-
-## Current Status
-
-The repository is actively evolving. The app is functional and tested, but the codebase is still mid-refactor in a few places:
-
-- `app.py` remains larger than ideal and is a strong candidate for UI-module extraction
-- `engine.py` still mixes multiple responsibilities
-- `legacy/` is retained for reference and can eventually be archived out of the main repo
-
-## Suggested Next Cleanup
-
-- Split `app.py` into per-view UI modules
-- Split `engine.py` into data-fetch, consensus, and AI/reporting modules
-- Add deployment metadata for the hosting platform you want to standardize on
-- Remove stale historical cache artifacts from Git history if the repo will remain public
+The application primarily uses Yahoo Finance and YahooQuery, with optional Financial Modeling Prep support when an `FMP_API_KEY` is provided.
