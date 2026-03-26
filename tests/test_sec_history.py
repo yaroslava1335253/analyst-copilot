@@ -2,9 +2,11 @@ import pytest
 import pandas as pd
 
 from engine import (
+    _filter_source_diagnostics_for_window,
     _get_quarterly_income_history,
     _get_quarterly_income_history_sec,
     _merge_yahoo_sec_quarterly_income,
+    analyze_quarterly_trends,
     _sec_backfill_annual_end_quarter_from_annual,
 )
 
@@ -303,3 +305,81 @@ def test_get_quarterly_income_history_labels_validated_extension(monkeypatch):
     assert diagnostics["sec_extended_quarters"] == ["2025-Q2"]
     assert diagnostics["sec_annual_end_backfilled"]["total_annual_end_derived"] == 1
     assert diagnostics["sec_annual_end_backfilled"]["quarters"] == ["2025-Q2"]
+
+
+def test_filter_source_diagnostics_for_window_keeps_only_visible_quarters():
+    diagnostics = {
+        "sec_overlap_points": 5,
+        "sec_extension_applied": True,
+        "sec_extended_quarters": ["2024-Q2", "2023-Q2", "2022-Q2", "2021-Q2"],
+        "sec_annual_end_backfilled": {
+            "total_annual_end_derived": 4,
+            "quarters": ["2024-Q2", "2023-Q2", "2022-Q2", "2021-Q2"],
+        },
+    }
+
+    filtered = _filter_source_diagnostics_for_window(
+        diagnostics,
+        [
+            (2025, 4),
+            (2025, 3),
+            (2025, 2),
+            (2025, 1),
+            (2024, 4),
+            (2024, 3),
+            (2024, 2),
+            (2024, 1),
+            (2023, 4),
+            (2023, 3),
+        ],
+    )
+
+    assert filtered["sec_extended_quarters"] == ["2024-Q2"]
+    assert filtered["sec_extension_applied_in_window"] is True
+    assert filtered["sec_annual_end_backfilled"]["total_annual_end_derived"] == 1
+    assert filtered["sec_annual_end_backfilled"]["quarters"] == ["2024-Q2"]
+
+
+def test_analyze_quarterly_trends_trims_sec_backfill_diagnostics_to_requested_window(monkeypatch):
+    quarter_range = pd.period_range(end="2025Q4", periods=20, freq="Q")
+    quarter_dates = [pd.Timestamp(period.end_time.date()) for period in reversed(quarter_range)]
+    income_df = pd.DataFrame(
+        {
+            quarter_date: {
+                "Total Revenue": 100_000_000_000 - idx * 1_000_000_000,
+                "Operating Income": 30_000_000_000 - idx * 500_000_000,
+                "Basic EPS": 5.0 - idx * 0.05,
+                "Diluted EPS": 5.0 - idx * 0.05,
+            }
+            for idx, quarter_date in enumerate(quarter_dates)
+        }
+    )
+    diagnostics = {
+        "sec_overlap_points": 5,
+        "sec_extension_applied": True,
+        "sec_extended_quarters": ["2024-Q2", "2023-Q2", "2022-Q2", "2021-Q2"],
+        "sec_annual_end_backfilled": {
+            "total_annual_end_derived": 4,
+            "quarters": ["2024-Q2", "2023-Q2", "2022-Q2", "2021-Q2"],
+        },
+    }
+
+    monkeypatch.setattr("engine.get_yf_ticker", lambda ticker_symbol: object())
+    monkeypatch.setattr("engine.get_yf_info", lambda stock: {})
+    monkeypatch.setattr("engine.get_yf_fast_info", lambda stock: {})
+    monkeypatch.setattr(
+        "engine._get_quarterly_income_history",
+        lambda ticker_symbol, max_quarters=20: (income_df, "Yahoo + SEC (validated extension)", diagnostics),
+    )
+    monkeypatch.setattr(
+        "engine.fetch_consensus_estimates",
+        lambda ticker_symbol, next_quarter_label, include_qualitative=False, fmp_api_key=None: {},
+    )
+
+    result = analyze_quarterly_trends("MSFT", num_quarters=10)
+
+    assert result["data_source"] == "Yahoo + SEC (validated extension)"
+    filtered = result["historical_trends"]["source_diagnostics"]
+    assert filtered["sec_extended_quarters"] == ["2024-Q2"]
+    assert filtered["sec_annual_end_backfilled"]["total_annual_end_derived"] == 1
+    assert filtered["sec_annual_end_backfilled"]["quarters"] == ["2024-Q2"]

@@ -1426,6 +1426,53 @@ def _merge_yahoo_sec_quarterly_income(
     }
 
 
+def _filter_source_diagnostics_for_window(source_diagnostics: dict, window_buckets: list[tuple[int, int]]) -> dict:
+    if not isinstance(source_diagnostics, dict):
+        return {}
+
+    filtered = dict(source_diagnostics)
+    window_quarters = [
+        f"{bucket[0]}-Q{bucket[1]}"
+        for bucket in window_buckets
+        if isinstance(bucket, tuple) and len(bucket) == 2
+    ]
+    window_quarter_set = set(window_quarters)
+    if not window_quarter_set:
+        return filtered
+
+    sec_extended_quarters = filtered.get("sec_extended_quarters", [])
+    if isinstance(sec_extended_quarters, list):
+        filtered_extended_quarters = [
+            quarter
+            for quarter in sec_extended_quarters
+            if isinstance(quarter, str) and quarter in window_quarter_set
+        ]
+        filtered["sec_extended_quarters"] = filtered_extended_quarters
+        filtered["sec_extension_applied_in_window"] = bool(filtered_extended_quarters)
+    else:
+        filtered["sec_extension_applied_in_window"] = False
+
+    sec_annual_end_backfilled = filtered.get("sec_annual_end_backfilled") or filtered.get("sec_q4_backfilled")
+    if isinstance(sec_annual_end_backfilled, dict):
+        filtered_backfill_quarters = [
+            quarter
+            for quarter in sec_annual_end_backfilled.get("quarters", [])
+            if isinstance(quarter, str) and quarter in window_quarter_set
+        ]
+        if filtered_backfill_quarters:
+            filtered_payload = dict(sec_annual_end_backfilled)
+            filtered_payload["quarters"] = filtered_backfill_quarters
+            filtered_payload["total_annual_end_derived"] = len(filtered_backfill_quarters)
+            filtered_payload["total_q4_derived"] = len(filtered_backfill_quarters)
+            filtered["sec_annual_end_backfilled"] = filtered_payload
+            filtered["sec_q4_backfilled"] = filtered_payload
+        else:
+            filtered.pop("sec_annual_end_backfilled", None)
+            filtered.pop("sec_q4_backfilled", None)
+
+    return filtered
+
+
 def _get_quarterly_income_history(ticker_symbol: str, max_quarters: int = 20) -> tuple[pd.DataFrame, str, dict]:
     sec_quarterly_income = _get_quarterly_income_history_sec(ticker_symbol, max_quarters=max_quarters)
     sec_error = sec_quarterly_income.attrs.get("sec_error") if hasattr(sec_quarterly_income, "attrs") else None
@@ -2001,6 +2048,14 @@ def analyze_quarterly_trends(
                 for q_col in all_quarters[:requested_quarters]
                 if _quarter_bucket_from_date_key(str(q_col)[:10]) is not None
             ]
+        if isinstance(source_diagnostics, dict):
+            window_source_diagnostics = _filter_source_diagnostics_for_window(source_diagnostics, expected_buckets)
+            result["historical_trends"]["source_diagnostics"] = window_source_diagnostics
+            if data_source.startswith("Yahoo + SEC") and not window_source_diagnostics.get("sec_extension_applied_in_window"):
+                if window_source_diagnostics.get("sec_overlap_points", 0):
+                    result["data_source"] = "Yahoo Finance (SEC cross-check)"
+                else:
+                    result["data_source"] = "Yahoo Finance"
         
         # Calculate next forecast quarter (based on the selected/most recent quarter)
         if most_recent_year and most_recent_q:
