@@ -40,6 +40,20 @@ SEC_CIK_FALLBACK_MAP = {
 MIN_YOY_PAIRS_FOR_AVG_GROWTH = 2
 MIN_REVENUE_POINTS_FOR_SEASONALITY = 8
 MIN_TRANSITIONS_PER_QUARTER_FOR_SEASONALITY = 2
+MONTH_ABBREVIATIONS = {
+    1: "Jan",
+    2: "Feb",
+    3: "Mar",
+    4: "Apr",
+    5: "May",
+    6: "Jun",
+    7: "Jul",
+    8: "Aug",
+    9: "Sep",
+    10: "Oct",
+    11: "Nov",
+    12: "Dec",
+}
 
 # Load local .env regardless of launch directory so FMP/Gemini keys are consistently available.
 load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
@@ -76,6 +90,185 @@ def _redact_api_secrets(text: str, known_secret: str = "") -> str:
     if secret:
         redacted = redacted.replace(secret, "[REDACTED]")
     return redacted
+
+
+def _month_abbrev(month_value) -> str:
+    try:
+        month_int = int(month_value)
+    except Exception:
+        return ""
+    return MONTH_ABBREVIATIONS.get(month_int, "")
+
+
+def _coerce_datetime(value):
+    if value in (None, ""):
+        return None
+
+    parsed = None
+    try:
+        numeric = float(value)
+    except Exception:
+        numeric = None
+
+    if numeric is not None:
+        try:
+            if abs(numeric) >= 1_000_000_000_000:
+                parsed = pd.to_datetime(numeric, unit="ms", utc=True)
+            elif abs(numeric) >= 1_000_000_000:
+                parsed = pd.to_datetime(numeric, unit="s", utc=True)
+        except Exception:
+            parsed = None
+
+    if parsed is None:
+        try:
+            parsed = pd.to_datetime(value, errors="coerce")
+        except Exception:
+            parsed = None
+
+    if parsed is None or pd.isna(parsed):
+        return None
+    if getattr(parsed, "tzinfo", None) is not None:
+        parsed = parsed.tz_localize(None)
+    return parsed
+
+
+def _calendar_quarter_from_month(month_value):
+    try:
+        month_int = int(month_value)
+    except Exception:
+        return None
+    if not 1 <= month_int <= 12:
+        return None
+    return ((month_int - 1) // 3) + 1
+
+
+def _extract_fiscal_year_end_month(stock_info: dict | None = None) -> tuple[int | None, str]:
+    info = stock_info if isinstance(stock_info, dict) else {}
+    for key in ("lastFiscalYearEnd", "nextFiscalYearEnd", "fiscalYearEnd"):
+        raw_value = info.get(key)
+        parsed = None
+        compact_digits = str(raw_value).strip()
+        if compact_digits.isdigit():
+            if len(compact_digits) == 8:
+                try:
+                    parsed = pd.to_datetime(compact_digits, format="%Y%m%d", errors="coerce")
+                except Exception:
+                    parsed = None
+            elif len(compact_digits) in {3, 4}:
+                try:
+                    month_value = int(compact_digits[:-2])
+                    day_value = int(compact_digits[-2:])
+                    if 1 <= month_value <= 12 and 1 <= day_value <= 31:
+                        parsed = pd.Timestamp(year=2000, month=month_value, day=day_value)
+                except Exception:
+                    parsed = None
+        if parsed is None:
+            parsed = _coerce_datetime(raw_value)
+        if parsed is None:
+            continue
+        month_value = int(parsed.month)
+        if 1 <= month_value <= 12:
+            return month_value, f"yfinance.info['{key}']"
+    return None, ""
+
+
+def _resolve_fiscal_calendar(company_name: str = "", stock_info: dict | None = None) -> dict:
+    fiscal_year_end_month, source = _extract_fiscal_year_end_month(stock_info)
+    if fiscal_year_end_month is None:
+        fiscal_year_end_month = 12
+        source = "default_calendar"
+
+    is_calendar_aligned = fiscal_year_end_month == 12
+    month_name = _month_abbrev(fiscal_year_end_month) or "Dec"
+    calendar_q4 = _calendar_quarter_from_month(fiscal_year_end_month) or 4
+    subject = str(company_name or "This company").strip() or "This company"
+
+    if is_calendar_aligned:
+        note = f"Quarter labels follow {subject}'s fiscal calendar; for this company they align with calendar quarters."
+        short_note = "Fiscal quarters align with calendar quarters."
+    else:
+        note = (
+            f"Quarter labels follow {subject}'s fiscal calendar "
+            f"(FY ends in {month_name}; calendar Q{calendar_q4} is fiscal Q4)."
+        )
+        short_note = f"FY ends in {month_name}; calendar Q{calendar_q4} is fiscal Q4."
+
+    return {
+        "fiscal_year_end_month": fiscal_year_end_month,
+        "fiscal_year_end_month_name": month_name,
+        "is_calendar_aligned": is_calendar_aligned,
+        "source": source,
+        "note": note,
+        "short_note": short_note,
+    }
+
+
+def _fiscal_period_from_date(date_value, fiscal_calendar: dict | None = None) -> dict:
+    parsed = _coerce_datetime(date_value)
+    if parsed is None:
+        return {
+            "date": str(date_value or ""),
+            "label": str(date_value or ""),
+            "year": None,
+            "quarter": None,
+            "calendar_year": None,
+            "calendar_quarter": None,
+            "calendar_label": "",
+            "calendar_description": "",
+            "date_pretty": str(date_value or ""),
+        }
+
+    fiscal_meta = fiscal_calendar if isinstance(fiscal_calendar, dict) else {}
+    fiscal_year_end_month = fiscal_meta.get("fiscal_year_end_month", 12)
+    try:
+        fiscal_year_end_month = int(fiscal_year_end_month)
+    except Exception:
+        fiscal_year_end_month = 12
+    if not 1 <= fiscal_year_end_month <= 12:
+        fiscal_year_end_month = 12
+
+    year = int(parsed.year)
+    month = int(parsed.month)
+    day = int(parsed.day)
+    calendar_quarter = _calendar_quarter_from_month(month)
+    calendar_label = f"CY{year} Q{calendar_quarter}" if calendar_quarter else ""
+    calendar_description = f"calendar Q{calendar_quarter} {year}" if calendar_quarter else ""
+
+    if fiscal_year_end_month == 12:
+        fiscal_year = year
+        fiscal_quarter = calendar_quarter
+    else:
+        fiscal_year = year + 1 if month > fiscal_year_end_month else year
+        offset = (month - fiscal_year_end_month) % 12
+        fiscal_quarter = 4 if offset == 0 else int((offset + 2) // 3)
+
+    month_name = _month_abbrev(month)
+    date_pretty = f"{month_name} {day}, {year}" if month_name else str(parsed.date())
+
+    return {
+        "date": parsed.strftime("%Y-%m-%d"),
+        "label": f"FY{fiscal_year} Q{fiscal_quarter}" if fiscal_year and fiscal_quarter else parsed.strftime("%Y-%m-%d"),
+        "year": fiscal_year,
+        "quarter": fiscal_quarter,
+        "calendar_year": year,
+        "calendar_quarter": calendar_quarter,
+        "calendar_label": calendar_label,
+        "calendar_description": calendar_description,
+        "date_pretty": date_pretty,
+    }
+
+
+def _fiscal_label_from_bucket(bucket, fiscal_calendar: dict | None = None) -> str:
+    date_key = _quarter_end_date_from_bucket(bucket)
+    period = _fiscal_period_from_date(date_key, fiscal_calendar)
+    return period.get("label") or str(date_key)
+
+
+def _fiscal_year_label_from_next_quarter(next_quarter_label: str = "") -> str:
+    match = re.search(r"(?i)FY\s*(\d{4})", str(next_quarter_label or ""))
+    if match:
+        return f"FY{match.group(1)}"
+    return "Current FY"
 
 
 def config_genai():
@@ -633,6 +826,13 @@ def get_latest_date_info(ticker_symbol: str) -> dict:
     """
     try:
         quarterly_income, data_source, _ = _get_quarterly_income_history(ticker_symbol, max_quarters=20)
+        stock_info = {}
+        try:
+            stock = get_yf_ticker(ticker_symbol)
+            stock_info = get_yf_info(stock)
+        except Exception:
+            stock_info = {}
+        fiscal_calendar = _resolve_fiscal_calendar(ticker_symbol, stock_info)
 
         if quarterly_income.empty:
             return {"date": None, "error": "No data available", "data_source": "Unavailable"}
@@ -643,29 +843,20 @@ def get_latest_date_info(ticker_symbol: str) -> dict:
 
         most_recent = ordered_quarters[0]
         
-        if hasattr(most_recent, 'year') and hasattr(most_recent, 'month'):
-            year = most_recent.year
-            month = most_recent.month
-            day = most_recent.day if hasattr(most_recent, 'day') else 1
-            calendar_quarter = (month - 1) // 3 + 1
-            
-            # Format as "Dec 31, 2025"
-            month_names = {
-                1: "Jan", 2: "Feb", 3: "Mar", 4: "Apr", 5: "May", 6: "Jun",
-                7: "Jul", 8: "Aug", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dec"
-            }
-            formatted_date = f"{month_names[month]} {day}, {year}"
-            
-            return {
-                "date": formatted_date,
-                "year": year,
-                "month": month,
-                "quarter": calendar_quarter,
-                "raw_date": str(most_recent)[:10],
-                "data_source": data_source,
-            }
-        else:
-            return {"date": str(most_recent)[:10], "raw_date": str(most_recent)[:10], "data_source": data_source}
+        period = _fiscal_period_from_date(most_recent, fiscal_calendar)
+        return {
+            "date": period.get("date_pretty"),
+            "year": period.get("year"),
+            "month": getattr(most_recent, "month", None),
+            "quarter": period.get("quarter"),
+            "label": period.get("label"),
+            "calendar_year": period.get("calendar_year"),
+            "calendar_quarter": period.get("calendar_quarter"),
+            "calendar_label": period.get("calendar_label"),
+            "raw_date": period.get("date"),
+            "data_source": data_source,
+            "fiscal_calendar": fiscal_calendar,
+        }
             
     except Exception as e:
         return {"date": None, "error": str(e), "data_source": "Unavailable"}
@@ -1843,6 +2034,7 @@ def analyze_quarterly_trends(
         current_market_cap = None
         pe_ratio = None
         company_name = ticker_symbol
+        stock_info = {}
         try:
             stock = get_yf_ticker(ticker_symbol)
             stock_info = get_yf_info(stock)
@@ -1890,6 +2082,8 @@ def analyze_quarterly_trends(
             "pe_ratio": pe_ratio
         }
         result["company_name"] = company_name
+        fiscal_calendar = _resolve_fiscal_calendar(company_name, stock_info)
+        result["fiscal_calendar"] = fiscal_calendar
         
         # --- PART 1: Historical Quarterly Data ---
         requested_quarters = max(4, int(num_quarters))
@@ -1943,7 +2137,14 @@ def analyze_quarterly_trends(
                     if isinstance(sec_annual_end_backfilled.get("quarters", []), list)
                     else []
                 )
-                preview = ", ".join(derived_quarters[:3]) if derived_quarters else ""
+                derived_quarter_labels = []
+                for quarter in derived_quarters:
+                    match = re.match(r"^(\d{4})-Q([1-4])$", str(quarter))
+                    if not match:
+                        continue
+                    bucket = (int(match.group(1)), int(match.group(2)))
+                    derived_quarter_labels.append(_fiscal_label_from_bucket(bucket, fiscal_calendar))
+                preview = ", ".join(derived_quarter_labels[:3]) if derived_quarter_labels else ""
                 if len(derived_quarters) > 3:
                     preview += ", ..."
                 backfill_note = (
@@ -1990,18 +2191,6 @@ def analyze_quarterly_trends(
                     f"SEC data was unavailable for additional merge coverage.{sec_error_note}"
                 )
         
-        # Find the most recent quarter
-        most_recent = all_quarters[0]
-        most_recent_year = most_recent.year if hasattr(most_recent, 'year') else None
-        most_recent_q = (most_recent.month - 1) // 3 + 1 if hasattr(most_recent, 'month') else None
-        
-        result["historical_trends"]["most_recent_quarter"] = {
-            "year": most_recent_year,
-            "quarter": most_recent_q,
-            "label": f"FY{most_recent_year} Q{most_recent_q}" if most_recent_year and most_recent_q else str(most_recent)[:10],
-            "date": str(most_recent)[:10]
-        }
-        
         # Build a bucket map so quarterly windows stay contiguous even when raw report dates are uneven.
         bucket_to_col = {}
         for q_col in all_quarters:
@@ -2024,17 +2213,28 @@ def analyze_quarterly_trends(
                 if end_bucket in bucket_to_col:
                     anchor_col = bucket_to_col[end_bucket]
 
-        selected_year = anchor_col.year if hasattr(anchor_col, 'year') else None
-        selected_q_num = (anchor_col.month - 1) // 3 + 1 if hasattr(anchor_col, 'month') else None
-        if selected_year and selected_q_num:
-            result["historical_trends"]["most_recent_quarter"] = {
-                "year": selected_year,
-                "quarter": selected_q_num,
-                "label": f"FY{selected_year} Q{selected_q_num}",
-                "date": str(anchor_col)[:10]
-            }
-            most_recent_year = selected_year
-            most_recent_q = selected_q_num
+        most_recent_period = _fiscal_period_from_date(anchor_col, fiscal_calendar)
+        result["historical_trends"]["most_recent_quarter"] = {
+            "year": most_recent_period.get("year"),
+            "quarter": most_recent_period.get("quarter"),
+            "label": most_recent_period.get("label"),
+            "date": most_recent_period.get("date"),
+            "calendar_year": most_recent_period.get("calendar_year"),
+            "calendar_quarter": most_recent_period.get("calendar_quarter"),
+            "calendar_label": most_recent_period.get("calendar_label"),
+        }
+        if not fiscal_calendar.get("is_calendar_aligned"):
+            result["historical_trends"]["most_recent_quarter"]["fiscal_note"] = (
+                f"{most_recent_period.get('label')} ended {most_recent_period.get('date_pretty')} "
+                f"and falls in {most_recent_period.get('calendar_description')}."
+            )
+        result["fiscal_calendar"]["current_period_example"] = (
+            f"{most_recent_period.get('label')} ended {most_recent_period.get('date_pretty')} "
+            f"and falls in {most_recent_period.get('calendar_description')}."
+        )
+
+        most_recent_year = most_recent_period.get("year")
+        most_recent_q = most_recent_period.get("quarter")
 
         anchor_bucket = _quarter_bucket_from_date_key(str(anchor_col)[:10])
         expected_buckets = []
@@ -2050,6 +2250,18 @@ def analyze_quarterly_trends(
             ]
         if isinstance(source_diagnostics, dict):
             window_source_diagnostics = _filter_source_diagnostics_for_window(source_diagnostics, expected_buckets)
+            sec_annual_end_backfilled = window_source_diagnostics.get("sec_annual_end_backfilled")
+            if isinstance(sec_annual_end_backfilled, dict):
+                display_quarters = []
+                for quarter in sec_annual_end_backfilled.get("quarters", []):
+                    match = re.match(r"^(\d{4})-Q([1-4])$", str(quarter))
+                    if not match:
+                        continue
+                    display_quarters.append(
+                        _fiscal_label_from_bucket((int(match.group(1)), int(match.group(2))), fiscal_calendar)
+                    )
+                if display_quarters:
+                    sec_annual_end_backfilled["display_quarters"] = display_quarters
             result["historical_trends"]["source_diagnostics"] = window_source_diagnostics
             if data_source.startswith("Yahoo + SEC") and not window_source_diagnostics.get("sec_extension_applied_in_window"):
                 if window_source_diagnostics.get("sec_overlap_points", 0):
@@ -2087,10 +2299,13 @@ def analyze_quarterly_trends(
         
         quarterly_data = []
         missing_report_quarters = []
+        missing_report_bucket_quarters = []
         for bucket in expected_buckets:
             q_col = bucket_to_col.get(bucket)
-            q_label = f"{bucket[0]}-Q{bucket[1]}"
             q_date = str(q_col)[:10] if q_col is not None else _quarter_end_date_from_bucket(bucket)
+            period = _fiscal_period_from_date(q_date, fiscal_calendar)
+            q_bucket_label = f"{bucket[0]}-Q{bucket[1]}"
+            q_label = period.get("label") or q_bucket_label
 
             revenue = safe_get(quarterly_income, ['Total Revenue', 'Operating Revenue', 'Revenue'], q_col) if q_col is not None else None
             op_income = safe_get(quarterly_income, ['Operating Income', 'EBIT'], q_col) if q_col is not None else None
@@ -2098,10 +2313,17 @@ def analyze_quarterly_trends(
 
             if q_col is None:
                 missing_report_quarters.append(q_label)
+                missing_report_bucket_quarters.append(q_bucket_label)
 
             quarterly_data.append({
                 "quarter": q_label,
                 "date": q_date,
+                "bucket_label": q_bucket_label,
+                "fiscal_year": period.get("year"),
+                "fiscal_quarter": period.get("quarter"),
+                "calendar_year": period.get("calendar_year"),
+                "calendar_quarter": period.get("calendar_quarter"),
+                "calendar_label": period.get("calendar_label"),
                 "revenue": revenue,
                 "operating_income": op_income,
                 "eps": eps
@@ -2126,6 +2348,7 @@ def analyze_quarterly_trends(
             "quarters_with_eps": quarters_with_eps,
             "quarters_with_complete_metrics": quarters_with_complete_metrics,
             "missing_report_quarters": missing_report_quarters,
+            "missing_report_bucket_quarters": missing_report_bucket_quarters,
             "missing_revenue_quarters": [q.get("quarter") for q in quarterly_data if q.get("revenue") is None],
             "missing_eps_quarters": [q.get("quarter") for q in quarterly_data if q.get("eps") is None],
         }
@@ -2145,17 +2368,25 @@ def analyze_quarterly_trends(
             return ((current - previous) / abs(previous)) * 100
 
         def quarter_num_from_entry(entry: dict):
+            fiscal_quarter = entry.get("fiscal_quarter")
+            if isinstance(fiscal_quarter, (int, float)):
+                try:
+                    fiscal_quarter = int(fiscal_quarter)
+                except Exception:
+                    fiscal_quarter = None
+                if fiscal_quarter in {1, 2, 3, 4}:
+                    return fiscal_quarter
             date_raw = entry.get("date")
+            label = str(entry.get("quarter", ""))
+            match = re.search(r"Q([1-4])", label)
+            if match:
+                return int(match.group(1))
             try:
                 dt = pd.to_datetime(date_raw)
                 if pd.notna(dt):
                     return (int(dt.month) - 1) // 3 + 1
             except Exception:
                 pass
-            label = str(entry.get("quarter", ""))
-            match = re.search(r"Q([1-4])", label)
-            if match:
-                return int(match.group(1))
             return None
 
         def compute_seasonality_signal(rows: list):
@@ -2397,6 +2628,7 @@ def fetch_consensus_estimates(
         sell_ratings=0,
     ) -> dict:
         total_ratings = int(buy_ratings or 0) + int(hold_ratings or 0) + int(sell_ratings or 0)
+        full_year_label = _fiscal_year_label_from_next_quarter(next_quarter_label)
         return {
             "next_quarter": {
                 "revenue_estimate": format_currency(next_q_revenue) if _has_value(next_q_revenue) else "N/A",
@@ -2408,7 +2640,7 @@ def fetch_consensus_estimates(
             "full_year": {
                 "revenue_estimate": format_currency(full_year_revenue) if _has_value(full_year_revenue) else "N/A",
                 "eps_estimate": format_price(full_year_eps) if _has_value(full_year_eps) else "N/A",
-                "fiscal_year": "Current FY",
+                "fiscal_year": full_year_label,
                 "source": source_label,
                 "source_url": source_url
             },
@@ -3100,6 +3332,9 @@ def generate_independent_forecast(quarterly_analysis: dict, company_name: str = 
     forecast_quarter_label = next_forecast.get("label", "next quarter")
     most_recent = quarterly_analysis.get("historical_trends", {}).get("most_recent_quarter", {})
     most_recent_label = most_recent.get("label", "recent quarter")
+    fiscal_calendar = quarterly_analysis.get("fiscal_calendar", {}) if isinstance(quarterly_analysis.get("fiscal_calendar", {}), dict) else {}
+    fiscal_context_note = str(fiscal_calendar.get("note", "") or "").strip()
+    fiscal_context_example = str(fiscal_calendar.get("current_period_example", "") or "").strip()
     
     # Prepare the data packet summary for the prompt
     historical_data = quarterly_analysis.get("historical_trends", {})
@@ -3290,6 +3525,17 @@ def generate_independent_forecast(quarterly_analysis: dict, company_name: str = 
         if qualitative_lines
         else "No qualitative market/company source packets available for this run."
     )
+    fiscal_context_text = "\n".join(
+        [
+            line
+            for line in [
+                f"- {fiscal_context_note}" if fiscal_context_note else "",
+                f"- Example: {fiscal_context_example}" if fiscal_context_example else "",
+                "- Interpret FY/Q labels using the company fiscal calendar, not calendar quarters.",
+            ]
+            if line
+        ]
+    )
     
     # Historical projection (our calculated estimate)
     hist_proj = projections.get("next_quarter_estimate", {})
@@ -3478,6 +3724,9 @@ def generate_independent_forecast(quarterly_analysis: dict, company_name: str = 
         DATA PACKET FOR {ticker}
         Analysis Date: {quarterly_analysis.get('analysis_date', datetime.now().strftime('%Y-%m-%d'))}
         ═══════════════════════════════════════════════════════════════
+
+        SECTION 0: QUARTER LABEL CONVENTION
+        {fiscal_context_text}
         
         SECTION 1: HISTORICAL QUARTERLY PERFORMANCE (Most Recent {prompt_quarters} Quarters)
         {historical_summary}

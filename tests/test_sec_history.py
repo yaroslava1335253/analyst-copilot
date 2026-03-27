@@ -383,3 +383,72 @@ def test_analyze_quarterly_trends_trims_sec_backfill_diagnostics_to_requested_wi
     assert filtered["sec_extended_quarters"] == ["2024-Q2"]
     assert filtered["sec_annual_end_backfilled"]["total_annual_end_derived"] == 1
     assert filtered["sec_annual_end_backfilled"]["quarters"] == ["2024-Q2"]
+
+
+def test_analyze_quarterly_trends_uses_company_fiscal_quarter_labels(monkeypatch):
+    income_df = _quarterly_income_df(
+        {
+            "Total Revenue": {
+                "2025-06-30": 70_000_000_000,
+                "2025-03-31": 68_000_000_000,
+                "2024-12-31": 66_000_000_000,
+                "2024-09-30": 64_000_000_000,
+                "2024-06-30": 62_000_000_000,
+            },
+            "Operating Income": {
+                "2025-06-30": 30_000_000_000,
+                "2025-03-31": 29_000_000_000,
+                "2024-12-31": 28_000_000_000,
+                "2024-09-30": 27_000_000_000,
+                "2024-06-30": 26_000_000_000,
+            },
+            "Basic EPS": {
+                "2025-06-30": 3.1,
+                "2025-03-31": 3.0,
+                "2024-12-31": 2.9,
+                "2024-09-30": 2.8,
+                "2024-06-30": 2.7,
+            },
+            "Diluted EPS": {
+                "2025-06-30": 3.1,
+                "2025-03-31": 3.0,
+                "2024-12-31": 2.9,
+                "2024-09-30": 2.8,
+                "2024-06-30": 2.7,
+            },
+        }
+    )
+    captured = {}
+
+    monkeypatch.setattr("engine.get_yf_ticker", lambda ticker_symbol: object())
+    monkeypatch.setattr(
+        "engine.get_yf_info",
+        lambda stock: {
+            "longName": "Microsoft Corporation",
+            "lastFiscalYearEnd": int(pd.Timestamp("2025-06-30", tz="UTC").timestamp()),
+        },
+    )
+    monkeypatch.setattr("engine.get_yf_fast_info", lambda stock: {})
+    monkeypatch.setattr(
+        "engine._get_quarterly_income_history",
+        lambda ticker_symbol, max_quarters=20: (income_df, "Yahoo Finance", {}),
+    )
+
+    def _fake_consensus(ticker_symbol, next_quarter_label, include_qualitative=False, fmp_api_key=None):
+        captured["next_quarter_label"] = next_quarter_label
+        return {"next_quarter": {"quarter_label": f"{next_quarter_label} (Est.)"}}
+
+    monkeypatch.setattr("engine.fetch_consensus_estimates", _fake_consensus)
+
+    result = analyze_quarterly_trends("MSFT", num_quarters=5)
+
+    assert result["fiscal_calendar"]["fiscal_year_end_month"] == 6
+    assert result["fiscal_calendar"]["is_calendar_aligned"] is False
+    assert "calendar Q2 is fiscal Q4" in result["fiscal_calendar"]["note"]
+    assert result["historical_trends"]["most_recent_quarter"]["label"] == "FY2025 Q4"
+    assert result["historical_trends"]["most_recent_quarter"]["calendar_label"] == "CY2025 Q2"
+    assert result["historical_trends"]["quarterly_data"][0]["quarter"] == "FY2025 Q4"
+    assert result["historical_trends"]["quarterly_data"][0]["calendar_quarter"] == 2
+    assert result["historical_trends"]["quarterly_data"][1]["quarter"] == "FY2025 Q3"
+    assert result["next_forecast_quarter"]["label"] == "FY2026 Q1"
+    assert captured["next_quarter_label"] == "FY2026 Q1"

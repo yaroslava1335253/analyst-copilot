@@ -131,6 +131,7 @@ def test_fetch_consensus_estimates_uses_partial_data_without_error(monkeypatch):
     assert result["next_quarter"]["revenue_estimate"] == "$82.50B"
     assert result["next_quarter"]["eps_estimate"] == "$4.25"
     assert result["analyst_coverage"]["num_analysts"] == 41
+    assert result["full_year"]["fiscal_year"] == "FY2026"
     assert "warning" not in result
 
 

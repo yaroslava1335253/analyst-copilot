@@ -5377,6 +5377,7 @@ def _build_summary_pdf_bytes(
     wacc_source_summary: str,
     hist_data: list | None,
     growth_summary: dict | None,
+    fiscal_note: str = "",
 ) -> bytes | None:
     if not isinstance(dcf_ui_data, dict) or not dcf_ui_data.get("success"):
         return None
@@ -5587,6 +5588,8 @@ def _build_summary_pdf_bytes(
             )
 
     source_items = []
+    if fiscal_note:
+        source_items.append(f"Quarter convention: {fiscal_note}")
     if data_source:
         source_items.append(f"Operating data: {data_source}")
     if wacc_source_summary:
@@ -6077,6 +6080,10 @@ if st.session_state.quarterly_analysis:
     consensus_next_q = consensus.get("next_quarter", {}) if isinstance(consensus, dict) else {}
     consensus_coverage = consensus.get("analyst_coverage", {}) if isinstance(consensus, dict) else {}
     consensus_targets = consensus.get("price_targets", {}) if isinstance(consensus, dict) else {}
+    fiscal_calendar = analysis.get("fiscal_calendar", {}) if isinstance(analysis.get("fiscal_calendar", {}), dict) else {}
+    fiscal_note = str(fiscal_calendar.get("note", "") or "").strip()
+    fiscal_note_short = str(fiscal_calendar.get("short_note", "") or fiscal_note).strip()
+    fiscal_example = str(fiscal_calendar.get("current_period_example", "") or "").strip()
 
     st.markdown("""
 <div class="disclaimer-banner">
@@ -6188,6 +6195,8 @@ if st.session_state.quarterly_analysis:
 
     with dashboard_tab:
         st.markdown(hero_strip_html, unsafe_allow_html=True)
+        if fiscal_note:
+            st.caption(f"Quarter convention: {fiscal_note}")
 
     with deep_dive_tab:
         # SECTION B: Investment Verdict
@@ -6582,8 +6591,8 @@ if st.session_state.quarterly_analysis:
                 total_annual_end_derived = sec_annual_end_backfilled.get("total_q4_derived")
             if isinstance(total_annual_end_derived, int) and total_annual_end_derived > 0:
                 derived_quarters = (
-                    sec_annual_end_backfilled.get("quarters", [])
-                    if isinstance(sec_annual_end_backfilled.get("quarters", []), list)
+                    sec_annual_end_backfilled.get("display_quarters", sec_annual_end_backfilled.get("quarters", []))
+                    if isinstance(sec_annual_end_backfilled.get("display_quarters", sec_annual_end_backfilled.get("quarters", [])), list)
                     else []
                 )
                 preview = ", ".join(derived_quarters[:3]) if derived_quarters else ""
@@ -6871,6 +6880,8 @@ if st.session_state.quarterly_analysis:
         st.markdown('<div id="consensus"></div>', unsafe_allow_html=True)
         st.markdown("---")
         st.markdown('<div class="section-header"><span class="step-badge">Step 04</span><span class="section-title">Street Context</span></div>', unsafe_allow_html=True)
+        if fiscal_note:
+            st.caption(f"Quarter convention: {fiscal_note}")
 
         consensus_citations = []
         qual_sources = []
@@ -6967,6 +6978,10 @@ if st.session_state.quarterly_analysis:
         # SECTION E: AI Synthesis
         st.markdown('<div id="outlook"></div>', unsafe_allow_html=True)
         st.markdown('<div class="section-header"><span class="step-badge">Step 05</span><span class="section-title">AI Synthesis</span></div>', unsafe_allow_html=True)
+        if fiscal_note:
+            st.caption(f"Quarter convention: {fiscal_note}")
+            if fiscal_example:
+                st.caption(f"Example: {fiscal_example}")
 
         dcf_ui = st.session_state.get("dcf_ui_adapter")
         dcf_data_for_forecast = dcf_ui.get_ui_data() if dcf_ui else None
@@ -7142,6 +7157,7 @@ if st.session_state.quarterly_analysis:
             wacc_source_summary=wacc_source_summary,
             hist_data=hist_data,
             growth_summary=growth_summary,
+            fiscal_note=fiscal_note_short,
         )
         if summary_pdf_bytes:
             st.download_button(
