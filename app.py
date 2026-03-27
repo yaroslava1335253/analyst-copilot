@@ -5959,7 +5959,7 @@ if st.session_state.quarterly_analysis:
                 with col_quality:
                     st.metric("Data Quality", f"{dcf_ui_data.get('data_quality_score', 0):.0f}/100")
 
-                st.caption("For full traceability use 'View DCF Details'.")
+                st.caption("For full traceability use 'View DCF Details' for inputs, projections, bridge, and assumptions.")
                 _render_dcf_trace_chatbot(
                     dcf_ui,
                     dcf_ui_data,
@@ -5967,49 +5967,6 @@ if st.session_state.quarterly_analysis:
                     st.session_state.get("dcf_snapshot"),
                     location_key="deep_dive",
                 )
-                st.markdown("**Current Financial Position (TTM)**")
-                col_d1, col_d2, col_d3 = st.columns(3)
-                with col_d1:
-                    current_price_metric = dcf_ui_data["inputs"].get("current_price")
-                    shares_metric = dcf_ui_data["inputs"].get("shares_outstanding")
-                    market_cap_metric = dcf_ui_data["inputs"].get("market_cap")
-                    st.caption(f"Price: {current_price_metric.formatted()}")
-                    st.caption(f"Shares: {shares_metric.formatted()}")
-                    st.caption(f"Market Cap: {market_cap_metric.formatted()}")
-                with col_d2:
-                    rev = dcf_ui_data["inputs"].get("ttm_revenue")
-                    op_income = dcf_ui_data["inputs"].get("ttm_operating_income")
-                    ebitda = dcf_ui_data["inputs"].get("ttm_ebitda")
-                    st.caption(f"Revenue: {rev.formatted()}")
-                    st.caption(f"Op Income: {op_income.formatted()}")
-                    st.caption(f"EBITDA: {ebitda.formatted()}")
-                with col_d3:
-                    cfo = dcf_ui_data["inputs"].get("ttm_operating_cash_flow")
-                    capex = dcf_ui_data["inputs"].get("ttm_capex")
-                    debt = dcf_ui_data["inputs"].get("total_debt")
-                    cash = dcf_ui_data["inputs"].get("cash")
-                    st.caption(f"Oper. CF: {cfo.formatted()}")
-                    st.caption(f"CapEx: {capex.formatted()}")
-                    st.caption(f"Total Debt: {debt.formatted()}")
-                    st.caption(f"Cash: {cash.formatted()}")
-
-                projections = dcf_ui_data.get("fcf_projections", [])
-                if projections:
-                    st.markdown("**5-Year FCF Projection**")
-                    proj_table = []
-                    for proj in projections:
-                        proj_table.append({
-                            "Year": f"Year {proj.get('year', 0)}",
-                            "FCF": f"${proj.get('fcf', 0)/1e9:.1f}B",
-                            "PV(FCF)": f"${proj.get('pv', 0)/1e9:.1f}B"
-                        })
-                    st.dataframe(pd.DataFrame(proj_table), use_container_width=True, hide_index=True)
-
-                st.markdown("**Valuation Bridge**")
-                st.dataframe(pd.DataFrame(dcf_ui.format_bridge_table()), use_container_width=True, hide_index=True)
-
-                st.markdown("**Key Assumptions**")
-                st.dataframe(pd.DataFrame(dcf_ui.format_assumptions_table()), use_container_width=True, hide_index=True)
         else:
             st.info("No DCF output yet. Set assumptions and run the model.")
 
