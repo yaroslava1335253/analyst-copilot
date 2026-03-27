@@ -1723,6 +1723,141 @@ def _parse_reliability_label(value):
     return None
 
 
+def _effective_data_quality_score(metadata) -> int:
+    if metadata is None:
+        return 0
+
+    score = getattr(metadata, "reliability_score", None)
+    value = getattr(metadata, "value", None)
+    has_value = value is not None and not pd.isna(value)
+
+    if not has_value and score is None:
+        return 0
+    if not has_value and score == 100:
+        return 0
+    if score is None:
+        return 0
+    return max(0, min(100, int(round(float(score)))))
+
+
+def _describe_data_quality_band(score: float) -> tuple[str, str]:
+    numeric = _dcf_chat_to_float(score) or 0.0
+    if numeric >= 90:
+        return "High confidence", "Most core inputs are direct current or TTM values with limited fallback usage."
+    if numeric >= 75:
+        return "Good confidence", "One or two important inputs rely on annual proxies or light estimation."
+    if numeric >= 60:
+        return "Moderate confidence", "Several fields use fallback logic or partial data coverage."
+    if numeric >= 40:
+        return "Low confidence", "Key metrics rely on weak or estimated inputs, so the output should be used cautiously."
+    return "Very low confidence", "Major data gaps make this output exploratory rather than decision-grade."
+
+
+def _summarize_data_quality_reason(label: str, metadata, score: int) -> str:
+    if metadata is None:
+        return "missing or unscored"
+
+    source = str(getattr(metadata, "source_path", "") or "").lower()
+    notes = str(getattr(metadata, "notes", "") or "").lower()
+    fallback = str(getattr(metadata, "fallback_reason", "") or "").lower()
+    period_type = str(getattr(metadata, "period_type", "") or "").lower()
+    combined = " ".join(part for part in [source, notes, fallback, period_type] if part)
+
+    if score == 0:
+        return "missing or unusable"
+
+    if label == "Current Price":
+        return "secondary market feed" if "fast_info" in combined else "direct market field"
+    if label == "Shares Outstanding":
+        if "derived(marketcap/price)" in combined:
+            return "back-calculated from market cap and price"
+        return "secondary reported field" if "fast_info" in combined else "direct reported share count"
+    if label == "TTM Revenue":
+        return "TTM built from the latest four quarters" if "quarterly_ttm" in combined else "annual revenue proxy"
+    if label == "TTM Free Cash Flow":
+        return "derived as CFO - CapEx and capped by the weaker input"
+    if label == "TTM Operating Income":
+        return "TTM built from the latest four quarters" if "quarterly_ttm" in combined else "annual operating-income proxy"
+    if label == "Total Debt":
+        if "yahooquery" in combined:
+            return "direct debt field from yahooquery"
+        if "balance" in combined:
+            return "balance-sheet debt field"
+        return "weak debt coverage or fallback handling" if score <= 30 else "direct debt field"
+    if label == "Cash & Equivalents":
+        return "balance-sheet cash field" if "balance" in combined else "low-confidence cash coverage"
+    if label == "Effective Tax Rate":
+        if "tax provision / pretax income" in combined:
+            return "computed from Tax Provision / Pretax Income"
+        if "net income / operating income" in combined:
+            return "inferred from Net Income / Operating Income"
+        return "default tax assumption" if score <= 20 else "reported tax input"
+    if label == "Suggested WACC":
+        if "observed debt cost" in combined:
+            return "component-based WACC with observed debt cost"
+        if "debt fallback" in combined:
+            return "component-based WACC with debt-cost fallback"
+        if "coe-only proxy" in combined:
+            return "cost-of-equity proxy"
+        return "component-based WACC estimate"
+
+    if any(token in combined for token in ["fallback", "default", "synthetic", "proxy"]):
+        return "fallback or estimated input"
+    if "annual" in combined:
+        return "annual proxy"
+    if any(token in combined for token in ["quarterly_ttm", "ttm", "current"]):
+        return "direct current or TTM value"
+    return "retrieval-path based assignment"
+
+
+def _build_data_quality_help_text(display_score, snapshot) -> str:
+    score_value = _dcf_chat_to_float(display_score) or 0.0
+    confidence_label, confidence_text = _describe_data_quality_band(score_value)
+
+    if snapshot is None:
+        return (
+            f"**What this means:** {confidence_label}. {confidence_text}\n\n"
+            "**How the score is assigned:** It is the simple average of nine core reliability scores. "
+            "Scores come from fixed retrieval-path rules rather than a hidden continuous formula: direct current/TTM values score highest, "
+            "annual proxies and inferred values score lower, fallback/default values score lower again, and missing values score 0."
+        )
+
+    component_specs = [
+        ("Current Price", getattr(snapshot, "price", None)),
+        ("Shares Outstanding", getattr(snapshot, "shares_outstanding", None)),
+        ("TTM Revenue", getattr(snapshot, "ttm_revenue", None)),
+        ("TTM Free Cash Flow", getattr(snapshot, "ttm_fcf", None)),
+        ("TTM Operating Income", getattr(snapshot, "ttm_operating_income", None)),
+        ("Total Debt", getattr(snapshot, "total_debt", None)),
+        ("Cash & Equivalents", getattr(snapshot, "cash_and_equivalents", None)),
+        ("Effective Tax Rate", getattr(snapshot, "effective_tax_rate", None)),
+        ("Suggested WACC", getattr(snapshot, "suggested_wacc", None)),
+    ]
+
+    component_lines = []
+    component_scores = []
+    for label, metadata in component_specs:
+        effective_score = _effective_data_quality_score(metadata)
+        component_scores.append(effective_score)
+        reason = _summarize_data_quality_reason(label, metadata, effective_score)
+        component_lines.append(f"- {label}: {effective_score}/100 ({reason})")
+
+    exact_average = sum(component_scores) / len(component_scores) if component_scores else 0.0
+    score_formula = " + ".join(str(score) for score in component_scores) if component_scores else "0"
+
+    return (
+        f"**What this means:** {confidence_label}. {confidence_text}\n\n"
+        "**How the exact number is assigned:** Overall Data Quality is the simple average of 9 fixed reliability scores. "
+        "Missing or unscored fields count as 0. Scores are assigned by retrieval path, not by a hidden continuous formula: "
+        "direct current/TTM values score highest, annual proxies and inferred values score lower, fallback/default values score lower again, "
+        "and missing values score 0.\n\n"
+        f"**This run:** ({score_formula}) / 9 = {exact_average:.1f}, displayed as {score_value:.0f}/100.\n"
+        + "\n".join(component_lines)
+        + "\n\n**Derived-metric guardrail:** TTM Free Cash Flow cannot score above the weaker of CFO and CapEx, and Suggested WACC is reliability-weighted from its component inputs.\n\n"
+        "Open View DCF Details to inspect the underlying sources, periods, and notes."
+    )
+
+
 def _estimate_chat_quota_reset_text(error_text: str) -> str:
     """Estimate next usable time from rate-limit text; fall back to next daily reset estimate."""
     text = str(error_text or "")
@@ -2334,9 +2469,7 @@ def _render_dcf_trace_chatbot(ui_adapter, ui_data, engine_result, snapshot, *, l
 
     chat_history = st.session_state[chat_history_key]
 
-    col_chat_meta, col_chat_clear = st.columns([4, 1])
-    with col_chat_meta:
-        st.caption("Assistant responses can make mistakes. Verify against the DCF details and source columns.")
+    _, col_chat_clear = st.columns([4, 1])
     with col_chat_clear:
         if st.button("Clear Q&A", key=f"clear_{chat_history_key}"):
             st.session_state[chat_history_key] = []
@@ -5946,6 +6079,9 @@ if st.session_state.quarterly_analysis:
                 current_price = dcf_ui_data.get("current_price", 0)
                 intrinsic = dcf_ui_data.get("price_per_share", 0)
                 upside_downside = ((intrinsic - current_price) / current_price * 100) if (current_price and current_price > 0 and intrinsic and intrinsic > 0) else None
+                dcf_snapshot = st.session_state.get("dcf_snapshot")
+                data_quality_score = dcf_ui_data.get("data_quality_score", 0)
+                data_quality_help = _build_data_quality_help_text(data_quality_score, dcf_snapshot)
 
                 col_ev, col_equity, col_intrinsic, col_quality = st.columns(4)
                 with col_ev:
@@ -5957,16 +6093,17 @@ if st.session_state.quarterly_analysis:
                 with col_intrinsic:
                     st.metric("Intrinsic Value/Share", f"${intrinsic:.2f}" if intrinsic else "—", delta=f"{upside_downside:+.1f}%" if upside_downside is not None else None)
                 with col_quality:
-                    st.metric("Data Quality", f"{dcf_ui_data.get('data_quality_score', 0):.0f}/100")
+                    st.metric("Data Quality", f"{data_quality_score:.0f}/100", help=data_quality_help)
 
                 st.caption("For full traceability use 'View DCF Details' for inputs, projections, bridge, and assumptions.")
                 _render_dcf_trace_chatbot(
                     dcf_ui,
                     dcf_ui_data,
                     st.session_state.get("dcf_engine_result") or {},
-                    st.session_state.get("dcf_snapshot"),
+                    dcf_snapshot,
                     location_key="deep_dive",
                 )
+                st.caption("Assistant responses can make mistakes. Verify against the DCF details and source columns.")
         else:
             st.info("No DCF output yet. Set assumptions and run the model.")
 
