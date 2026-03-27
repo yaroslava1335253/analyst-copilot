@@ -2204,7 +2204,58 @@ def _extract_dcf_chat_key_numbers(raw_value) -> list[str]:
     return [text]
 
 
-def _normalize_dcf_trace_chat_payload(raw_text: str, ticker_symbol: str = "UNKNOWN") -> dict:
+def _infer_dcf_chat_response_mode(question_text: str) -> str:
+    text = str(question_text or "").strip().lower()
+    if not text:
+        return "reasoning"
+
+    source_markers = [
+        "source",
+        "where did",
+        "where does",
+        "where is",
+        "where from",
+        "which source",
+        "citation",
+        "cite",
+        "link",
+        "url",
+        "what filing",
+    ]
+    reasoning_markers = [
+        "why",
+        "how",
+        "explain",
+        "reasoning",
+        "rationale",
+        "walk me through",
+        "talk me through",
+        "logic",
+        "derive",
+        "derived",
+        "what drives",
+        "how come",
+    ]
+    value_starters = [
+        "what is",
+        "what's",
+        "how much",
+        "give me",
+        "show me",
+        "what are",
+        "tell me",
+    ]
+
+    if any(marker in text for marker in source_markers):
+        return "source"
+    if any(marker in text for marker in reasoning_markers):
+        return "reasoning"
+    if any(text.startswith(starter) for starter in value_starters):
+        return "value"
+    return "reasoning"
+
+
+def _normalize_dcf_trace_chat_payload(raw_text: str, ticker_symbol: str = "UNKNOWN", question_text: str = "") -> dict:
     formatted_fallback = _format_dcf_trace_chat_response(raw_text, ticker_symbol)
 
     def _normalize_credibility_score(value):
@@ -2300,6 +2351,7 @@ def _normalize_dcf_trace_chat_payload(raw_text: str, ticker_symbol: str = "UNKNO
                 parsed = None
 
     if isinstance(parsed, dict):
+        response_mode = str(parsed.get("response_mode") or "").strip().lower()
         answer = str(
             parsed.get("answer")
             or parsed.get("direct_answer")
@@ -2336,6 +2388,7 @@ def _normalize_dcf_trace_chat_payload(raw_text: str, ticker_symbol: str = "UNKNO
             or ""
         ).strip()
     else:
+        response_mode = ""
         answer_match = re.search(r"(?i)\*\*Answer:\*\*\s*(.+?)(?:\n\n|\Z)", formatted_fallback, flags=re.S)
         value_match = re.search(r"(?i)\*\*Value:\*\*\s*(.+?)(?:\n\n|\Z)", formatted_fallback, flags=re.S)
         calc_match = re.search(r"(?i)\*\*(?:Formula Path|Calculation):\*\*\s*(.+?)(?:\n\n|\Z)", formatted_fallback, flags=re.S)
@@ -2356,6 +2409,8 @@ def _normalize_dcf_trace_chat_payload(raw_text: str, ticker_symbol: str = "UNKNO
     if not answer:
         answer = "I couldn't produce a clean answer from this run."
     answer = re.sub(r"^\*\*Answer:\*\*\s*", "", answer).strip()
+    if response_mode not in {"reasoning", "value", "source"}:
+        response_mode = _infer_dcf_chat_response_mode(question_text)
     source_name = source_name or _infer_source_name(source_name, source_summary, calculation_summary)
     if not source_url:
         source_url = _infer_source_url(source_name, source_summary, calculation_summary)
@@ -2375,6 +2430,7 @@ def _normalize_dcf_trace_chat_payload(raw_text: str, ticker_symbol: str = "UNKNO
 
     return {
         "kind": "dcf_trace_answer",
+        "response_mode": response_mode,
         "answer": answer,
         "key_numbers": key_numbers[:6],
         "calculation_summary": calculation_summary,
@@ -2409,12 +2465,13 @@ def _render_dcf_chat_message(role: str, content) -> None:
             st.markdown(str(content or ""))
             return
 
+        response_mode = str(content.get("response_mode") or "reasoning").strip().lower()
         answer = str(content.get("answer") or "").strip()
         if answer:
             st.markdown(answer)
 
         key_numbers = [str(item).strip() for item in (content.get("key_numbers") or []) if str(item).strip()]
-        if key_numbers:
+        if key_numbers and response_mode == "reasoning":
             st.markdown("\n".join(f"- {item}" for item in key_numbers))
 
         calculation_summary = str(content.get("calculation_summary") or "").strip()
@@ -2424,7 +2481,8 @@ def _render_dcf_chat_message(role: str, content) -> None:
         confidence_score = content.get("confidence_score")
         confidence_explanation = str(content.get("confidence_explanation") or "").strip()
 
-        has_details = any([
+        show_details = response_mode == "reasoning"
+        has_details = show_details and any([
             calculation_summary,
             source_name,
             source_summary,
@@ -2831,6 +2889,7 @@ def _render_dcf_trace_chatbot(ui_adapter, ui_data, engine_result, snapshot, *, l
         submitted = st.form_submit_button("Ask")
 
     if submitted and user_question:
+        response_mode = _infer_dcf_chat_response_mode(user_question)
         context_packet = _build_dcf_chat_context_packet(
             ui_adapter,
             ui_data,
@@ -2841,11 +2900,13 @@ def _render_dcf_trace_chatbot(ui_adapter, ui_data, engine_result, snapshot, *, l
         context_data = json.dumps(context_packet, indent=2, default=str)
         trace_prompt = (
             "User question: " + user_question + "\n\n"
+            f"Detected response mode: {response_mode}\n\n"
             "Answer rules:\n"
             "1) Use only the provided DCF context and logic_reference. If the answer depends on a calculation, explain it from this run's formulas and numbers.\n"
             "2) Return ONLY valid JSON (no markdown outside JSON) with this exact schema:\n"
             "{\n"
-            "  \"answer\": \"2-4 sentence natural, ChatGPT-style answer in plain English. Start with the direct answer and mention the most relevant numbers.\",\n"
+            "  \"response_mode\": \"reasoning|value|source\",\n"
+            "  \"answer\": \"natural answer in plain English; length should match response_mode\",\n"
             "  \"key_numbers\": [\"short bullet with a number\", \"short bullet with a number\"],\n"
             "  \"calculation_summary\": \"1-2 sentence explanation of how the answer was calculated or inferred from this run's logic\",\n"
             "  \"source_summary\": \"1 sentence naming the upstream source(s), period(s), or model step(s) used\",\n"
@@ -2854,12 +2915,16 @@ def _render_dcf_trace_chatbot(ui_adapter, ui_data, engine_result, snapshot, *, l
             "  \"confidence_score\": 0,\n"
             "  \"confidence_explanation\": \"1 short sentence explaining the confidence score\"\n"
             "}\n"
-            "3) Write naturally. Do not output raw dictionaries, snake_case keys, or internal field/container names.\n"
-            "4) Keep key_numbers concise and user-facing. If year-by-year values matter, list them there.\n"
-            "5) Prefer source_name/source_url from verifiable_sources when available.\n"
-            "6) If the answer is model-derived, say that clearly in calculation_summary and still cite the closest upstream external source_url when available.\n"
-            "7) If data is missing, say that plainly.\n"
-            "8) Do not provide investment advice.\n"
+            "3) Follow the detected response mode strictly.\n"
+            "4) If response_mode is `reasoning`, answer in a fuller explanatory style and use key_numbers when helpful.\n"
+            "5) If response_mode is `value`, answer briefly with just the requested value or values. Do not add extra reasoning unless needed for clarity.\n"
+            "6) If response_mode is `source`, answer briefly with just the source, period, and linkable origin. Do not add extra reasoning.\n"
+            "7) Write naturally. Do not output raw dictionaries, snake_case keys, or internal field/container names.\n"
+            "8) Keep key_numbers concise and user-facing. Leave key_numbers empty when the question only asks for the source.\n"
+            "9) Prefer source_name/source_url from verifiable_sources when available.\n"
+            "10) If the answer is model-derived, say that clearly in calculation_summary and still cite the closest upstream external source_url when available.\n"
+            "11) If data is missing, say that plainly.\n"
+            "12) Do not provide investment advice.\n"
         )
         prior_history = []
         for msg in chat_history:
@@ -2877,7 +2942,7 @@ def _render_dcf_trace_chatbot(ui_adapter, ui_data, engine_result, snapshot, *, l
             if raw_lower.startswith("chat error:") or raw_lower.startswith("error:"):
                 assistant_reply = _format_dcf_chat_runtime_message(assistant_raw)
             else:
-                assistant_reply = _normalize_dcf_trace_chat_payload(assistant_raw, chat_ticker)
+                assistant_reply = _normalize_dcf_trace_chat_payload(assistant_raw, chat_ticker, user_question)
 
         _render_dcf_chat_message("assistant", assistant_reply)
 
