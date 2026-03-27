@@ -12,6 +12,7 @@ import os
 import re
 import html
 import math
+import ast
 import hashlib
 import smtplib
 import ssl
@@ -2136,6 +2137,324 @@ def _format_dcf_trace_chat_response(raw_text: str, ticker_symbol: str = "UNKNOWN
     )
 
 
+def _humanize_dcf_chat_key(label) -> str:
+    text = str(label or "").strip()
+    if not text:
+        return "Value"
+    text = text.replace("_", " ")
+    text = re.sub(r"(?i)\byear\s+(\d+)\b", r"Year \1", text)
+    text = re.sub(r"(?i)\bttm\b", "TTM", text)
+    text = re.sub(r"(?i)\bfcff\b", "FCFF", text)
+    text = re.sub(r"(?i)\bfcf\b", "FCF", text)
+    text = re.sub(r"(?i)\bebitda\b", "EBITDA", text)
+    text = re.sub(r"(?i)\bwacc\b", "WACC", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if text.islower():
+        text = text.title()
+    return text
+
+
+def _extract_dcf_chat_key_numbers(raw_value) -> list[str]:
+    def _from_mapping(mapping) -> list[str]:
+        rows = []
+        for key, value in mapping.items():
+            label = _humanize_dcf_chat_key(key)
+            rows.append(f"{label}: {value}")
+        return rows
+
+    if raw_value is None:
+        return []
+    if isinstance(raw_value, list):
+        rows = []
+        for item in raw_value:
+            if isinstance(item, dict):
+                rows.extend(_from_mapping(item))
+            else:
+                cleaned = str(item).strip()
+                if cleaned:
+                    rows.append(cleaned)
+        return rows[:6]
+    if isinstance(raw_value, dict):
+        return _from_mapping(raw_value)[:6]
+
+    text = str(raw_value or "").strip()
+    if not text or text.lower() in {"n/a", "not explicitly provided."}:
+        return []
+
+    parsed = None
+    if text.startswith("{") or text.startswith("["):
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            try:
+                parsed = ast.literal_eval(text)
+            except Exception:
+                parsed = None
+    if parsed is not None:
+        return _extract_dcf_chat_key_numbers(parsed)
+
+    if ";" in text:
+        rows = [part.strip() for part in text.split(";") if part.strip()]
+        return rows[:6]
+
+    if "\n" in text:
+        rows = [part.strip("- ").strip() for part in text.splitlines() if part.strip()]
+        return rows[:6]
+
+    return [text]
+
+
+def _normalize_dcf_trace_chat_payload(raw_text: str, ticker_symbol: str = "UNKNOWN") -> dict:
+    formatted_fallback = _format_dcf_trace_chat_response(raw_text, ticker_symbol)
+
+    def _normalize_credibility_score(value):
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            raw_score = float(value)
+        else:
+            match = re.search(r"-?\d+(?:\.\d+)?", str(value))
+            if not match:
+                return None
+            raw_score = float(match.group(0))
+        if 0 <= raw_score <= 1:
+            raw_score *= 100
+        return max(0, min(100, int(round(raw_score))))
+
+    def _yahoo_quote_url(section: str = "") -> str:
+        ticker_clean = _normalize_ticker(ticker_symbol) or "UNKNOWN"
+        if ticker_clean == "UNKNOWN":
+            return ""
+        base = f"https://finance.yahoo.com/quote/{quote(ticker_clean)}"
+        if section:
+            return f"{base}/{section.lstrip('/')}"
+        return base
+
+    def _infer_source_name(source_name: str, source_detail: str, calculation_summary: str) -> str:
+        combined = f"{source_name or ''} {source_detail or ''} {calculation_summary or ''}".lower()
+        if not combined.strip():
+            return "Not explicitly provided"
+        if any(token in combined for token in ["yahoo", "yfinance", "yahooquery", "yf.ticker"]):
+            if any(token in combined for token in ["income statement", "balance sheet", "cash flow", "quarterly", "ttm"]):
+                return "Yahoo Finance financial statements"
+            if any(token in combined for token in ["analyst", "consensus", "estimate"]):
+                return "Yahoo Finance analyst consensus"
+            return "Yahoo Finance"
+        if any(token in combined for token in ["sec", "10-k", "10-q", "filing"]):
+            return "SEC filing"
+        if any(token in combined for token in ["damodaran", "equity risk premium", "erp"]):
+            return "Damodaran dataset"
+        if any(token in combined for token in ["treasury", "^tnx", "risk-free", "dgs10"]):
+            return "Treasury market data"
+        if any(token in combined for token in ["projection", "pv(", "terminal value", "enterprise value", "wacc"]):
+            return "DCF model calculation"
+        return "DCF run context"
+
+    def _infer_source_url(source_name: str, source_detail: str, calculation_summary: str) -> str:
+        combined = f"{source_name or ''} {source_detail or ''} {calculation_summary or ''}".lower()
+        if any(token in combined for token in ["tax provision", "pretax income", "income statement", "financials"]):
+            return _yahoo_quote_url("financials")
+        if any(token in combined for token in ["balance sheet", "total debt", "cash & equivalents", "cash and equivalents", "net debt"]):
+            return _yahoo_quote_url("balance-sheet")
+        if any(token in combined for token in ["cash flow", "operating cash flow", "capex", "free cash flow"]):
+            return _yahoo_quote_url("cash-flow")
+        if any(token in combined for token in ["analyst", "consensus", "estimate"]):
+            return _yahoo_quote_url("analysis")
+        if any(token in combined for token in ["price", "market cap", "shares", "beta", "quote"]):
+            return _yahoo_quote_url("")
+        if any(token in combined for token in ["^tnx", "risk-free", "treasury", "dgs10"]):
+            return "https://finance.yahoo.com/quote/%5ETNX"
+        if any(token in combined for token in ["damodaran", "equity risk premium", "erp"]):
+            return "https://pages.stern.nyu.edu/~adamodar/New_Home_Page/datafile/histimpl.html"
+        return ""
+
+    def _infer_credibility(source_name: str, source_detail: str, calculation_summary: str):
+        combined = f"{source_name or ''} {source_detail or ''} {calculation_summary or ''}".lower()
+        if any(token in combined for token in ["sec", "10-k", "10-q", "filing"]):
+            return 95, "Primary company filing data is highly reliable."
+        if any(token in combined for token in ["income statement", "balance sheet", "cash flow", "quarterly", "ttm"]):
+            return 90, "Company-reported statement data is strong, with only light transformation risk."
+        if any(token in combined for token in ["analyst", "consensus", "estimate", "damodaran", "treasury"]):
+            return 80, "The answer uses reputable market or consensus inputs, but those can still move over time."
+        if any(token in combined for token in ["projection", "model", "formula", "pv(", "terminal value", "wacc"]):
+            return 72, "This is model-derived, so confidence depends on the input assumptions and trace."
+        if any(token in combined for token in ["fallback", "default", "missing"]):
+            return 55, "Fallback or missing-data paths lower confidence versus directly observed inputs."
+        return 65, "Moderate confidence because the exact upstream provenance was not fully explicit."
+
+    cleaned = str(raw_text or "").strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+
+    parsed = None
+    try:
+        parsed = json.loads(cleaned)
+    except Exception:
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            try:
+                parsed = json.loads(cleaned[start:end + 1])
+            except Exception:
+                parsed = None
+
+    if isinstance(parsed, dict):
+        answer = str(
+            parsed.get("answer")
+            or parsed.get("direct_answer")
+            or ""
+        ).strip()
+        key_numbers = _extract_dcf_chat_key_numbers(
+            parsed.get("key_numbers", parsed.get("value"))
+        )
+        calculation_summary = str(
+            parsed.get("calculation_summary")
+            or parsed.get("formula_path")
+            or parsed.get("formula")
+            or ""
+        ).strip()
+        source_summary = str(
+            parsed.get("source_summary")
+            or parsed.get("source_detail")
+            or parsed.get("source_explanation")
+            or parsed.get("source_origin")
+            or ""
+        ).strip()
+        source_name = str(parsed.get("source_name") or parsed.get("source") or "").strip()
+        source_url = _normalize_url_candidate(
+            str(parsed.get("source_url") or parsed.get("verification_url") or parsed.get("url") or "").strip()
+        )
+        confidence_score = _normalize_credibility_score(
+            parsed.get("confidence_score", parsed.get("credibility_score", parsed.get("reliability_score")))
+        )
+        confidence_explanation = str(
+            parsed.get("confidence_explanation")
+            or parsed.get("credibility_explanation")
+            or parsed.get("reliability_explanation")
+            or parsed.get("credibility_reason")
+            or ""
+        ).strip()
+    else:
+        answer_match = re.search(r"(?i)\*\*Answer:\*\*\s*(.+?)(?:\n\n|\Z)", formatted_fallback, flags=re.S)
+        value_match = re.search(r"(?i)\*\*Value:\*\*\s*(.+?)(?:\n\n|\Z)", formatted_fallback, flags=re.S)
+        calc_match = re.search(r"(?i)\*\*(?:Formula Path|Calculation):\*\*\s*(.+?)(?:\n\n|\Z)", formatted_fallback, flags=re.S)
+        source_name_match = re.search(r"(?i)\*\*Source Name:\*\*\s*(.+?)(?:\n\n|\Z)", formatted_fallback, flags=re.S)
+        source_detail_match = re.search(r"(?i)\*\*Source Detail:\*\*\s*(.+?)(?:\n\n|\Z)", formatted_fallback, flags=re.S)
+        confidence_match = re.search(r"(?i)\*\*Credibility:\*\*\s*(\d+)\s*/\s*100\s*-\s*(.+?)(?:\n\n|\Z)", formatted_fallback, flags=re.S)
+        link_match = re.search(r"\[Open original source\]\((https?://[^\)]+)\)", formatted_fallback)
+
+        answer = answer_match.group(1).strip() if answer_match else cleaned
+        key_numbers = _extract_dcf_chat_key_numbers(value_match.group(1).strip() if value_match else "")
+        calculation_summary = calc_match.group(1).strip() if calc_match else ""
+        source_name = source_name_match.group(1).strip() if source_name_match else ""
+        source_summary = source_detail_match.group(1).strip() if source_detail_match else ""
+        source_url = _normalize_url_candidate(link_match.group(1).strip()) if link_match else ""
+        confidence_score = int(confidence_match.group(1)) if confidence_match else None
+        confidence_explanation = confidence_match.group(2).strip() if confidence_match else ""
+
+    if not answer:
+        answer = "I couldn't produce a clean answer from this run."
+    answer = re.sub(r"^\*\*Answer:\*\*\s*", "", answer).strip()
+    source_name = source_name or _infer_source_name(source_name, source_summary, calculation_summary)
+    if not source_url:
+        source_url = _infer_source_url(source_name, source_summary, calculation_summary)
+    if not source_summary:
+        source_summary = "The answer comes from the active DCF run and its underlying source tables."
+    inferred_score, inferred_explanation = _infer_credibility(source_name, source_summary, calculation_summary)
+    if confidence_score is None:
+        confidence_score = inferred_score
+    if not confidence_explanation:
+        confidence_explanation = inferred_explanation
+
+    history_text = answer
+    if key_numbers:
+        history_text += " Key numbers: " + "; ".join(key_numbers[:4]) + "."
+    if calculation_summary:
+        history_text += " Calculation basis: " + calculation_summary
+
+    return {
+        "kind": "dcf_trace_answer",
+        "answer": answer,
+        "key_numbers": key_numbers[:6],
+        "calculation_summary": calculation_summary,
+        "source_name": source_name,
+        "source_summary": source_summary,
+        "source_url": source_url,
+        "confidence_score": confidence_score,
+        "confidence_explanation": confidence_explanation,
+        "history_text": history_text.strip(),
+    }
+
+
+def _dcf_chat_message_to_history_text(message) -> str:
+    if isinstance(message, dict):
+        if message.get("history_text"):
+            return str(message.get("history_text"))
+        if message.get("kind") == "dcf_trace_answer":
+            parts = [str(message.get("answer") or "").strip()]
+            key_numbers = message.get("key_numbers") or []
+            if key_numbers:
+                parts.append("Key numbers: " + "; ".join(str(item) for item in key_numbers[:4]))
+            if message.get("calculation_summary"):
+                parts.append("Calculation basis: " + str(message.get("calculation_summary")))
+            return " ".join(part for part in parts if part).strip()
+        return str(message.get("content") or "").strip()
+    return str(message or "").strip()
+
+
+def _render_dcf_chat_message(role: str, content) -> None:
+    with st.chat_message(role):
+        if role != "assistant" or not isinstance(content, dict) or content.get("kind") != "dcf_trace_answer":
+            st.markdown(str(content or ""))
+            return
+
+        answer = str(content.get("answer") or "").strip()
+        if answer:
+            st.markdown(answer)
+
+        key_numbers = [str(item).strip() for item in (content.get("key_numbers") or []) if str(item).strip()]
+        if key_numbers:
+            st.markdown("\n".join(f"- {item}" for item in key_numbers))
+
+        calculation_summary = str(content.get("calculation_summary") or "").strip()
+        source_name = str(content.get("source_name") or "").strip()
+        source_summary = str(content.get("source_summary") or "").strip()
+        source_url = _normalize_url_candidate(str(content.get("source_url") or "").strip())
+        confidence_score = content.get("confidence_score")
+        confidence_explanation = str(content.get("confidence_explanation") or "").strip()
+
+        has_details = any([
+            calculation_summary,
+            source_name,
+            source_summary,
+            source_url,
+            confidence_score is not None,
+            confidence_explanation,
+        ])
+        if not has_details:
+            return
+
+        with st.expander("How this answer was derived", expanded=False):
+            if calculation_summary:
+                st.markdown(f"**Calculation logic**\n\n{calculation_summary}")
+
+            source_lines = []
+            if source_name:
+                source_lines.append(f"Primary source: {source_name}")
+            if source_summary:
+                source_lines.append(source_summary)
+            if source_url:
+                source_lines.append(f"[Open source]({source_url})")
+            if source_lines:
+                st.markdown("**Source basis**\n\n" + "\n\n".join(source_lines))
+
+            if confidence_score is not None or confidence_explanation:
+                score_text = f"{int(confidence_score)}/100" if confidence_score is not None else "N/A"
+                detail = f"{score_text} - {confidence_explanation}".strip(" -")
+                st.markdown(f"**Confidence**\n\n{detail}")
+
+
 def _build_dcf_trace_verifiable_sources(ticker_symbol: str, input_table: list[dict], snapshot, assumptions: dict) -> list[dict]:
     ticker_clean = _normalize_ticker(ticker_symbol) or "UNKNOWN"
     yahoo_quote = f"https://finance.yahoo.com/quote/{quote(ticker_clean)}" if ticker_clean != "UNKNOWN" else ""
@@ -2413,6 +2732,24 @@ def _build_dcf_chat_context_packet(ui_adapter, ui_data, engine_result, snapshot,
         snapshot,
         assumptions,
     )
+    logic_reference = {
+        "valuation_identities": [
+            "Enterprise Value = PV of explicit FCFF + PV of terminal value.",
+            "Equity Value = Enterprise Value - Net Debt.",
+            "Intrinsic Value per Share = Equity Value / Shares Outstanding.",
+        ],
+        "projection_logic": [
+            "Revenue projections grow forward from the current base using the year-by-year growth schedule in this run.",
+            "Driver-model FCFF follows Revenue -> EBIT -> NOPAT -> Reinvestment -> FCFF.",
+            "Terminal value uses either Gordon Growth or Exit Multiple, depending on the selected method for this run.",
+        ],
+        "data_quality_logic": [
+            "Overall Data Quality is the simple average of 9 core reliability scores: Current Price, Shares Outstanding, TTM Revenue, TTM Free Cash Flow, TTM Operating Income, Total Debt, Cash & Equivalents, Effective Tax Rate, and Suggested WACC.",
+            "Missing or unscored fields contribute 0 to the overall average.",
+            "TTM Free Cash Flow reliability is capped by the weaker of Operating Cash Flow and CapEx reliability.",
+            "Suggested WACC reliability is a weighted component score and drops when the model relies on debt-cost fallbacks or proxy logic.",
+        ],
+    }
 
     return {
         "ticker": ticker_symbol,
@@ -2441,6 +2778,7 @@ def _build_dcf_chat_context_packet(ui_adapter, ui_data, engine_result, snapshot,
         "terminal_rows": terminal_rows,
         "bridge_rows": bridge_rows,
         "reconciliation_rows": reconciliation_rows,
+        "logic_reference": logic_reference,
         "trace_steps": trace_steps[:120],
     }
 
@@ -2478,8 +2816,7 @@ def _render_dcf_trace_chatbot(ui_adapter, ui_data, engine_result, snapshot, *, l
     for msg in chat_history[-10:]:
         role = msg.get("role", "assistant")
         content = msg.get("content", "")
-        with st.chat_message(role):
-            st.markdown(content)
+        _render_dcf_chat_message(role, content)
 
     user_question = ""
     submitted = False
@@ -2505,40 +2842,44 @@ def _render_dcf_trace_chatbot(ui_adapter, ui_data, engine_result, snapshot, *, l
         trace_prompt = (
             "User question: " + user_question + "\n\n"
             "Answer rules:\n"
-            "1) Use only the provided DCF context.\n"
-            "2) Return ONLY valid JSON (no markdown, no prose outside JSON) with this exact schema:\n"
+            "1) Use only the provided DCF context and logic_reference. If the answer depends on a calculation, explain it from this run's formulas and numbers.\n"
+            "2) Return ONLY valid JSON (no markdown outside JSON) with this exact schema:\n"
             "{\n"
-            "  \"direct_answer\": \"one-sentence direct answer\",\n"
-            "  \"value\": \"specific numeric value(s) used\",\n"
-            "  \"formula_path\": \"equation or calculation chain\",\n"
-            "  \"source_name\": \"human-readable primary source name (e.g., Yahoo Finance, SEC 10-Q, Reuters, DCF model trace)\",\n"
-            "  \"source_url\": \"direct https URL to original source (or empty string if none)\",\n"
-            "  \"source_detail\": \"exact metric origin with period and trace step; no internal path keys\",\n"
-            "  \"credibility_score\": 0,\n"
-            "  \"credibility_explanation\": \"one short sentence explaining why this score applies\"\n"
+            "  \"answer\": \"2-4 sentence natural, ChatGPT-style answer in plain English. Start with the direct answer and mention the most relevant numbers.\",\n"
+            "  \"key_numbers\": [\"short bullet with a number\", \"short bullet with a number\"],\n"
+            "  \"calculation_summary\": \"1-2 sentence explanation of how the answer was calculated or inferred from this run's logic\",\n"
+            "  \"source_summary\": \"1 sentence naming the upstream source(s), period(s), or model step(s) used\",\n"
+            "  \"source_name\": \"human-readable source label\",\n"
+            "  \"source_url\": \"direct https URL to the closest external source, or empty string if the answer is purely model-derived\",\n"
+            "  \"confidence_score\": 0,\n"
+            "  \"confidence_explanation\": \"1 short sentence explaining the confidence score\"\n"
             "}\n"
-            "3) Prefer source_name/source_url from `verifiable_sources` when available.\n"
-            "4) source_detail must name the metric and period used.\n"
-            "5) Do NOT use internal container names (assumptions_table, trace_steps, context packet) as source_name.\n"
-            "6) If value is model-derived, still cite the closest upstream external source_url; if truly none, set source_url to empty string and say why.\n"
-            "7) credibility_score must be an integer between 0 and 100.\n"
-            "8) If data is missing, say so explicitly in source_detail.\n"
-            "9) Do not provide investment advice.\n"
+            "3) Write naturally. Do not output raw dictionaries, snake_case keys, or internal field/container names.\n"
+            "4) Keep key_numbers concise and user-facing. If year-by-year values matter, list them there.\n"
+            "5) Prefer source_name/source_url from verifiable_sources when available.\n"
+            "6) If the answer is model-derived, say that clearly in calculation_summary and still cite the closest upstream external source_url when available.\n"
+            "7) If data is missing, say that plainly.\n"
+            "8) Do not provide investment advice.\n"
         )
-        prior_history = [m for m in chat_history if isinstance(m, dict) and m.get("role") in {"user", "assistant"}]
+        prior_history = []
+        for msg in chat_history:
+            if not isinstance(msg, dict) or msg.get("role") not in {"user", "assistant"}:
+                continue
+            history_text = _dcf_chat_message_to_history_text(msg.get("content"))
+            if history_text:
+                prior_history.append({"role": msg.get("role"), "content": history_text})
 
-        with st.chat_message("user"):
-            st.markdown(user_question)
+        _render_dcf_chat_message("user", user_question)
 
-        with st.chat_message("assistant"):
-            with st.spinner("Tracing value..."):
-                assistant_raw = run_chat(prior_history, trace_prompt, context_data)
-                raw_lower = str(assistant_raw or "").lower()
-                if raw_lower.startswith("chat error:") or raw_lower.startswith("error:"):
-                    assistant_reply = _format_dcf_chat_runtime_message(assistant_raw)
-                else:
-                    assistant_reply = _format_dcf_trace_chat_response(assistant_raw, chat_ticker)
-            st.markdown(assistant_reply)
+        with st.spinner("Working through the DCF logic..."):
+            assistant_raw = run_chat(prior_history, trace_prompt, context_data)
+            raw_lower = str(assistant_raw or "").lower()
+            if raw_lower.startswith("chat error:") or raw_lower.startswith("error:"):
+                assistant_reply = _format_dcf_chat_runtime_message(assistant_raw)
+            else:
+                assistant_reply = _normalize_dcf_trace_chat_payload(assistant_raw, chat_ticker)
+
+        _render_dcf_chat_message("assistant", assistant_reply)
 
         st.session_state[chat_history_key].append({"role": "user", "content": user_question})
         st.session_state[chat_history_key].append({"role": "assistant", "content": assistant_reply})
@@ -4287,15 +4628,15 @@ st.markdown("""
     }
     .qa-chatbot-pill {
         display: inline-block;
-        padding: 10px 14px;
+        padding: 9px 13px;
         border-radius: 10px;
-        background: #1d4ed8;
-        border: 1px solid #1e40af;
-        color: #ffffff;
-        font-weight: 700;
-        font-size: 1.02rem;
+        background: linear-gradient(180deg, #ffffff 0%, #f7f9fc 100%);
+        border: 1px solid #d7deea;
+        color: #1f2937;
+        font-weight: 600;
+        font-size: 1rem;
         letter-spacing: .02em;
-        box-shadow: 0 2px 10px rgba(29, 78, 216, 0.25);
+        box-shadow: 0 1px 4px rgba(15, 23, 42, 0.08);
     }
     .analysis-view-boundary {
         display: none !important;
