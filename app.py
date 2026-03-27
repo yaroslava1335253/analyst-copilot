@@ -5418,17 +5418,6 @@ def _clean_summary_items(items, max_items: int = 3) -> list[str]:
     return cleaned
 
 
-def _join_summary_phrases(items: list[str]) -> str:
-    cleaned = [str(item).strip().rstrip(".") for item in (items or []) if str(item).strip()]
-    if not cleaned:
-        return ""
-    if len(cleaned) == 1:
-        return cleaned[0]
-    if len(cleaned) == 2:
-        return f"{cleaned[0]} and {cleaned[1]}"
-    return f"{', '.join(cleaned[:-1])}, and {cleaned[-1]}"
-
-
 def _build_summary_pdf_bytes(
     *,
     ticker: str,
@@ -5687,22 +5676,6 @@ def _build_summary_pdf_bytes(
         sections.append(("Street Context", street_items))
     if source_items:
         sections.append(("Core Sources", source_items))
-
-    qualitative_items = []
-    if summary_text:
-        qualitative_items.append(summary_text)
-    driver_sentence = _join_summary_phrases(drivers)
-    if driver_sentence:
-        qualitative_items.append(f"The call is supported by {driver_sentence}.")
-    risk_sentence = _join_summary_phrases(risks)
-    if risk_sentence:
-        qualitative_items.append(f"The main risks to the view are {risk_sentence}.")
-    if evidence_gaps:
-        qualitative_items.append(f"A remaining evidence gap is {evidence_gaps[0].rstrip('.')}.")
-    if key_conditional and "null" not in key_conditional.lower():
-        qualitative_items.append(f"The view would need to be revisited if {key_conditional.rstrip('.')}.")
-    if qualitative_items:
-        sections.append(("Why This Verdict", qualitative_items))
 
     outlook_payload = {}
     if summary_model:
