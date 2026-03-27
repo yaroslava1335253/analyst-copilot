@@ -6500,7 +6500,12 @@ if st.session_state.quarterly_analysis:
         st.markdown('<div id="momentum"></div>', unsafe_allow_html=True)
         st.markdown("---")
         st.markdown('<div class="section-header"><span class="step-badge">Step 01</span><span class="section-title">Business Momentum</span></div>', unsafe_allow_html=True)
-        source_caption = str(data_source or "").replace(" (Yahoo-priority)", "").strip()
+        source_caption = (
+            str(data_source or "")
+            .replace(" (Yahoo-priority)", "")
+            .replace(" (validated extension)", "")
+            .strip()
+        )
         st.caption(f"Source: {source_caption}")
 
         latest_quarter_snapshot = hist_data[0] if hist_data else {}
@@ -6660,8 +6665,6 @@ if st.session_state.quarterly_analysis:
             coverage_parts.append(f"Missing EPS: {missing_eps_display}")
         if coverage_parts:
             st.caption(" | ".join(coverage_parts))
-        if seasonality_reason:
-            st.caption(f"Seasonality method: {seasonality_reason}")
         if seasonality_tip:
             st.caption(seasonality_tip)
 
