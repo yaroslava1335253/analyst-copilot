@@ -16,6 +16,7 @@ import ast
 import hashlib
 import smtplib
 import ssl
+import importlib.util
 from collections.abc import Mapping
 import streamlit as st
 import streamlit.components.v1 as components
@@ -49,7 +50,7 @@ except Exception:
 import pandas as pd
 import altair as alt
 import json
-from engine import get_financials, run_structured_prompt, calculate_metrics, run_chat, analyze_quarterly_trends, generate_independent_forecast, get_latest_date_info, get_available_report_dates, calculate_comprehensive_analysis, get_consensus_runtime_signature
+from engine import get_financials, run_structured_prompt, calculate_metrics, run_chat, analyze_quarterly_trends, generate_independent_forecast, get_latest_date_info, get_available_report_dates, calculate_comprehensive_analysis
 from data_adapter import DataAdapter, DataQualityMetadata, NormalizedFinancialSnapshot
 from dcf_engine import DCFEngine, DCFAssumptions
 from dcf_ui_adapter import DCFUIAdapter
@@ -1044,7 +1045,11 @@ def _env_or_secret(name: str, default: str = "", aliases: tuple[str, ...] = (), 
 
 def _consensus_runtime_signature() -> str:
     fmp_api_key = _env_or_secret("FMP_API_KEY", section_name="fmp") or None
-    return get_consensus_runtime_signature(fmp_api_key)
+    fmp_fingerprint = "none"
+    if fmp_api_key:
+        fmp_fingerprint = hashlib.sha256(fmp_api_key.encode("utf-8")).hexdigest()[:12]
+    yahooquery_available = int(importlib.util.find_spec("yahooquery") is not None)
+    return f"consensus-v2:fmp={fmp_fingerprint}:yq={yahooquery_available}"
 
 
 def _smtp_config() -> tuple[dict, list]:
