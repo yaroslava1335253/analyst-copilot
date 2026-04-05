@@ -49,7 +49,7 @@ except Exception:
 import pandas as pd
 import altair as alt
 import json
-from engine import get_financials, run_structured_prompt, calculate_metrics, run_chat, analyze_quarterly_trends, generate_independent_forecast, get_latest_date_info, get_available_report_dates, calculate_comprehensive_analysis
+from engine import get_financials, run_structured_prompt, calculate_metrics, run_chat, analyze_quarterly_trends, generate_independent_forecast, get_latest_date_info, get_available_report_dates, calculate_comprehensive_analysis, get_consensus_runtime_signature
 from data_adapter import DataAdapter, DataQualityMetadata, NormalizedFinancialSnapshot
 from dcf_engine import DCFEngine, DCFAssumptions
 from dcf_ui_adapter import DCFUIAdapter
@@ -1042,6 +1042,11 @@ def _env_or_secret(name: str, default: str = "", aliases: tuple[str, ...] = (), 
     return str(default or "").strip()
 
 
+def _consensus_runtime_signature() -> str:
+    fmp_api_key = _env_or_secret("FMP_API_KEY", section_name="fmp") or None
+    return get_consensus_runtime_signature(fmp_api_key)
+
+
 def _smtp_config() -> tuple[dict, list]:
     smtp_host = _env_or_secret("SMTP_HOST", aliases=("host",), section_name="smtp")
     smtp_user = _env_or_secret("SMTP_USER", aliases=("user", "username"), section_name="smtp")
@@ -1528,9 +1533,10 @@ def cached_quarterly_analysis(
     num_quarters: int = DEFAULT_INITIAL_QUARTERS,
     end_date: str = None,
     history_source_version: str = HISTORY_SOURCE_VERSION,
+    consensus_runtime_signature: str = "",
 ) -> dict:
     """Cached version of analyze_quarterly_trends to avoid API rate limits."""
-    _ = history_source_version  # cache-key salt when quarterly history sourcing logic changes
+    _ = (history_source_version, consensus_runtime_signature)  # cache-key salt when consensus source availability changes
     fmp_api_key = _env_or_secret("FMP_API_KEY", section_name="fmp") or None
     fallback = {
         "ticker": ticker,
@@ -1579,7 +1585,12 @@ def cached_independent_forecast(
     outlook_cache_key is used to bust cache if underlying analysis or DCF inputs change.
     """
     _ = outlook_cache_key  # cache-key salt when AI synthesis inputs change
-    analysis = cached_quarterly_analysis(ticker, num_quarters, end_date)
+    analysis = cached_quarterly_analysis(
+        ticker,
+        num_quarters,
+        end_date,
+        consensus_runtime_signature=_consensus_runtime_signature(),
+    )
     return generate_independent_forecast(analysis, company_name, dcf_data)
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -5974,7 +5985,12 @@ with st.sidebar:
                 )
                 with st.spinner(f"Loading {ticker}..."):
                     inc, bal, cf, qcf, financials_source, financials_warning = cached_financials(ticker)
-                    analysis = cached_quarterly_analysis(ticker, num_quarters, selected_end_date)
+                    analysis = cached_quarterly_analysis(
+                        ticker,
+                        num_quarters,
+                        selected_end_date,
+                        consensus_runtime_signature=_consensus_runtime_signature(),
+                    )
                     quarterly_data = analysis.get("historical_trends", {}).get("quarterly_data", [])
                     analysis_errors = analysis.get("errors", []) if isinstance(analysis, dict) else []
 
@@ -6748,7 +6764,12 @@ if st.session_state.quarterly_analysis:
             if requested_quarters > loaded_quarters:
                 end_date_for_reload = st.session_state.get("end_date") or st.session_state.get("selected_end_date")
                 with st.spinner(f"Loading up to {requested_quarters} quarters for {ticker}..."):
-                    expanded_analysis = cached_quarterly_analysis(ticker, requested_quarters, end_date_for_reload)
+                    expanded_analysis = cached_quarterly_analysis(
+                        ticker,
+                        requested_quarters,
+                        end_date_for_reload,
+                        consensus_runtime_signature=_consensus_runtime_signature(),
+                    )
                 expanded_hist_data = expanded_analysis.get("historical_trends", {}).get("quarterly_data", [])
                 if len(expanded_hist_data) > loaded_quarters:
                     st.session_state.quarterly_analysis = expanded_analysis
@@ -6935,6 +6956,16 @@ if st.session_state.quarterly_analysis:
             consensus_citations = consensus.get("citations", [])
             qual_sources = consensus.get("qualitative_sources", [])
             consensus_warning = str(consensus.get("warning", "") or "").strip()
+            consensus_source_diagnostics = (
+                consensus.get("source_diagnostics", {})
+                if isinstance(consensus.get("source_diagnostics", {}), dict)
+                else {}
+            )
+            consensus_diag_messages = (
+                consensus_source_diagnostics.get("messages", [])
+                if isinstance(consensus_source_diagnostics.get("messages", []), list)
+                else []
+            )
 
             has_next_estimate = any((next_q.get("revenue_estimate"), next_q.get("eps_estimate"))) and any(
                 value not in (None, "", "N/A") for value in (next_q.get("revenue_estimate"), next_q.get("eps_estimate"))
@@ -6944,6 +6975,8 @@ if st.session_state.quarterly_analysis:
 
             if consensus_warning and not (has_next_estimate or has_coverage or has_targets):
                 st.info(consensus_warning)
+                for message in consensus_diag_messages[:3]:
+                    st.caption(f"Consensus diagnostic: {message}")
 
             quarter_label = next_q.get("quarter_label") or next_forecast_label
             st.markdown(f"**{quarter_label} Estimates**")
@@ -6962,9 +6995,9 @@ if st.session_state.quarterly_analysis:
                 st.metric("Buy/Hold/Sell", f"{buy}/{hold}/{sell}" if total > 0 else "N/A")
 
             estimate_sources = []
-            if next_q.get("source"):
+            if has_next_estimate and next_q.get("source"):
                 estimate_sources.append(next_q.get("source"))
-            if coverage.get("source") and coverage.get("source") not in estimate_sources:
+            if has_coverage and coverage.get("source") and coverage.get("source") not in estimate_sources:
                 estimate_sources.append(coverage.get("source"))
             if estimate_sources:
                 st.caption(f"Source: {', '.join(estimate_sources)}")

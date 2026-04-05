@@ -6,10 +6,11 @@ Uses Google Gemini (FREE) for AI analysis.
 Includes financial math logic to pre-process data for the LLM.
 """
 
+import hashlib
 import os
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FuturesTimeoutError
 import requests
 import pandas as pd
 from pathlib import Path
@@ -57,6 +58,21 @@ MONTH_ABBREVIATIONS = {
 
 # Load local .env regardless of launch directory so FMP/Gemini keys are consistently available.
 load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
+
+
+def get_consensus_runtime_signature(fmp_api_key: str = None) -> str:
+    """
+    Return a cache-safe fingerprint for consensus source availability.
+
+    This lets the UI invalidate cached quarterly analysis when the runtime gains
+    or loses fallback providers without ever storing the raw FMP key in the
+    cache key.
+    """
+    clean_key = str(fmp_api_key or os.getenv("FMP_API_KEY") or "").strip()
+    fmp_fingerprint = "none"
+    if clean_key:
+        fmp_fingerprint = hashlib.sha256(clean_key.encode("utf-8")).hexdigest()[:12]
+    return f"consensus-v2:fmp={fmp_fingerprint}:yq={int(YQTicker is not None)}"
 
 
 def _sanitize_valuation_language(value):
@@ -2587,6 +2603,13 @@ def fetch_consensus_estimates(
         next_quarter_label: Label for the upcoming quarter (e.g., "FY2026 Q3")
     """
     fmp_api_key = str(fmp_api_key or os.getenv("FMP_API_KEY") or "").strip() or None
+    source_diagnostics = {
+        "runtime_signature": get_consensus_runtime_signature(fmp_api_key),
+        "fmp_configured": bool(fmp_api_key),
+        "yahooquery_available": YQTicker is not None,
+        "messages": [],
+        "attempts": [],
+    }
 
     def _has_value(value) -> bool:
         return value is not None and pd.notna(value)
@@ -2610,6 +2633,46 @@ def fetch_consensus_estimates(
         if not _has_value(val):
             return None
         return f"${val:.2f}"
+
+    def _clean_diag_text(value) -> str:
+        text = _redact_api_secrets(str(value or ""), fmp_api_key).strip()
+        if len(text) > 220:
+            text = text[:217] + "..."
+        return text
+
+    def _record_source_attempt(provider: str, status: str, summary: str = "", details: dict | None = None) -> None:
+        entry = {
+            "provider": str(provider or "").strip(),
+            "status": str(status or "").strip() or "unknown",
+        }
+        summary_text = _clean_diag_text(summary)
+        if summary_text:
+            entry["summary"] = summary_text
+        if isinstance(details, dict):
+            clean_details = {}
+            for key, value in details.items():
+                if value in (None, "", [], {}):
+                    continue
+                if isinstance(value, str):
+                    clean_details[str(key)] = _clean_diag_text(value)
+                else:
+                    clean_details[str(key)] = value
+            if clean_details:
+                entry["details"] = clean_details
+        source_diagnostics["attempts"].append(entry)
+        if summary_text and status != "success" and summary_text not in source_diagnostics["messages"]:
+            source_diagnostics["messages"].append(summary_text)
+
+    def _attach_source_diagnostics(result: dict) -> dict:
+        if isinstance(result, dict):
+            result["source_diagnostics"] = {
+                "runtime_signature": source_diagnostics.get("runtime_signature"),
+                "fmp_configured": bool(source_diagnostics.get("fmp_configured")),
+                "yahooquery_available": bool(source_diagnostics.get("yahooquery_available")),
+                "messages": list(source_diagnostics.get("messages", [])),
+                "attempts": [dict(item) for item in source_diagnostics.get("attempts", [])],
+            }
+        return result
 
     def _build_consensus_result(
         *,
@@ -2829,6 +2892,11 @@ def fetch_consensus_estimates(
 
     def _fetch_consensus_estimates_fmp() -> dict | None:
         if not fmp_api_key:
+            _record_source_attempt(
+                "Financial Modeling Prep",
+                "skipped",
+                "FMP fallback was not configured for this run.",
+            )
             return None
 
         analyst_docs_url = "https://site.financialmodelingprep.com/developer/docs/stable/financial-estimates"
@@ -2860,11 +2928,13 @@ def fetch_consensus_estimates(
             }
 
             payloads = {name: None for name in future_map}
+            future_errors = {}
             for name, future in future_map.items():
                 try:
                     payloads[name] = future.result()
-                except Exception:
+                except Exception as exc:
                     payloads[name] = None
+                    future_errors[name] = _clean_diag_text(exc)
 
         quarter_record = _pick_record_by_date(_extract_records(payloads["quarter"]), future_bias=True)
         annual_record = _pick_record_by_date(_extract_records(payloads["annual"]), future_bias=True)
@@ -2988,6 +3058,26 @@ def fetch_consensus_estimates(
         result["citations"] = citations
         if not _consensus_has_any_data(result):
             result["warning"] = "Financial Modeling Prep did not return analyst consensus data for this run."
+        _record_source_attempt(
+            "Financial Modeling Prep",
+            "success" if _consensus_has_any_data(result) else ("error" if future_errors else "empty"),
+            (
+                "Financial Modeling Prep returned analyst consensus data."
+                if _consensus_has_any_data(result)
+                else (
+                    "Financial Modeling Prep returned no usable analyst consensus data."
+                    if future_errors
+                    else "Financial Modeling Prep returned no analyst consensus data."
+                )
+            ),
+            {
+                "quarter_endpoint": "error" if "quarter" in future_errors else ("ok" if payloads["quarter"] is not None else "empty"),
+                "annual_endpoint": "error" if "annual" in future_errors else ("ok" if payloads["annual"] is not None else "empty"),
+                "targets_endpoint": "error" if "targets" in future_errors else ("ok" if payloads["targets"] is not None else "empty"),
+                "grades_endpoint": "error" if "grades" in future_errors else ("ok" if payloads["grades"] is not None else "empty"),
+                "errors": "; ".join(f"{name}: {message}" for name, message in future_errors.items()),
+            },
+        )
         return result
 
     def _extract_yq_symbol_payload(payload):
@@ -3032,6 +3122,11 @@ def fetch_consensus_estimates(
 
     def _fetch_consensus_estimates_yahooquery() -> dict | None:
         if YQTicker is None:
+            _record_source_attempt(
+                "Yahoo Finance (yahooquery)",
+                "unavailable",
+                "YahooQuery fallback is unavailable in the active Python environment.",
+            )
             return None
         try:
             yq = YQTicker(ticker_symbol)
@@ -3106,34 +3201,78 @@ def fetch_consensus_estimates(
             )
             if not _consensus_has_any_data(fallback_result):
                 fallback_result["warning"] = "Yahoo Finance did not return analyst consensus data for this run."
+            _record_source_attempt(
+                "Yahoo Finance (yahooquery)",
+                "success" if _consensus_has_any_data(fallback_result) else "empty",
+                (
+                    "YahooQuery fallback returned analyst consensus data."
+                    if _consensus_has_any_data(fallback_result)
+                    else "YahooQuery fallback returned no analyst consensus data."
+                ),
+                {
+                    "target_mean_present": bool(_has_value(financial_data.get("targetMeanPrice"))),
+                    "analyst_opinions_present": bool(_safe_int(financial_data.get("numberOfAnalystOpinions"))),
+                    "trend_items": len(trend_items),
+                    "recommendation_rows": int(len(recommendation_trend.index)) if isinstance(recommendation_trend, pd.DataFrame) else 0,
+                },
+            )
             return fallback_result
-        except Exception:
+        except Exception as exc:
+            _record_source_attempt(
+                "Yahoo Finance (yahooquery)",
+                "error",
+                f"YahooQuery fallback failed: {_clean_diag_text(exc)}",
+            )
             return None
 
     try:
         stock = get_yf_ticker(ticker_symbol, use_cache=False)
-        info = get_yf_info(stock)
-        
+        def _yf_frame_with_timeout(attr_name: str, timeout: float = 8.0) -> pd.DataFrame:
+            """Fetch a yfinance DataFrame attribute with a wall-clock timeout.
+
+            Yahoo Finance sometimes hangs indefinitely instead of raising an error.
+            Running the call in a thread lets us bail out after ``timeout`` seconds.
+            """
+            with ThreadPoolExecutor(max_workers=1) as _ex:
+                _fut = _ex.submit(get_yf_frame, stock, attr_name)
+                try:
+                    return _fut.result(timeout=timeout)
+                except (_FuturesTimeoutError, Exception):
+                    return pd.DataFrame()
+
+        def _yf_info_with_timeout(timeout: float = 8.0) -> dict:
+            """Fetch yfinance info with a wall-clock timeout for stalled Yahoo requests."""
+            with ThreadPoolExecutor(max_workers=1) as _ex:
+                _fut = _ex.submit(get_yf_info, stock)
+                try:
+                    payload = _fut.result(timeout=timeout)
+                    return payload if isinstance(payload, dict) else {}
+                except (_FuturesTimeoutError, Exception):
+                    return {}
+
+        info = _yf_info_with_timeout()
+
         # Get price targets from yfinance
         target_mean = info.get('targetMeanPrice')
         target_high = info.get('targetHighPrice')
         target_low = info.get('targetLowPrice')
         num_analysts = info.get('numberOfAnalystOpinions')
         recommendation = info.get('recommendationKey', '')
-        
+
         # Get earnings and revenue estimates
+
         earnings_est = pd.DataFrame()
         revenue_est = pd.DataFrame()
         try:
-            earnings_est = get_yf_frame(stock, "earnings_estimate")
-            revenue_est = get_yf_frame(stock, "revenue_estimate")
+            earnings_est = _yf_frame_with_timeout("earnings_estimate")
+            revenue_est = _yf_frame_with_timeout("revenue_estimate")
         except:
             pass
-        
+
         # Get recommendations summary (buy/hold/sell)
         rec_summary = pd.DataFrame()
         try:
-            rec_summary = get_yf_frame(stock, "recommendations_summary")
+            rec_summary = _yf_frame_with_timeout("recommendations_summary")
         except:
             pass
         
@@ -3213,6 +3352,22 @@ def fetch_consensus_estimates(
             hold_ratings=hold_ratings,
             sell_ratings=sell_ratings,
         )
+        _record_source_attempt(
+            "Yahoo Finance (yfinance)",
+            "success" if _consensus_has_any_data(result) else "empty",
+            (
+                "Yahoo Finance yfinance returned analyst consensus data."
+                if _consensus_has_any_data(result)
+                else "Yahoo Finance yfinance returned no usable analyst consensus fields."
+            ),
+            {
+                "info_targets_present": bool(any(_has_value(value) for value in (target_mean, target_high, target_low))),
+                "num_analysts_present": bool(_safe_int(num_analysts) or next_q_analysts),
+                "earnings_estimate_rows": int(len(earnings_est.index)) if isinstance(earnings_est, pd.DataFrame) else 0,
+                "revenue_estimate_rows": int(len(revenue_est.index)) if isinstance(revenue_est, pd.DataFrame) else 0,
+                "recommendations_rows": int(len(rec_summary.index)) if isinstance(rec_summary, pd.DataFrame) else 0,
+            },
+        )
         primary_result = _fetch_consensus_estimates_fmp()
         if isinstance(primary_result, dict) and _consensus_has_any_data(primary_result):
             result = _merge_consensus_results(primary_result, result)
@@ -3289,11 +3444,16 @@ def fetch_consensus_estimates(
                     result["qualitative_sources"] = []
         except Exception:
             pass  # No qualitative summary if AI fails
-        
-        return result
+
+        return _attach_source_diagnostics(result)
         
     except Exception as e:
-        return {"error": f"Failed to fetch estimates from Yahoo Finance: {str(e)}"}
+        _record_source_attempt(
+            "Yahoo Finance (yfinance)",
+            "error",
+            f"Yahoo Finance yfinance request failed: {_clean_diag_text(e)}",
+        )
+        return _attach_source_diagnostics({"error": f"Failed to fetch estimates from Yahoo Finance: {str(e)}"})
 
 
 def generate_independent_forecast(quarterly_analysis: dict, company_name: str = None, dcf_data: dict = None) -> dict:

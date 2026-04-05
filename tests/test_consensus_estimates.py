@@ -1,6 +1,6 @@
 import pandas as pd
 
-from engine import fetch_consensus_estimates
+from engine import fetch_consensus_estimates, get_consensus_runtime_signature
 
 
 class EmptyConsensusTicker:
@@ -118,6 +118,16 @@ def test_fetch_consensus_estimates_handles_none_info(monkeypatch):
     assert result["next_quarter"]["eps_estimate"] == "N/A"
     assert result["analyst_coverage"]["num_analysts"] is None
     assert result["warning"] == "Yahoo Finance did not return analyst consensus data for this run."
+    assert result["source_diagnostics"]["fmp_configured"] is False
+    assert result["source_diagnostics"]["yahooquery_available"] is False
+    assert any(
+        attempt["provider"] == "Yahoo Finance (yfinance)" and attempt["status"] == "empty"
+        for attempt in result["source_diagnostics"]["attempts"]
+    )
+    assert any(
+        attempt["provider"] == "Yahoo Finance (yahooquery)" and attempt["status"] == "unavailable"
+        for attempt in result["source_diagnostics"]["attempts"]
+    )
 
 
 def test_fetch_consensus_estimates_uses_partial_data_without_error(monkeypatch):
@@ -133,6 +143,10 @@ def test_fetch_consensus_estimates_uses_partial_data_without_error(monkeypatch):
     assert result["analyst_coverage"]["num_analysts"] == 41
     assert result["full_year"]["fiscal_year"] == "FY2026"
     assert "warning" not in result
+    assert any(
+        attempt["provider"] == "Yahoo Finance (yfinance)" and attempt["status"] == "success"
+        for attempt in result["source_diagnostics"]["attempts"]
+    )
 
 
 def test_fetch_consensus_estimates_handles_info_property_error(monkeypatch):
@@ -162,6 +176,11 @@ def test_fetch_consensus_estimates_falls_back_to_yahooquery(monkeypatch):
     assert result["analyst_coverage"]["num_analysts"] == 57
     assert result["source"] == "Yahoo Finance (yahooquery)"
     assert "warning" not in result
+    assert result["source_diagnostics"]["yahooquery_available"] is True
+    assert any(
+        attempt["provider"] == "Yahoo Finance (yahooquery)" and attempt["status"] == "success"
+        for attempt in result["source_diagnostics"]["attempts"]
+    )
 
 
 def test_fetch_consensus_estimates_uses_fmp_when_available(monkeypatch):
@@ -227,6 +246,11 @@ def test_fetch_consensus_estimates_uses_fmp_when_available(monkeypatch):
     assert result["analyst_coverage"]["buy_ratings"] == 39
     assert result["source"].startswith("Financial Modeling Prep")
     assert "warning" not in result
+    assert result["source_diagnostics"]["fmp_configured"] is True
+    assert any(
+        attempt["provider"] == "Financial Modeling Prep" and attempt["status"] == "success"
+        for attempt in result["source_diagnostics"]["attempts"]
+    )
 
 
 def test_fetch_consensus_estimates_keeps_fmp_targets_when_estimates_unavailable(monkeypatch):
@@ -319,3 +343,15 @@ def test_fetch_consensus_estimates_preserves_per_section_source_attribution(monk
     assert result["source"] == "Financial Modeling Prep + Yahoo Finance (yfinance)"
     assert result["next_quarter"]["source"] == "Yahoo Finance (yfinance)"
     assert result["price_targets"]["source"] == "Financial Modeling Prep"
+
+
+def test_get_consensus_runtime_signature_changes_when_runtime_sources_change(monkeypatch):
+    monkeypatch.setattr("engine.YQTicker", None)
+    signature_without_fmp = get_consensus_runtime_signature(None)
+    signature_with_fmp = get_consensus_runtime_signature("demo-key")
+
+    monkeypatch.setattr("engine.YQTicker", object())
+    signature_with_yq = get_consensus_runtime_signature("demo-key")
+
+    assert signature_without_fmp != signature_with_fmp
+    assert signature_with_fmp != signature_with_yq
